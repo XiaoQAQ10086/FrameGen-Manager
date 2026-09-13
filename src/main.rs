@@ -131,7 +131,7 @@ fn main() -> eframe::Result<()> {
                 return Ok(());
             }
         };
-        for (prefix, tag, _dll, label) in update::DLSS_RUNTIME {
+        for (prefix, tag, _zip, _dll, label) in update::DLSS_RUNTIME {
             match update::find_release_zip(&c, update::DLSS_REPO, prefix, tag) {
                 Ok(a) => println!(
                     "  查到 {label}: tag={}  asset={}  ({})",
@@ -198,45 +198,6 @@ fn main() -> eframe::Result<()> {
         return Ok(());
     }
 
-    // 离线验证目录列举解析：cargo run -- --dirtest
-    if std::env::args().any(|a| a == "--dirtest") {
-        // 真实响应结构的样本（字段和 GitHub contents API 一致）
-        let root = r#"[
-          {"name":"README.md","path":"README.md","sha":"c3444a0f22937949150799285d0bf5f3a39b96c3","size":13831,"type":"file"},
-          {"name":"altnative","path":"altnative","sha":"abc","size":0,"type":"dir"},
-          {"name":".DS_Store","path":".DS_Store","sha":"2503f617b9e9536f5bac009fe93a0aab71a1e28e","size":8196,"type":"file"},
-          {"name":"dlssg_sm86.ini","path":"dlssg_sm86.ini","sha":"f68878e557c6be4babf678d16efabe93fd3492c0","size":581,"type":"file"},
-          {"name":"version.dll","path":"version.dll","sha":"50c04d7f4b","size":15667520,"type":"file"}
-        ]"#;
-        let alt = r#"[
-          {"name":"winmm.dll","path":"altnative/winmm.dll","sha":"7166b7feef","size":15678272,"type":"file"},
-          {"name":"dxgi.dll","path":"altnative/dxgi.dll","sha":"6291c9bd39","size":15668032,"type":"file"}
-        ]"#;
-
-        let mut items = update::parse_dir_listing(root);
-        items.extend(update::parse_dir_listing(alt));
-        println!("解析出 {} 个文件（dir 和非文件应被跳过）", items.len());
-        for it in &items {
-            println!("  name={:<26} sha={} size={}", it.name, it.blob_sha, it.size);
-        }
-
-        // 模拟界面里挑文件的过程
-        println!("
-界面挑文件：");
-        for want in ["version.dll", "dlssg_sm86.ini"] {
-            match items.iter().find(|r| r.name == want) {
-                Some(r) => println!("  [OK]   {want:<16} -> 本地名 {}", update::local_name(&r.name)),
-                None => println!("  [FAIL] {want} 没找到"),
-            }
-        }
-        for want in ["winmm.dll", "dinput8.dll", "winhttp.dll", "dxgi.dll"] {
-            match items.iter().find(|r| r.name.ends_with(want)) {
-                Some(r) => println!("  [OK]   {want:<16} -> 本地名 {}", update::local_name(&r.name)),
-                None => println!("  (缺失) {want}"),
-            }
-        }
-        return Ok(());
-    }
 
     // 备用源实测：cargo run -- --backuptest
     if std::env::args().any(|a| a == "--backuptest") {
@@ -249,10 +210,10 @@ fn main() -> eframe::Result<()> {
             }
         };
         let path = update::INI_REPO_PATH;
-        let remote = match update::fetch_remote(&c, path) {
+        let remote = match update::probe_remote(&c, path) {
             Ok(r) => r,
             Err(e) => {
-                println!("[FAIL] 取远端信息失败: {e}");
+                println!("[FAIL] 取远端指纹失败: {e}");
                 return Ok(());
             }
         };
@@ -265,17 +226,20 @@ fn main() -> eframe::Result<()> {
         );
         println!("  内置备用源 = {}", update::DEFAULT_BACKUP_PREFIX);
         println!("  实际请求   = {url}");
-        match update::download(&c, &remote, &dest, &url, &cancel, |_, _| {}) {
-            Ok(()) => {
-                let data = std::fs::read(&dest).unwrap_or_default();
-                let blob = util::git_blob_sha1(&data);
+        match update::download(&c, path, &dest, &url, Some(&remote.etag), &cancel, |_, _| {}) {
+            Ok(dl) => {
+                let ok = dl
+                    .etag
+                    .as_deref()
+                    .map(|e| e.eq_ignore_ascii_case(&remote.etag))
+                    .unwrap_or(false);
                 println!(
-                    "  [{}] 下载 {} 字节，blob sha = {}",
-                    if blob == remote.blob_sha { "PASS" } else { "FAIL" },
-                    data.len(),
-                    blob
+                    "  [{}] 走镜像下载 {} 字节，响应 ETag = {}",
+                    if ok { "PASS" } else { "FAIL" },
+                    dl.bytes,
+                    dl.etag.clone().unwrap_or_else(|| "(无)".to_owned())
                 );
-                println!("  期望 sha   = {}", remote.blob_sha);
+                println!("  期望 ETag = {}", remote.etag);
                 let _ = std::fs::remove_file(&dest);
             }
             Err(e) => println!("  [FAIL] {e}"),
@@ -497,64 +461,52 @@ fn selftest() {
         }
     }
 
-    println!("\n--- 上游更新检查（注意：上游无 Releases，走 contents API 的 blob sha） ---");
+    println!("\n--- 上游更新检查（走 raw 的 HEAD + ETag，完全不占 API 配额） ---");
     match update::client() {
         Ok(c) => {
             println!("  README 版本: {:?}", update::fetch_version(&c));
             let st = update::load_state();
-            // 和界面里一样：两次目录列举代替六个单文件查询
-            match update::fetch_dir_listing(&c, "") {
-                Ok(root) => {
-                    let alt = update::fetch_dir_listing(&c, "altnative").unwrap_or_default();
-                    println!(
-                        "  目录列举：根 {} 个文件 / altnative {} 个文件（共 2 次 API 调用）",
-                        root.len(),
-                        alt.len()
-                    );
-                    let wanted = [
-                        "version.dll",
-                        "dlssg_sm86.ini",
-                        "winmm.dll",
-                        "dinput8.dll",
-                        "winhttp.dll",
-                        "dxgi.dll",
-                    ];
-                    for r in root.iter().chain(alt.iter()) {
-                        let local = update::local_name(&r.name);
-                        if !wanted.contains(&local.as_str()) {
-                            continue;
-                        }
-                        let short = &r.blob_sha[..r.blob_sha.len().min(10)];
+            // 和界面里一样：每个文件发一次 HEAD 拿 ETag，一次 API 都不调
+            let specs = [
+                "version.dll",
+                "altnative/winmm.dll",
+                "altnative/dinput8.dll",
+                "altnative/winhttp.dll",
+                "altnative/dxgi.dll",
+                update::INI_REPO_PATH,
+            ];
+            println!("  逐个 HEAD 取内容指纹（0 次 API 调用）：");
+            for path in specs {
+                match update::probe_remote(&c, path) {
+                    Ok(r) => {
+                        let local = update::local_name(path);
                         println!(
-                            "  {:<22} sha={} size={:>9} 需要下载={}",
+                            "  {:<22} etag={} size={:>9} 需要下载={}",
                             local,
-                            short,
+                            &r.etag[..r.etag.len().min(10)],
                             r.size,
-                            st.needs_update(&local, &r.blob_sha)
+                            st.needs_update(&local, &r.etag)
                         );
                     }
+                    Err(e) => println!("  {:<22} 取指纹失败: {e}", path),
                 }
-                Err(e) => println!("  目录列举失败: {e}"),
             }
 
             println!("
   DLSS 运行库（界面里会单独分组显示）：");
-            for (prefix, tag, dll_name, _label) in update::DLSS_RUNTIME {
-                match update::find_release_zip(&c, update::DLSS_REPO, prefix, tag) {
-                    Ok(a) => {
-                        let dest = update::asset_path(dll_name).unwrap_or_default();
-                        let ready = dest.is_file()
-                            && scan::identify_dll(&dest) == scan::FileIdentity::Nvidia;
-                        println!(
-                            "  {:<22} {}  下载 {}  本地={}",
-                            dll_name,
-                            a.tag,
-                            util::format_bytes(a.size),
-                            if ready { "已就绪(NVIDIA 签名)" } else { "未下载" }
-                        );
-                    }
-                    Err(e) => println!("  {:<22} 查询失败: {e}", dll_name),
-                }
+            for (_prefix, tag, zip_name, dll_name, _label) in update::DLSS_RUNTIME {
+                let url = update::release_url(tag, zip_name);
+                let dest = update::asset_path(dll_name).unwrap_or_default();
+                let ready =
+                    dest.is_file() && scan::identify_dll(&dest) == scan::FileIdentity::Nvidia;
+                let size = update::probe_url(&c, &url).map(|(n, _)| n).unwrap_or(0);
+                println!(
+                    "  {:<22} {}  直链大小 {}  本地={}",
+                    dll_name,
+                    tag,
+                    util::format_bytes(size),
+                    if ready { "已就绪(NVIDIA 签名)" } else { "未下载" }
+                );
             }
         }
         Err(e) => println!("  客户端创建失败: {e}"),
@@ -633,10 +585,10 @@ fn canceltest() {
             return;
         }
     };
-    let remote = match update::fetch_remote(&c, update::INI_REPO_PATH) {
+    let remote = match update::probe_remote(&c, update::INI_REPO_PATH) {
         Ok(r) => r,
         Err(e) => {
-            println!("[FAIL] 查询远端失败: {e}");
+            println!("[FAIL] 取远端指纹失败: {e}");
             return;
         }
     };
@@ -654,12 +606,20 @@ fn canceltest() {
     // 一开始就把取消标志置上，下载循环应当在第一次读取前就退出
     let cancel = AtomicBool::new(true);
     let url = update::official_url(update::INI_REPO_PATH);
-    let r = update::download(&c, &remote, &dest, &url, &cancel, |_, _| {});
+    let r = update::download(
+        &c,
+        update::INI_REPO_PATH,
+        &dest,
+        &url,
+        Some(&remote.etag),
+        &cancel,
+        |_, _| {},
+    );
 
     println!(
         "  下载结果: {}",
         match &r {
-            Ok(()) => "意外成功了".to_owned(),
+            Ok(_) => "意外成功了".to_owned(),
             Err(e) => format!("如期失败 -> {e}"),
         }
     );
@@ -690,14 +650,14 @@ fn downloadtest() {
         }
     };
     let repo_path = update::INI_REPO_PATH;
-    let remote = match update::fetch_remote(&c, repo_path) {
+    let remote = match update::probe_remote(&c, repo_path) {
         Ok(r) => r,
         Err(e) => {
-            println!("[FAIL] 查询远端失败: {e}");
+            println!("[FAIL] 取远端指纹失败: {e}");
             return;
         }
     };
-    println!("  远端 {} sha={} size={}", remote.name, remote.blob_sha, remote.size);
+    println!("  远端 {} etag={} size={}", remote.name, remote.etag, remote.size);
 
     let dest = match update::asset_path(&update::local_name(repo_path)) {
         Ok(d) => d,
@@ -709,16 +669,35 @@ fn downloadtest() {
 
     let url = update::official_url(repo_path);
     let cancel = AtomicBool::new(false);
-    match update::download(&c, &remote, &dest, &url, &cancel, |got, total| {
-        if total > 0 && got >= total {
-            println!("  已下载 {got} / {total} 字节");
-        }
-    }) {
-        Ok(()) => {
+    match update::download(
+        &c,
+        repo_path,
+        &dest,
+        &url,
+        Some(&remote.etag),
+        &cancel,
+        |got, total| {
+            if total > 0 && got >= total {
+                println!("  已下载 {got} / {total} 字节");
+            }
+        },
+    ) {
+        Ok(dl) => {
             let data = std::fs::read(&dest).unwrap_or_default();
             let blob = util::git_blob_sha1(&data);
-            let ok = blob == remote.blob_sha;
-            println!("  [{}] 下载内容 blob sha = {}", if ok { "PASS" } else { "FAIL" }, blob);
+            let ok = dl
+                .etag
+                .as_deref()
+                .map(|e| e.eq_ignore_ascii_case(&remote.etag))
+                .unwrap_or(false);
+            println!(
+                "  [{}] 响应 ETag = {}（HEAD 拿到 {}）",
+                if ok { "PASS" } else { "FAIL" },
+                dl.etag.clone().unwrap_or_else(|| "(无)".to_owned()),
+                remote.etag
+            );
+            println!("  本地内容 sha256 = {}", dl.sha256);
+            println!("  内容 blob sha = {blob}");
             println!("  保存于: {}", dest.display());
             println!(
                 "  内容:\n{}",
@@ -947,8 +926,8 @@ struct AssetRow {
     label: String,
     detail: String,
     bytes: u64,
-    /// 核心 Mod：远端 blob sha，用来和本地下载记录比对
-    remote_blob: Option<String>,
+    /// 核心 Mod：远端内容指纹（raw 的 ETag = 内容 SHA-256），用来判断有没有更新
+    remote_etag: Option<String>,
     /// DLSS 运行库：本地文件名，靠签名判断在不在
     runtime_file: Option<String>,
 }
@@ -1163,8 +1142,12 @@ impl App {
                 AssetState::Missing
             };
         }
-        match (&row.remote_blob, self.update_state.files.get(&row.label)) {
-            (Some(remote), Some(local)) if local.blob_sha == *remote => AssetState::Ready,
+        match (&row.remote_etag, self.update_state.files.get(&row.label)) {
+            (Some(remote), Some(local))
+                if !local.etag.is_empty() && local.etag.eq_ignore_ascii_case(remote) =>
+            {
+                AssetState::Ready
+            }
             (Some(_), Some(_)) => AssetState::Outdated,
             _ => AssetState::Missing,
         }
@@ -1327,47 +1310,58 @@ impl App {
                 let version = update::fetch_version(&c);
                 let mut rows: Vec<AssetRow> = Vec::new();
 
-                // 用两次目录列举代替六个单文件查询：contents API 每小时只有 60 次配额，
-                // 列目录一次就能拿到该目录下所有文件的 blob sha。
-                let root = update::fetch_dir_listing(&c, "")?;
-                let alt = update::fetch_dir_listing(&c, "altnative").unwrap_or_default();
-
-                let mut specs: Vec<(String, update::RemoteFile)> = Vec::new();
-                for want in ["version.dll", update::INI_REPO_PATH] {
-                    if let Some(r) = root.iter().find(|r| r.name == want) {
-                        specs.push((want.to_owned(), r.clone()));
+                // 六个文件各发一次 HEAD 到 raw.githubusercontent.com 拿内容指纹。
+                // 走的是 CDN，不占 api.github.com 那每小时 60 次的配额 ——
+                // 配额被共享出口 IP 吃光正是之前「检查更新 / 下载」失败的原因。
+                let specs = [
+                    "version.dll".to_owned(),
+                    "altnative/winmm.dll".to_owned(),
+                    "altnative/dinput8.dll".to_owned(),
+                    "altnative/winhttp.dll".to_owned(),
+                    "altnative/dxgi.dll".to_owned(),
+                    update::INI_REPO_PATH.to_owned(),
+                ];
+                let mut first_err: Option<String> = None;
+                for path in specs {
+                    match update::probe_remote(&c, &path) {
+                        Ok(r) => {
+                            let local = update::local_name(&path);
+                            rows.push(AssetRow {
+                                group: "核心 Mod",
+                                label: local,
+                                detail: format!(
+                                    "内容指纹 {}",
+                                    &r.etag[..r.etag.len().min(10)]
+                                ),
+                                bytes: r.size,
+                                remote_etag: Some(r.etag),
+                                runtime_file: None,
+                            });
+                        }
+                        Err(e) => {
+                            if first_err.is_none() {
+                                first_err = Some(format!("{e}"));
+                            }
+                        }
                     }
                 }
-                for want in ["winmm.dll", "dinput8.dll", "winhttp.dll", "dxgi.dll"] {
-                    if let Some(r) = alt.iter().find(|r| r.name.ends_with(want)) {
-                        specs.push((update::local_name(&r.name), r.clone()));
+                // 一个都拿不到才算真失败；个别文件缺失不影响其它行显示
+                if rows.is_empty() {
+                    if let Some(e) = first_err {
+                        return Err(anyhow::anyhow!("{e}"));
                     }
                 }
 
-                for (local, r) in specs {
-                    rows.push(AssetRow {
-                        group: "核心 Mod",
-                        label: local,
-                        detail: format!("sha {}", &r.blob_sha[..r.blob_sha.len().min(8)]),
-                        bytes: r.size,
-                        remote_blob: Some(r.blob_sha.clone()),
-                        runtime_file: None,
-                    });
-                }
-
-                // DLSS 运行库：两个 zip release
-                for (prefix, tag, dll_name, label) in update::DLSS_RUNTIME {
-                    let asset = update::find_release_zip(&c, update::DLSS_REPO, prefix, tag)?;
-                    let dest = update::asset_path(dll_name)?;
-                    let ready = dest.is_file()
-                        && scan::identify_dll(&dest) == scan::FileIdentity::Nvidia;
-                    let _ = (ready, label);
+                // DLSS 运行库：直接拼 release 直链，再 HEAD 一下问大小，全程不碰 API
+                for (_prefix, tag, zip_name, dll_name, label) in update::DLSS_RUNTIME {
+                    let url = update::release_url(tag, zip_name);
+                    let size = update::probe_url(&c, &url).map(|(n, _)| n).unwrap_or(0);
                     rows.push(AssetRow {
                         group: "DLSS 运行库",
                         label: dll_name.to_owned(),
-                        detail: format!("{}（{}）", asset.tag, label),
-                        bytes: asset.size,
-                        remote_blob: None,
+                        detail: format!("{tag} · {zip_name}（{label}）"),
+                        bytes: size,
+                        remote_etag: None,
                         runtime_file: Some(dll_name.to_owned()),
                     });
                 }
@@ -1404,7 +1398,8 @@ impl App {
                     update::INI_REPO_PATH.to_owned(),
                 ];
                 for path in specs {
-                    let remote = update::fetch_remote(&c, &path)?;
+                    // HEAD 拿期望的内容 SHA-256（不占 API 配额，官方源和镜像都会给）
+                    let remote = update::probe_remote(&c, &path)?;
                     let local = update::local_name(&path);
                     let dest = update::asset_path(&local)?;
 
@@ -1418,31 +1413,39 @@ impl App {
                     let tx2 = tx.clone();
                     let ctx2 = ctx.clone();
                     let label = local.clone();
-                    update::download(&c, &remote, &dest, &url, &cancel, move |got, total| {
-                        let f = if total > 0 {
-                            got as f32 / total as f32
-                        } else {
-                            0.0
-                        };
-                        let _ = tx2.send(Msg::Progress(
-                            format!(
-                                "下载 {} {} / {}",
-                                label,
-                                util::format_bytes(got),
-                                util::format_bytes(total)
-                            ),
-                            f,
-                        ));
-                        ctx2.request_repaint();
-                    })?;
+                    let dl = update::download(
+                        &c,
+                        &path,
+                        &dest,
+                        &url,
+                        Some(&remote.etag),
+                        &cancel,
+                        move |got, total| {
+                            let f = if total > 0 {
+                                got as f32 / total as f32
+                            } else {
+                                0.0
+                            };
+                            let _ = tx2.send(Msg::Progress(
+                                format!(
+                                    "下载 {} {} / {}",
+                                    label,
+                                    util::format_bytes(got),
+                                    util::format_bytes(total)
+                                ),
+                                f,
+                            ));
+                            ctx2.request_repaint();
+                        },
+                    )?;
 
-                    let data = std::fs::read(&dest)?;
                     state.files.insert(
                         local,
                         update::LocalFile {
-                            blob_sha: remote.blob_sha.clone(),
-                            sha256: util::sha256_hex(&data),
-                            bytes: data.len() as u64,
+                            blob_sha: dl.blob_sha,
+                            etag: remote.etag.clone(),
+                            sha256: dl.sha256,
+                            bytes: dl.bytes,
                             downloaded_at: util::now_utc(),
                         },
                     );
@@ -1532,7 +1535,7 @@ impl App {
 
         // 两个 DLSS 运行库也是必需文件（很多游戏缺了就不生效）
         let mut files = vec![deploy::DeployFile::new(&proxy, dll.clone())];
-        for (_prefix, _tag, dll_name, label) in update::DLSS_RUNTIME {
+        for (_prefix, _tag, _zip, dll_name, label) in update::DLSS_RUNTIME {
             let p = update::asset_path(dll_name).unwrap_or_default();
             if !p.is_file() {
                 self.status = format!("缺少 {label}（{dll_name}），请先点「下载 / 更新资产」");

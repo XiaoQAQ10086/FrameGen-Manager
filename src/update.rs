@@ -1,8 +1,21 @@
 //! 更新模块。
 //!
 //! 重要：上游 sdli1995/dlssg_for_sm86 **没有 GitHub Releases，也没有 Tags**。
-//! 文件是直接提交在 main 分支根目录的（version.dll / dlssg_sm86.ini），
-//! 所以「检查 Releases」这条路根本不存在，这里改用 contents API 的 git blob sha 作为变更指纹。
+//! 文件是直接提交在 main 分支根目录的（version.dll / dlssg_sm86.ini）。
+//!
+//! **正常流程一次 GitHub API 都不调。**
+//!
+//! 原因：api.github.com 未登录时按 IP 每小时只有 60 次配额，而不少用户走加速器 /
+//! 代理，出口 IP 是共享的，配额会被别人吃光，于是「检查更新」「下载资产」直接失败。
+//!
+//! 替代方案（都已实测）：
+//!   * 变更指纹：对 raw.githubusercontent.com 发 **HEAD**，响应里的 `ETag` 就是内容的
+//!     SHA-256（64 位十六进制）。官方源和 ghproxy 镜像**都会**返回它。
+//!   * 文件下载：raw.githubusercontent.com 官方源，或镜像前缀。
+//!   * 运行库：直接拼 release 直链 github.com/{repo}/releases/download/{tag}/{asset}，
+//!     不必先问 releases API 要资产列表。
+//!
+//! 只有 release 直链失败（作者删包 / 改名）时，才回退到 releases API。
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -41,16 +54,24 @@ const USER_AGENT: &str = "FrameGen-Manager/0.1 (+https://github.com/sdli1995/dls
 const RATE_LIMIT_MSG: &str = "GitHub 接口配额用完了（未登录每小时 60 次）。\
 本地文件状态不受影响，等一会儿再点「检查更新」即可。";
 
+/// 远端文件信息。由 `probe_remote` 用 HEAD 拿到，不消耗任何 API 配额。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RemoteFile {
+    /// 仓库里的路径，如 altnative/winmm.dll
     pub name: String,
-    pub blob_sha: String,
     pub size: u64,
+    /// 内容的 SHA-256（64 位小写十六进制）。来自响应头的 ETag。
+    pub etag: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LocalFile {
+    /// 本地这份文件的 git blob sha1（显示用，也是老版本判断更新的依据）
+    #[serde(default)]
     pub blob_sha: String,
+    /// 下载时官方源给的 ETag。判断「有没有更新」就靠它。
+    #[serde(default)]
+    pub etag: String,
     pub sha256: String,
     pub bytes: u64,
     pub downloaded_at: String,
@@ -63,15 +84,18 @@ pub struct UpdateState {
 }
 
 impl UpdateState {
-    /// 远端 sha 和本地记录不同 -> 有更新。
+    /// 远端指纹和本地记录不同 -> 有更新。
     ///
     /// 注意要传**本地文件名**（比如 winmm.dll），不是仓库路径
     /// （altnative/winmm.dll）—— files 表是按本地文件名做 key 的。
     /// 早先用 remote.name 查，导致 altnative 那四个永远被判定成「有更新」。
-    pub fn needs_update(&self, local_name: &str, remote_blob_sha: &str) -> bool {
+    ///
+    /// 老版本的记录里没有 etag 字段，这时按「需要更新」处理，
+    /// 重新下载一次就会补上，属于一次性成本。
+    pub fn needs_update(&self, local_name: &str, remote_etag: &str) -> bool {
         self.files
             .get(local_name)
-            .map(|l| l.blob_sha != remote_blob_sha)
+            .map(|l| l.etag.is_empty() || !l.etag.eq_ignore_ascii_case(remote_etag))
             .unwrap_or(true)
     }
 }
@@ -85,32 +109,57 @@ pub fn client() -> Result<reqwest::blocking::Client> {
         .context("创建 HTTP 客户端失败")
 }
 
-pub fn fetch_remote(client: &reqwest::blocking::Client, name: &str) -> Result<RemoteFile> {
-    let url = format!("https://api.github.com/repos/{REPO}/contents/{name}?ref={BRANCH}");
-    let resp = client.get(&url).send().context("请求 GitHub API 失败")?;
-    let status = resp.status();
-    if status.as_u16() == 403 || status.as_u16() == 429 {
-        bail!(RATE_LIMIT_MSG);
+/// 取响应头里的 ETag，并确认它看起来就是内容的 SHA-256。
+///
+/// raw.githubusercontent.com（以及实测会透传的 ghproxy 镜像）返回的 ETag 就是
+/// 64 位十六进制的 SHA-256；不满足这个形状就当作没有，免得拿别的哈希去比对。
+fn etag_of(resp: &reqwest::blocking::Response) -> Option<String> {
+    let raw = resp.headers().get("etag")?.to_str().ok()?;
+    let v = raw.trim().trim_matches('"').trim().to_ascii_lowercase();
+    if v.len() == 64 && v.chars().all(|c| c.is_ascii_hexdigit()) {
+        Some(v)
+    } else {
+        None
     }
-    if !status.is_success() {
-        bail!("GitHub API 返回 {}", status);
+}
+
+fn content_length_of(resp: &reqwest::blocking::Response) -> u64 {
+    resp.headers()
+        .get("content-length")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(0)
+}
+
+/// HEAD 一个仓库文件，拿它的内容指纹。**不消耗 API 配额。**
+///
+/// 先问官方 raw，官方不通再问镜像 —— 两边都会返回 ETag，所以走镜像时
+/// 同样能拿到期望哈希，下载完照样能校验。
+pub fn probe_remote(client: &reqwest::blocking::Client, repo_path: &str) -> Result<RemoteFile> {
+    let official = official_url(repo_path);
+    let mirror = format!("{DEFAULT_BACKUP_PREFIX}{official}");
+    let mut last = String::from("没有可用的源");
+
+    for (label, url) in [("官方源", official), ("备用源", mirror)] {
+        match client.head(&url).send() {
+            Ok(resp) if resp.status().is_success() => {
+                let size = content_length_of(&resp);
+                match etag_of(&resp) {
+                    Some(etag) => {
+                        return Ok(RemoteFile {
+                            name: repo_path.to_owned(),
+                            size,
+                            etag,
+                        })
+                    }
+                    None => last = format!("{label} 没返回可用的 ETag"),
+                }
+            }
+            Ok(resp) => last = format!("{label} 返回 HTTP {}", resp.status().as_u16()),
+            Err(e) => last = format!("{label} {}", friendly_error(&e)),
+        }
     }
-    let text = resp.text().context("读取响应失败")?;
-    let v: serde_json::Value = serde_json::from_str(&text).context("解析 JSON 失败")?;
-    let blob_sha = v
-        .get("sha")
-        .and_then(|x| x.as_str())
-        .unwrap_or_default()
-        .to_owned();
-    let size = v.get("size").and_then(|x| x.as_u64()).unwrap_or(0);
-    if blob_sha.is_empty() {
-        bail!("GitHub 响应里没有 sha 字段");
-    }
-    Ok(RemoteFile {
-        name: name.to_owned(),
-        blob_sha,
-        size,
-    })
+    bail!("拿不到 {repo_path} 的内容指纹（{last}）")
 }
 
 /// 版本号同时出现在两处，格式略有不同：
@@ -193,20 +242,39 @@ pub fn clean_stale_partials() -> usize {
     n
 }
 
+/// 下载结果。带回去给调用方存档。
+#[derive(Debug, Clone)]
+pub struct Downloaded {
+    pub bytes: u64,
+    /// 本地算出来的内容 SHA-256（只是记录，不是校验依据）
+    pub sha256: String,
+    /// 内容的 git blob sha1（显示用，和 GitHub 的 blob sha 一致）
+    pub blob_sha: String,
+    /// 响应头里的 ETag，也就是 GitHub 给这份内容的内容指纹
+    pub etag: Option<String>,
+}
+
 /// 下载并校验。
 ///
 /// - url 由调用方决定（官方源或备用源）
 /// - cancel 置位时立刻中断，且磁盘上不留任何残留
 ///
-/// 校验方式：用下载到的字节算出 git blob sha1，必须等于 API 报的 sha。
+/// 校验方式（不再依赖 GitHub API）：
+///   1. 先 HEAD 拿到内容指纹（ETag），下载后用**响应里的 ETag** 和它比对；
+///   2. 再比对 Content-Length，防止被截断。
+///
+/// 说明：raw.githubusercontent.com 的 ETag 是 GitHub 自己的内容哈希（不是 SHA-256，
+/// 本地算不出来），所以这里比的是「两次请求说的是不是同一份内容」。
+/// 官方源直连时 HTTPS 本身已经保证了内容真实性，这一步主要是防镜像返回错东西。
 pub fn download(
     client: &reqwest::blocking::Client,
-    remote: &RemoteFile,
+    repo_path: &str,
     dest: &Path,
     url: &str,
+    expect_etag: Option<&str>,
     cancel: &AtomicBool,
     mut progress: impl FnMut(u64, u64),
-) -> Result<()> {
+) -> Result<Downloaded> {
     let tmp = part_path(dest);
     let _ = std::fs::remove_file(&tmp);
 
@@ -216,12 +284,10 @@ pub fn download(
         .map_err(|e| anyhow::anyhow!(friendly_error(&e)))?;
     let status = resp.status();
     if !status.is_success() {
-        bail!("下载 {} 返回 HTTP {}", remote.name, status.as_u16());
+        bail!("下载 {repo_path} 返回 HTTP {}", status.as_u16());
     }
-    let total = resp
-        .content_length()
-        .filter(|n| *n > 0)
-        .unwrap_or(remote.size);
+    let resp_etag = etag_of(&resp);
+    let total = resp.content_length().filter(|n| *n > 0).unwrap_or(0);
 
     let mut buf: Vec<u8> = Vec::with_capacity(total as usize);
     let mut chunk = vec![0u8; 64 * 1024];
@@ -242,12 +308,21 @@ pub fn download(
         progress(got, total);
     }
 
-    let actual = util::git_blob_sha1(&buf);
-    if actual != remote.blob_sha {
+    // 指纹比对：下载响应说的必须是同一份内容
+    if let (Some(exp), Some(got)) = (expect_etag, &resp_etag) {
+        if !exp.eq_ignore_ascii_case(got) {
+            let _ = std::fs::remove_file(&tmp);
+            bail!(
+                "完整性校验失败：{repo_path} 的内容指纹和仓库对不上，已丢弃（镜像可能返回了错误内容）"
+            );
+        }
+    }
+    // 长度比对：防截断
+    if total > 0 && buf.len() as u64 != total {
         let _ = std::fs::remove_file(&tmp);
         bail!(
-            "完整性校验失败：{} 的内容与仓库记录不一致，已丢弃（镜像可能返回了错误内容）",
-            remote.name
+            "下载不完整：{repo_path} 期望 {total} 字节，实际只收到 {} 字节，已丢弃",
+            buf.len()
         );
     }
 
@@ -257,7 +332,12 @@ pub fn download(
     std::fs::write(&tmp, &buf)?;
     util::atomic_replace(&tmp, dest)?;
     util::clear_motw(dest);
-    Ok(())
+    Ok(Downloaded {
+        bytes: buf.len() as u64,
+        sha256: util::sha256_hex(&buf),
+        blob_sha: util::git_blob_sha1(&buf),
+        etag: resp_etag,
+    })
 }
 
 fn state_path() -> Result<PathBuf> {
@@ -381,11 +461,31 @@ pub const DEFAULT_BACKUP_PREFIX: &str = "https://ghproxy.net/";
 /// 运行库来源仓库
 pub const DLSS_REPO: &str = "RankFTW/rhi-repo";
 
-/// (release tag 前缀, 期望 tag, 解出来的文件名, 界面显示名)
-pub const DLSS_RUNTIME: [(&str, &str, &str, &str); 2] = [
-    ("dlssg-", "dlssg-310.9.1", "nvngx_dlssg.dll", "DLSS 帧生成运行库"),
-    ("dlss-", "dlss-310.9.1", "nvngx_dlss.dll", "DLSS 超分运行库"),
+/// (release tag 前缀, 期望 tag, 压缩包文件名, 解出来的文件名, 界面显示名)
+///
+/// 压缩包名是实测从仓库 releases 里查出来写死的。有了它就能直接拼直链下载，
+/// 不必先调 releases API 拿资产列表 —— 这一步正是配额用完后卡住下载的地方。
+pub const DLSS_RUNTIME: [(&str, &str, &str, &str, &str); 2] = [
+    (
+        "dlssg-",
+        "dlssg-310.9.1",
+        "nvngx_dlssg_310.9.1.zip",
+        "nvngx_dlssg.dll",
+        "DLSS 帧生成运行库",
+    ),
+    (
+        "dlss-",
+        "dlss-310.9.1",
+        "nvngx_dlss_310.9.1.zip",
+        "nvngx_dlss.dll",
+        "DLSS 超分运行库",
+    ),
 ];
+
+/// release 资产的直链。github.com 直连不通时，调用方会在前面拼镜像前缀。
+pub fn release_url(tag: &str, asset_name: &str) -> String {
+    format!("https://github.com/{DLSS_REPO}/releases/download/{tag}/{asset_name}")
+}
 
 #[derive(Debug, Clone)]
 pub struct ReleaseAsset {
@@ -414,61 +514,6 @@ fn pick_zip_asset(release: &serde_json::Value, tag: &str) -> Option<ReleaseAsset
         });
     }
     None
-}
-
-/// 列一个目录下的所有文件。
-///
-/// 一次调用就能拿到该目录下全部文件的 blob sha —— 比逐文件查询省得多。
-/// GitHub 未认证 API 每小时只有 60 次配额，逐文件查六个文件就吃掉 6 次。
-pub fn fetch_dir_listing(
-    client: &reqwest::blocking::Client,
-    dir_path: &str,
-) -> Result<Vec<RemoteFile>> {
-    let url = if dir_path.is_empty() {
-        format!("https://api.github.com/repos/{REPO}/contents?ref={BRANCH}")
-    } else {
-        format!("https://api.github.com/repos/{REPO}/contents/{dir_path}?ref={BRANCH}")
-    };
-    let resp = client.get(&url).send().context("请求 GitHub API 失败")?;
-    let status = resp.status();
-    if status.as_u16() == 403 || status.as_u16() == 429 {
-        bail!(RATE_LIMIT_MSG);
-    }
-    if !status.is_success() {
-        bail!("GitHub API 返回 {}", status.as_u16());
-    }
-    let text = resp.text().context("读取响应失败")?;
-    Ok(parse_dir_listing(&text))
-}
-
-/// 解析 contents API 的目录列举响应。抽出来是为了能离线测试。
-pub fn parse_dir_listing(text: &str) -> Vec<RemoteFile> {
-    let mut out = Vec::new();
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(text) else {
-        return out;
-    };
-    let Some(arr) = v.as_array() else {
-        return out;
-    };
-    for e in arr {
-        // 目录项和符号链接跳过
-        if e.get("type").and_then(|x| x.as_str()) != Some("file") {
-            continue;
-        }
-        let name = e.get("name").and_then(|x| x.as_str()).unwrap_or_default();
-        let path = e.get("path").and_then(|x| x.as_str()).unwrap_or(name);
-        let blob_sha = e.get("sha").and_then(|x| x.as_str()).unwrap_or_default();
-        let size = e.get("size").and_then(|x| x.as_u64()).unwrap_or(0);
-        if name.is_empty() || blob_sha.is_empty() {
-            continue;
-        }
-        out.push(RemoteFile {
-            name: path.to_owned(),
-            blob_sha: blob_sha.to_owned(),
-            size,
-        });
-    }
-    out
 }
 
 /// 找 release 里的 zip 资产。
@@ -522,7 +567,7 @@ pub fn download_raw(
     url: &str,
     dest: &Path,
     cancel: &AtomicBool,
-    mut progress: impl FnMut(u64, u64),
+    progress: &mut dyn FnMut(u64, u64),
 ) -> Result<u64> {
     let tmp = part_path(dest);
     let _ = std::fs::remove_file(&tmp);
@@ -561,6 +606,39 @@ pub fn download_raw(
     util::atomic_replace(&tmp, dest)?;
     util::clear_motw(dest);
     Ok(buf.len() as u64)
+}
+
+/// HEAD 任意 URL，拿 (大小, ETag)。发布资产也有 Content-Length，够界面显示用了。
+/// 同样先官方后镜像，失败返回 None（只是显示不出大小，不影响下载）。
+pub fn probe_url(client: &reqwest::blocking::Client, url: &str) -> Option<(u64, String)> {
+    for u in [url.to_owned(), format!("{}{}", DEFAULT_BACKUP_PREFIX, url)] {
+        if let Ok(r) = client.head(&u).send() {
+            if r.status().is_success() {
+                return Some((content_length_of(&r), etag_of(&r).unwrap_or_default()));
+            }
+        }
+    }
+    None
+}
+
+/// 先试官方地址，失败再试镜像前缀。
+/// 两边都失败时把两个错误一起报出来，方便看出到底卡在哪一环。
+fn download_with_mirror(
+    client: &reqwest::blocking::Client,
+    official: &str,
+    dest: &Path,
+    cancel: &AtomicBool,
+    progress: &mut dyn FnMut(u64, u64),
+) -> Result<u64> {
+    match download_raw(client, official, dest, cancel, progress) {
+        Ok(n) => Ok(n),
+        Err(e1) => {
+            let mirror = format!("{}{}", DEFAULT_BACKUP_PREFIX, official);
+            progress(0, 0);
+            download_raw(client, &mirror, dest, cancel, progress)
+                .map_err(|e2| anyhow::anyhow!("官方源失败（{e1}）；备用源也失败（{e2}）"))
+        }
+    }
 }
 
 // ---------------------------------------------------------------- ZIP 单文件解压
@@ -679,7 +757,7 @@ pub fn ensure_dlss_runtime(
     let dir = util::assets_dir()?;
     let mut out = Vec::new();
 
-    for (prefix, tag, dll_name, label) in DLSS_RUNTIME {
+    for (prefix, tag, zip_name, dll_name, label) in DLSS_RUNTIME {
         let dest = dir.join(dll_name);
 
         if dest.is_file() && scan::identify_dll(&dest) == scan::FileIdentity::Nvidia {
@@ -688,25 +766,46 @@ pub fn ensure_dlss_runtime(
             continue;
         }
 
-        let asset = find_release_zip(client, DLSS_REPO, prefix, tag)?;
-        let zip_path = dir.join(&asset.asset_name);
-        progress(
-            format!("下载 {label}（{}）", util::format_bytes(asset.size)),
-            0.0,
-        );
+        // 直链下载：这一步不消耗任何 GitHub API 配额
+        let official = release_url(tag, zip_name);
+        let zip_path = dir.join(zip_name);
+        progress(format!("下载 {label}..."), 0.0);
 
-        download_raw(client, &asset.url, &zip_path, cancel, |got, total| {
-            let t = if total > 0 { total } else { asset.size };
-            let f = if t > 0 { got as f32 / t as f32 } else { 0.0 };
-            progress(
-                format!(
-                    "下载 {label} {} / {}",
-                    util::format_bytes(got),
-                    util::format_bytes(t)
-                ),
-                f,
-            );
-        })?;
+        let direct = {
+            let mut relay = |got: u64, total: u64| {
+                let f = if total > 0 { got as f32 / total as f32 } else { 0.0 };
+                progress(
+                    format!(
+                        "下载 {label} {} / {}",
+                        util::format_bytes(got),
+                        util::format_bytes(total)
+                    ),
+                    f,
+                );
+            };
+            download_with_mirror(client, &official, &zip_path, cancel, &mut relay)
+        };
+
+        if let Err(e) = direct {
+            // 直链彻底失败才回退去问 releases API：作者删包 / 改名时会走到这里
+            let asset = find_release_zip(client, DLSS_REPO, prefix, tag).map_err(|e2| {
+                anyhow::anyhow!("直链下载失败（{e}）；改用 Releases 接口也没成功：{e2}")
+            })?;
+            progress(format!("{label} 改用 Releases 接口重试"), 0.0);
+            let mut relay = |got: u64, total: u64| {
+                let t = if total > 0 { total } else { asset.size };
+                let f = if t > 0 { got as f32 / t as f32 } else { 0.0 };
+                progress(
+                    format!(
+                        "下载 {label} {} / {}",
+                        util::format_bytes(got),
+                        util::format_bytes(t)
+                    ),
+                    f,
+                );
+            };
+            download_with_mirror(client, &asset.url, &zip_path, cancel, &mut relay)?;
+        }
 
         progress(format!("解压 {label} ..."), 1.0);
         let extracted = zip_extract_dll(&zip_path, &dest)?;

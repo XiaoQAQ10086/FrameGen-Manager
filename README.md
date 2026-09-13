@@ -86,12 +86,29 @@ Windows 桌面工具，把 [sdli1995/dlssg_for_sm86](https://github.com/sdli1995
 所以本工具会一并下载部署这两个运行库（DLSS FG 310.9.1 / DLSS SR 310.9.1）。
 
 - 来源：社区仓库 [RankFTW/rhi-repo](https://github.com/RankFTW/rhi-repo) 的 GitHub Releases
+- **不走 GitHub 接口**：直接拼 Releases 直链下载，不先查 API，所以不会撞上「接口配额用完」
 - **为什么可以信任**：这两个 DLL 由 **NVIDIA 官方签名**。程序解压后会读取 PE 证书表，
   校验签名者必须是 NVIDIA Corporation，不符合就丢弃报错。该仓库只做搬运打包，没有改动内容。
 - 下载完的 zip 会**立即删除**，只保留解压出来的 DLL。
 
 **本程序不分发、也不打包 NVIDIA 的任何文件。** 运行库由用户在程序内主动触发下载，
 版权归 NVIDIA Corporation 所有。本工具与 NVIDIA、sdli1995、RankFTW 均无关联。
+
+## 关于 GitHub 接口配额
+
+GitHub 未登录的 API 按 **IP** 每小时只有 60 次。很多人的加速器 / 代理是共享出口 IP 的，
+配额会被别人吃光 —— 表现出来就是「检查更新」「下载资产」莫名失败，自己怎么查都查不出原因。
+
+**本工具已经把正常流程的 API 调用降到 0 次：**
+
+| 用途 | 做法 |
+|---|---|
+| 判断上游有没有更新 | 对 raw.githubusercontent.com 发 HEAD，比对响应里的 ETag |
+| 下载 Mod 文件 | 直接从 raw.githubusercontent.com 下（连不上就用镜像前缀） |
+| 下载 DLSS 运行库 | 直接拼 Releases 直链 github.com/.../releases/download/... |
+
+只有运行库直链失效（上游删包 / 改名）时，才回退去问一次 Releases 接口。
+正常情况下不会再看到配额相关的报错。
 
 ## 数据放在哪
 

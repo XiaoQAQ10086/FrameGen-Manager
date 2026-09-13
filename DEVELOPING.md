@@ -28,11 +28,10 @@ Rust + egui/eframe。**不许用** Electron / Tauri / WebView。
     cargo run -- --selftest        # 扫描游戏库 + 反作弊 + 更新检查 + 入口推荐 + 显卡
     cargo run -- --deploytest      # 部署 / 备份 / 还原 / 冲突 / 已装过本项目 端到端断言
     cargo run -- --canceltest      # 取消下载 + 残留清理
-    cargo run -- --downloadtest    # 下载 581B 的 ini 并验证 git blob sha
-    cargo run -- --backuptest      # 实测备用源可用性
-    cargo run -- --dlssrun         # 下载 DLSS 运行库：查 release -> 下载 -> 解压 -> 删包 -> 验签
+    cargo run -- --downloadtest    # HEAD 取 ETag -> 下载 581B 的 ini -> 校验指纹（0 次 API）
+    cargo run -- --backuptest      # 实测备用源，并验证镜像也会透传 ETag
+    cargo run -- --dlssrun         # 下载 DLSS 运行库：直链 -> 下载 -> 解压 -> 删包 -> 验签
     cargo run -- --ziptest <zip> <输出>   # 单独测 zip 解压
-    cargo run -- --dirtest                # 离线测目录列举解析
     cargo run -- --idtest <文件>          # 看一个文件的签名身份
     cargo run -- --icontest <exe>         # 提取图标并打印尺寸/透明度统计
     cargo run -- --pedump <exe>           # 打印 PE 导入表
@@ -79,8 +78,8 @@ Rust + egui/eframe。**不许用** Electron / Tauri / WebView。
 ## 上游（sdli1995/dlssg_for_sm86）的两个事实
 
 1. **上游没有 GitHub Releases，也没有 Tags。** 文件直接提交在 main 分支根目录。
-   所以更新检查走 contents API 的 git blob sha 做变更指纹，即
-   sha1("blob <len>\0" + content)；下载后本地重算这个哈希并与 API 返回值比对。
+   所以「查 Releases」这条路本来就不存在；变更指纹改用 raw.githubusercontent.com
+   的 ETag —— 对文件发一次 HEAD 就能拿到，且不占 API 配额。
 2. **altnative/ 下的四个 DLL 不是 version.dll 改个名**，而是导出名不同的独立二进制
    （体积都不同）。选了非默认入口就必须下载对应那一个。
 
@@ -118,14 +117,34 @@ PE 解析是**随机读取**的：先读头部拿节表，再按节表把 RVA �
 都能取到。踩过的坑：SHGetFileInfoW 遇到混合分隔符路径（d:/steam\...）会直接失败，
 而 Steam 注册表里的 SteamPath 就是带正斜杠的，所以要先归一化。
 
-### 下载与备用源
+### 下载与备用源：正常流程 0 次 API 调用
 
-官方走 raw.githubusercontent.com（国内间歇性不可达）。失败后界面会给一个
-「改用备用源重试」按钮，用内置前缀 https://ghproxy.net/。
-备用源返回的内容同样用 git blob sha 校验，内容不符会被拒绝，所以换镜像不影响安全性。
+**这是本模块最重要的一条设计约束：正常使用全程不碰 api.github.com。**
 
-GitHub 未登录 API 每小时只有 60 次配额，所以更新检查用**两次目录列举**代替
-逐文件查询（从 8 次调用降到 4 次），并且本地文件状态完全按本地判断、不依赖网络。
+原因：未登录的 GitHub API 按 IP 每小时只有 60 次配额。很多用户走加速器 / 代理，
+出口 IP 是共享的，配额会被别人吃光，于是「检查更新」「下载资产」直接失败，
+而用户自己完全无从排查。所以整套流程都换成了没有配额的通道：
+
+| 用途 | 原来 | 现在 |
+|---|---|---|
+| 变更指纹 | contents API 的 blob sha（1 次/目录） | 对 raw 发 HEAD 读 ETag（0 次） |
+| 下载 Mod 文件 | raw.githubusercontent.com | 同左（0 次） |
+| 下载运行库 | releases API 查资产列表 | 直拼 releases/download/{tag}/{asset}（0 次） |
+
+几条实测结论，别凭直觉改：
+
+* raw 的 ETag 是 64 位十六进制，但它**不是内容的 SHA-256**，也和 git blob sha1 对不上
+  （sha256(blob N\\0+content)、sha256(blob N+content)、sha256(hex(blob sha1)) 三种都试过，
+  全不匹配）。它是 GitHub 内部的不透明哈希，**只能当变更指纹，不能当内容哈希算**。
+* 这个 ETag 在 HEAD 和 GET 上一致；ghproxy 镜像会把 GitHub 的响应头原样透传
+  （连 X-Served-By 都在），所以走镜像时也能拿到同一个 ETag 用于比对。
+* 因此下载校验 = 「HEAD 拿到的 ETag」对比「GET 响应里的 ETag」，外加 Content-Length 比对。
+  官方源直连时 HTTPS 本身已保证内容真实性，这一步主要防镜像返回错东西。
+* 运行库的资产名（nvngx_dlssg_310.9.1.zip 等）写死在 DLSS_RUNTIME 表里；
+  上游改名 / 删包导致直链失败时，才回退去问一次 releases API。
+
+官方源不可达时界面会给「改用备用源重试」，前缀 https://ghproxy.net/。
+本地文件状态完全按本地判断，不依赖网络。
 
 ### 显卡名称伪装（注册表）
 
