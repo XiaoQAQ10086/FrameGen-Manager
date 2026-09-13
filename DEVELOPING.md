@@ -29,6 +29,7 @@ Rust + egui/eframe。**不许用** Electron / Tauri / WebView。
     cargo run -- --deploytest      # 部署 / 备份 / 还原 / 冲突 / 已装过本项目 端到端断言
     cargo run -- --canceltest      # 取消下载 + 残留清理
     cargo run -- --downloadtest    # HEAD 取 ETag -> 下载 581B 的 ini -> 校验指纹（0 次 API）
+    cargo run -- --speedtest       # 走生产路径（镜像优先 + 签名校验）实测下载速度
     cargo run -- --backuptest      # 实测备用源，并验证镜像也会透传 ETag
     cargo run -- --dlssrun         # 下载 DLSS 运行库：直链 -> 下载 -> 解压 -> 删包 -> 验签
     cargo run -- --ziptest <zip> <输出>   # 单独测 zip 解压
@@ -151,31 +152,57 @@ PE 解析是**随机读取**的：先读头部拿节表，再按节表把 RVA �
 * raw 的 ETag 是 64 位十六进制，但它**不是内容的 SHA-256**，也和 git blob sha1 对不上
   （sha256(blob N\\0+content)、sha256(blob N+content)、sha256(hex(blob sha1)) 三种都试过，
   全不匹配）。它是 GitHub 内部的不透明哈希，**只能当变更指纹，不能当内容哈希算**。
-* 这个 ETag 在 HEAD 和 GET 上一致；ghproxy 镜像会把 GitHub 的响应头原样透传
-  （连 X-Served-By 都在），所以走镜像时也能拿到同一个 ETag 用于比对。
-* 因此下载校验 = 「HEAD 拿到的 ETag」对比「GET 响应里的 ETag」，外加 Content-Length 比对。
-  官方源直连时 HTTPS 本身已保证内容真实性，这一步主要防镜像返回错东西。
+* 这个 ETag 在 HEAD 和 GET 上一致；**但只有部分镜像会透传它**。ghproxy.net 会
+  （连 X-Served-By 都带过来），而 **gh-proxy.com 不会** —— 走后者时 ETag 比对会落空，
+  只剩 Content-Length 校验。所以下面「镜像优先就必须配签名校验」是一条硬要求。
 * 运行库的资产名（nvngx_dlssg_310.9.1.zip 等）写死在 DLSS_RUNTIME 表里；
   上游改名 / 删包导致直链失败时，才回退去问一次 releases API。
 
-官方源不可达时界面会给「改用备用源重试」，前缀 https://ghproxy.net/。
-本地文件状态完全按本地判断，不依赖网络。
+#### 镜像排序，以及「快」和「可信」的分工
 
-**源偏好是有记忆的**：\`try_both()\` 记住上一次哪个源成功，下次先试它。
-而且是**按主机分别记**（\`PREFER_MIRROR_RAW\` / \`PREFER_MIRROR_GH\`）——
-raw.githubusercontent.com 在国内通常直连没问题，而 release 直链用的 github.com
-往往要先干等 15 秒连接超时才轮到镜像。两边共用一个标志会互相覆盖，等于没缓存。
+`MIRRORS` 按**实测速度**排（2026-09，拉 raw 上的 version.dll，8 MB 样本，跑两轮）：
+
+| 源 | 速率 |
+|---|---|
+| gh-proxy.com | 3.9 ~ 5.2 MB/s |
+| ghfast.top | 0.5 ~ 0.9 MB/s |
+| ghproxy.net | 0.02 ~ 0.16 MB/s（原来内置的是它） |
+| raw 官方直连 | 0.00 ~ 0.06 MB/s（基本不通） |
+
+48 MB 资产：ghproxy.net 要十几分钟，gh-proxy.com 十几秒。随时可以用
+`cargo run -- --speedtest` 复测 —— 它走的就是界面那条生产路径。
+
+难点是**快的不可信、可信的不快**，所以探测和下载的优先级是**反的**：
+
+* **探测（HEAD，取 ETag 指纹）走官方优先。** 指纹从 GitHub 自己那里拿才可信；
+  HEAD 很小，官方 raw 就算链路很慢也能秒回。
+* **下载走镜像优先。** 镜像快几十倍，内容再拿官方指纹校验。
+
+gh-proxy.com 不转发 ETag，等于下载侧少了一道校验，所以 `download_auto()` 强制
+要求调用方传 `verify` 回调，并按文件类型分开处理：
+
+* **代理 DLL（15 MB，prefer_mirror = true）**：下完必须
+  `identify_dll().is_ours()` —— 这 5 个 DLL 都由 DLSSG Native Project 自签，
+  镜像伪造不出来。签名不过就丢弃并换源重试。
+* **ini（581 B，prefer_mirror = false）**：走官方优先。官方再慢也是瞬间，而且**会**
+  返回 ETag，比对能真正生效。ini 没有签名，这是它唯一的校验手段。
+
+界面上的「改用备用源重试」现在只是手动兜底；正常路径会自动多源回退，不用用户点。
+
+**源偏好是有记忆的**：`try_sources()` 记住每个「主机 + 用途」上一次哪个候选成功，
+下次从它开始试（`PREF` 四个槽：raw / github.com × 探测 / 下载）。
+不记的话，release 直链用的 github.com 每次都要先干等 15 秒连接超时才轮到镜像。
 
 ### 资产状态与部署的几条规矩
 
-**资产状态以磁盘为准。** \`App::asset_state()\` 必须先确认文件真的还在 assets 目录里，
+**资产状态以磁盘为准。** `App::asset_state()` 必须先确认文件真的还在 assets 目录里，
 再去看 update_state.json 里的下载记录。只信记录会造成「用户把资产删光了，界面还显示
 已就绪」—— 记录在，文件早没了。判定顺序：文件不存在 -> 未下载；大小与记录不符（被改过
 或没下完）-> 有更新；再比 ETag。
 
 **重部署必须沿用第一次的备份。** 上游更新后用户会再点一次「部署」。如果这时把「我们
 上次部署进去的文件」当成游戏原文件重新备份，就会覆盖掉真正的原件，之后「还原」只能
-还原出我们自己部署的那一版 —— 原件永久丢失。所以 \`deploy()\` 会先查旧 manifest，
+还原出我们自己部署的那一版 —— 原件永久丢失。所以 `deploy()` 会先查旧 manifest，
 已经有原始备份的条目直接沿用，绝不重下备份。备份文件本身丢了的才重新备份。
 
 **换代理入口要清掉旧的。** 用户手动换入口再部署时，旧的那个会留在游戏目录里，而且新
@@ -194,7 +221,7 @@ manifest 里没有它 —— 变成「还原也管不到」的孤儿，游戏加
    （DEV_228B 就是音频设备，ClassGUID 是 {4d36e97d-...}）。
 3. **故意不改类键的 `DriverDesc`。** 本程序自己的 SM86 / SM75 路由判断读的就是它；
    改掉之后程序会把 RTX 30 系误判成「RTX 50 系，不需要本 Mod」。
-4. **写之前必须备份并读回校验。** 备份落在程序同级的 `backups\gpu-name\`，
+4. **写之前必须备份并读回校验。** 备份落在程序同级的 `backups\gpu-name`，
    存的是「第一次改动之前」的值，之后重复改不会把它覆盖掉。
 5. **型号只能从 `gpu::PRESETS` 里选**，`apply()` 会再校验一次，不在名单里直接拒绝。
 

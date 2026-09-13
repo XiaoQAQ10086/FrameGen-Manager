@@ -26,7 +26,7 @@ use std::time::Duration;
 
 use crate::scan::{self, GpuRoute};
 use crate::util;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 pub const REPO: &str = "sdli1995/dlssg_for_sm86";
 pub const BRANCH: &str = "main";
@@ -109,46 +109,64 @@ pub fn client() -> Result<reqwest::blocking::Client> {
         .context("创建 HTTP 客户端失败")
 }
 
-/// 记住上一次哪个源能用，下次先试它。
+/// 记住每个「主机 + 用途」上一次哪个候选成功，下次从它开始试。
 ///
-/// 不这么做的话：github.com 被墙的机器上，每次检查都要先干等 15 秒连接超时
-/// 才轮到镜像；运行库直链正是 github.com，于是白白多等两次。
-/// 两个主机分别记：raw.githubusercontent.com 通常直连没问题，
-/// github.com（release 直链）在墙内往往要等 15 秒连接超时才轮到镜像。
-/// 共用一个标志会被两边来回覆盖，等于没缓存。
-static PREFER_MIRROR_RAW: AtomicBool = AtomicBool::new(false);
-static PREFER_MIRROR_GH: AtomicBool = AtomicBool::new(false);
+/// 下标 = 主机 * 2 + 用途（0 探测 / 1 下载）：
+///   主机 0 = raw.githubusercontent.com，主机 1 = github.com（release 直链）
+/// 不记的话，github.com 被墙的机器每次都要先干等 15 秒连接超时。
+static PREF: [AtomicUsize; 4] = [
+    AtomicUsize::new(0),
+    AtomicUsize::new(0),
+    AtomicUsize::new(0),
+    AtomicUsize::new(0),
+];
 
-fn prefer_slot(url: &str) -> &'static AtomicBool {
-    if url.contains("raw.githubusercontent.com") {
-        &PREFER_MIRROR_RAW
+fn pref_slot(official: &str, download: bool) -> &'static AtomicUsize {
+    let host = if official.contains("raw.githubusercontent.com") {
+        0
     } else {
-        &PREFER_MIRROR_GH
-    }
+        1
+    };
+    &PREF[host * 2 + usize::from(download)]
 }
 
-/// 依次尝试官方源和镜像，顺序由上次的成功经验决定。
-/// attempt(url, 是不是镜像) 负责实际请求。
-fn try_both<T>(official: &str, mut attempt: impl FnMut(&str, bool) -> Result<T>) -> Result<T> {
-    let slot = prefer_slot(official);
-    let mirror = format!("{}{}", DEFAULT_BACKUP_PREFIX, official);
-    let order: [(String, bool); 2] = if slot.load(Ordering::Relaxed) {
-        [(mirror, true), (official.to_owned(), false)]
+/// 按候选顺序依次尝试，第一个成功的胜出，并记住它的位置。
+///
+/// **探测和下载的优先级是反的，这是故意的**：
+/// * 探测（HEAD，拿 ETag 指纹）走**官方优先** —— 指纹要从 GitHub 自己那里拿才可信。
+///   HEAD 很小，官方 raw 即使是慢速链路也能秒回。
+/// * 下载走**镜像优先** —— 镜像实测快几十倍，而内容仍然用官方拿到的指纹校验，
+///   所以既快又不牺牲可信度。
+fn try_sources<T>(
+    official: &str,
+    mirrors: &[String],
+    download: bool,
+    mut attempt: impl FnMut(&str) -> Result<T>,
+) -> Result<T> {
+    let mut urls: Vec<(String, &'static str)> = Vec::with_capacity(mirrors.len() + 1);
+    if download {
+        for m in mirrors {
+            urls.push((format!("{m}{official}"), "备用源"));
+        }
+        urls.push((official.to_owned(), "官方源"));
     } else {
-        [(official.to_owned(), false), (mirror, true)]
-    };
+        urls.push((official.to_owned(), "官方源"));
+        for m in mirrors {
+            urls.push((format!("{m}{official}"), "备用源"));
+        }
+    }
 
+    let slot = pref_slot(official, download);
+    let start = slot.load(Ordering::Relaxed).min(urls.len() - 1);
     let mut errs: Vec<String> = Vec::new();
-    for (url, is_mirror) in order {
-        match attempt(&url, is_mirror) {
+    for k in 0..urls.len() {
+        let i = (start + k) % urls.len();
+        match attempt(&urls[i].0) {
             Ok(v) => {
-                slot.store(is_mirror, Ordering::Relaxed);
+                slot.store(i, Ordering::Relaxed);
                 return Ok(v);
             }
-            Err(e) => errs.push(format!(
-                "{}失 {e}",
-                if is_mirror { "备用源" } else { "官方源" }
-            )),
+            Err(e) => errs.push(format!("{}：{e}", urls[i].1)),
         }
     }
     bail!("{}", errs.join("；"))
@@ -182,7 +200,8 @@ fn content_length_of(resp: &reqwest::blocking::Response) -> u64 {
 /// 同样能拿到期望哈希，下载完照样能校验。
 pub fn probe_remote(client: &reqwest::blocking::Client, repo_path: &str) -> Result<RemoteFile> {
     let official = official_url(repo_path);
-    try_both(&official, |url, _| {
+    let ms = mirrors("");
+    try_sources(&official, &ms, false, |url| {
         let resp = client
             .head(url)
             .send()
@@ -281,6 +300,37 @@ pub fn clean_stale_partials() -> usize {
     n
 }
 
+/// 自动选源下载一个仓库文件。这就是界面上「下载 / 更新资产」走的路径，
+/// 不用用户再手点「改用备用源」。
+///
+/// **prefer_mirror 是有讲究的：**
+/// * 大文件（15 MB 的代理 DLL）传 true —— 镜像实测快几十倍。代价是
+///   gh-proxy.com **不转发 ETag**，那边 ETag 比对会落空，必须靠 `verify` 里的
+///   签名校验兜住（这 5 个代理 DLL 都有本项目签名，镜像伪造不出来）。
+/// * 小文件（581 B 的 ini）传 false —— 官方源再慢也是瞬间，而且官方**会**给
+///   ETag，比对能真正生效。ini 没有签名，只能靠这个。
+///
+/// `verify` 失败时返回 Err 就会自动换下一个源重试。
+pub fn download_auto(
+    client: &reqwest::blocking::Client,
+    repo_path: &str,
+    dest: &Path,
+    expect_etag: Option<&str>,
+    cancel: &AtomicBool,
+    custom_prefix: &str,
+    prefer_mirror: bool,
+    verify: &dyn Fn(&Path) -> Result<()>,
+    progress: &mut dyn FnMut(u64, u64),
+) -> Result<Downloaded> {
+    let official = official_url(repo_path);
+    let ms = mirrors(custom_prefix);
+    try_sources(&official, &ms, prefer_mirror, |url| {
+        let dl = download(client, repo_path, dest, url, expect_etag, cancel, progress)?;
+        verify(dest)?;
+        Ok(dl)
+    })
+}
+
 /// 下载结果。带回去给调用方存档。
 #[derive(Debug, Clone)]
 pub struct Downloaded {
@@ -312,7 +362,7 @@ pub fn download(
     url: &str,
     expect_etag: Option<&str>,
     cancel: &AtomicBool,
-    mut progress: impl FnMut(u64, u64),
+    progress: &mut dyn FnMut(u64, u64),
 ) -> Result<Downloaded> {
     let tmp = part_path(dest);
     let _ = std::fs::remove_file(&tmp);
@@ -493,9 +543,35 @@ pub fn prepare_deploy_ini(route: GpuRoute, gpu_name: Option<&str>) -> Result<Ini
 // 这两个文件由 NVIDIA 官方签名，这里从社区仓库的 release 里取（该仓库只做搬运打包，
 // 我们解压后会校验签名者必须是 NVIDIA，否则丢弃）。
 
-/// 内置的备用下载源。官方 raw.githubusercontent.com 连不上时用这个前缀拼接。
-/// 这个地址是实测可用的（拉下来的 ini 内容与官方完全一致）。
-pub const DEFAULT_BACKUP_PREFIX: &str = "https://ghproxy.net/";
+/// 内置镜像，按**实测速度**从快到慢排。
+///
+/// 2026-09 本机实测（拉 raw 上的 version.dll，每次 8 MB 样本，跑两轮）：
+///   gh-proxy.com   3.9 ~ 5.2 MB/s
+///   ghfast.top     0.5 ~ 0.9 MB/s
+///   ghproxy.net    0.02 ~ 0.16 MB/s   <- 原来内置的是它，慢到基本不可用
+///   raw 官方直连   0.00 ~ 0.06 MB/s   <- 基本不通
+/// 换成 gh-proxy.com 之后，48 MB 资产从十几分钟降到十几秒。
+pub const MIRRORS: [&str; 3] = [
+    "https://gh-proxy.com/",
+    "https://ghfast.top/",
+    "https://ghproxy.net/",
+];
+
+/// 默认备用源（= 最快的那个镜像）。界面上「当前备用源」显示的就是它。
+pub const DEFAULT_BACKUP_PREFIX: &str = "https://gh-proxy.com/";
+
+/// 实际要试的镜像列表。
+///
+/// 用户在界面上填了自定义前缀就只试它；留空、或者填的正好是内置的那几个，
+/// 就用完整的内置列表 —— 这样才能自动在多个镜像之间回退。
+fn mirrors(custom: &str) -> Vec<String> {
+    let c = custom.trim();
+    if c.is_empty() || MIRRORS.contains(&c) {
+        MIRRORS.iter().map(|s| (*s).to_owned()).collect()
+    } else {
+        vec![c.to_owned()]
+    }
+}
 
 /// 运行库来源仓库
 pub const DLSS_REPO: &str = "RankFTW/rhi-repo";
@@ -650,7 +726,8 @@ pub fn download_raw(
 /// HEAD 任意 URL，拿 (大小, ETag)。发布资产也有 Content-Length，够界面显示用了。
 /// 同样先官方后镜像，失败返回 None（只是显示不出大小，不影响下载）。
 pub fn probe_url(client: &reqwest::blocking::Client, url: &str) -> Option<(u64, String)> {
-    try_both(url, |u, _| {
+    let ms = mirrors("");
+    try_sources(url, &ms, false, |u| {
         let r = client.head(u).send().map_err(|e| anyhow::anyhow!("{e}"))?;
         if !r.status().is_success() {
             bail!("HTTP {}", r.status().as_u16());
@@ -660,8 +737,8 @@ pub fn probe_url(client: &reqwest::blocking::Client, url: &str) -> Option<(u64, 
     .ok()
 }
 
-/// 先试官方地址，失败再试镜像前缀。
-/// 两边都失败时把两个错误一起报出来，方便看出到底卡在哪一环。
+/// 按「镜像优先、官方兜底」的顺序下载一个不需要指纹校验的文件（运行库 zip）。
+/// 所有源都失败时把错误一起报出来，方便看出到底卡在哪一环。
 fn download_with_mirror(
     client: &reqwest::blocking::Client,
     official: &str,
@@ -669,7 +746,8 @@ fn download_with_mirror(
     cancel: &AtomicBool,
     progress: &mut dyn FnMut(u64, u64),
 ) -> Result<u64> {
-    try_both(official, |url, _| {
+    let ms = mirrors("");
+    try_sources(official, &ms, true, |url| {
         progress(0, 0);
         download_raw(client, url, dest, cancel, progress)
     })

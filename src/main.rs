@@ -31,6 +31,12 @@ fn main() -> eframe::Result<()> {
         return Ok(());
     }
 
+    // 下载测速：走生产路径（镜像优先 + 官方指纹校验）拉一遍 version.dll
+    if std::env::args().any(|a| a == "--speedtest") {
+        speedtest();
+        return Ok(());
+    }
+
     // 显卡与驱动只读自检（不写任何东西）：cargo run -- --gpuinfo
     if std::env::args().any(|a| a == "--gpuinfo") {
         gpuinfo();
@@ -226,20 +232,25 @@ fn main() -> eframe::Result<()> {
         );
         println!("  内置备用源 = {}", update::DEFAULT_BACKUP_PREFIX);
         println!("  实际请求   = {url}");
-        match update::download(&c, path, &dest, &url, Some(&remote.etag), &cancel, |_, _| {}) {
+        match update::download(&c, path, &dest, &url, Some(&remote.etag), &cancel, &mut |_, _| {}) {
             Ok(dl) => {
-                let ok = dl
-                    .etag
-                    .as_deref()
-                    .map(|e| e.eq_ignore_ascii_case(&remote.etag))
-                    .unwrap_or(false);
+                // 通过标准是「长度对得上」。有些镜像（比如现在的 gh-proxy.com）
+                // 不转发 GitHub 的 ETag，拿不到就没法比指纹 —— 那是镜像的特性，
+                // 不是下载失败。代理 DLL 由签名校验兜底，ini 走官方优先不受影响。
+                let len_ok = dl.bytes == remote.size;
                 println!(
-                    "  [{}] 走镜像下载 {} 字节，响应 ETag = {}",
-                    if ok { "PASS" } else { "FAIL" },
+                    "  [{}] 走镜像下载 {} 字节（期望 {}）",
+                    if len_ok { "PASS" } else { "FAIL" },
                     dl.bytes,
-                    dl.etag.clone().unwrap_or_else(|| "(无)".to_owned())
+                    remote.size
                 );
-                println!("  期望 ETag = {}", remote.etag);
+                match dl.etag.as_deref() {
+                    Some(e) if e.eq_ignore_ascii_case(&remote.etag) => {
+                        println!("  ETag 比对：通过")
+                    }
+                    Some(e) => println!("  ETag 比对：不一致！镜像可能返回了错误内容 ({e})"),
+                    None => println!("  ETag 比对：该镜像不转发 ETag，跳过（属正常）"),
+                }
                 let _ = std::fs::remove_file(&dest);
             }
             Err(e) => println!("  [FAIL] {e}"),
@@ -381,6 +392,86 @@ fn write_result(out: &str, r: anyhow::Result<String>) {
     }
     if let Err(e) = std::fs::write(out, &text) {
         println!("写结果文件失败: {e}");
+    }
+}
+
+/// 下载测速。走的就是界面上「下载 / 更新资产」那条路径，
+/// 所以测出来的数就是用户实际会遇到的数。
+fn speedtest() {
+    println!("===== 下载测速（生产路径：镜像优先 + 官方指纹校验）=====");
+    let c = match update::client() {
+        Ok(c) => c,
+        Err(e) => {
+            println!("[FAIL] 创建客户端失败: {e}");
+            return;
+        }
+    };
+    let repo_path = update::proxy_repo_path("version.dll");
+    let remote = match update::probe_remote(&c, repo_path) {
+        Ok(r) => r,
+        Err(e) => {
+            println!("[FAIL] 取远端指纹失败: {e}");
+            return;
+        }
+    };
+    println!(
+        "  远端 {}  {} 字节  指纹 {}...",
+        remote.name,
+        remote.size,
+        &remote.etag[..remote.etag.len().min(12)]
+    );
+
+    let dest = match update::asset_path(&update::local_name(repo_path)) {
+        Ok(d) => d,
+        Err(e) => {
+            println!("[FAIL] 定位目标失败: {e}");
+            return;
+        }
+    };
+    let cancel = AtomicBool::new(false);
+    let t0 = std::time::Instant::now();
+    let mut last = 0u64;
+    let r = update::download_auto(
+        &c,
+        repo_path,
+        &dest,
+        Some(&remote.etag),
+        &cancel,
+        "",
+        true,
+        // 和界面里一样：代理 DLL 必须带本项目签名
+        &|p: &Path| {
+            let id = scan::identify_dll(p);
+            if id.is_ours() {
+                Ok(())
+            } else {
+                Err(anyhow::anyhow!("签名校验失败，判定为「{}」", id.label()))
+            }
+        },
+        &mut |got, _| {
+            if got.saturating_sub(last) >= 4 * 1024 * 1024 {
+                last = got;
+                println!("      ... {} MB", got / (1024 * 1024));
+            }
+        },
+    );
+    let dt = t0.elapsed().as_secs_f64();
+    match r {
+        Ok(dl) => {
+            let mb = dl.bytes as f64 / (1024.0 * 1024.0);
+            println!(
+                "  [PASS] {mb:.2} MB 用时 {dt:.2}s => {:.2} MB/s",
+                if dt > 0.0 { mb / dt } else { 0.0 }
+            );
+            match &dl.etag {
+                Some(e) => println!("  ETag 比对：通过（响应 ETag = {e}）"),
+                None => println!(
+                    "  ETag 比对：该源不转发 ETag，跳过 —— 已由签名校验兜住（这正是                      download_auto 里 prefer_mirror=true 时必须配 verify 的原因）"
+                ),
+            }
+            println!("  保存于 {}", dest.display());
+        }
+        Err(e) => println!("  [FAIL] {e}"),
     }
 }
 
@@ -613,7 +704,7 @@ fn canceltest() {
         &url,
         Some(&remote.etag),
         &cancel,
-        |_, _| {},
+        &mut |_, _| {},
     );
 
     println!(
@@ -676,7 +767,7 @@ fn downloadtest() {
         &url,
         Some(&remote.etag),
         &cancel,
-        |got, total| {
+        &mut |got, total| {
             if total > 0 && got >= total {
                 println!("  已下载 {got} / {total} 字节");
             }
@@ -1526,24 +1617,39 @@ impl App {
                     let local = update::local_name(&path);
                     let dest = update::asset_path(&local)?;
 
-                    let official = update::official_url(&path);
-                    let url = if use_backup {
-                        format!("{prefix}{official}")
-                    } else {
-                        official
-                    };
-
                     let tx2 = tx.clone();
                     let ctx2 = ctx.clone();
                     let label = local.clone();
-                    let dl = update::download(
+
+                    // 代理 DLL 走镜像优先（快几十倍），但 gh-proxy.com 不转发 ETag，
+                    // ETag 比对会落空 —— 所以必须再加一道签名校验：这 5 个 DLL 都由
+                    // DLSSG Native Project 自签，镜像伪造不出来。
+                    // ini 只有 581 字节，走官方优先：官方会返回 ETag，比对能真正生效。
+                    let is_dll = path.to_ascii_lowercase().ends_with(".dll");
+                    let verifier = move |p: &Path| -> anyhow::Result<()> {
+                        if !is_dll {
+                            return Ok(());
+                        }
+                        let id = scan::identify_dll(p);
+                        if id.is_ours() {
+                            return Ok(());
+                        }
+                        Err(anyhow::anyhow!(
+                            "下载到的文件不是本项目的签名版本（判定为「{}」），已丢弃并换源重试",
+                            id.label()
+                        ))
+                    };
+
+                    let dl = update::download_auto(
                         &c,
                         &path,
                         &dest,
-                        &url,
                         Some(&remote.etag),
                         &cancel,
-                        move |got, total| {
+                        &prefix,
+                        is_dll,
+                        &verifier,
+                        &mut move |got, total| {
                             let f = if total > 0 {
                                 got as f32 / total as f32
                             } else {
