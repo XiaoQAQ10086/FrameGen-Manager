@@ -2312,8 +2312,16 @@ impl eframe::App for App {
                     // 这里故意不用下拉框：下拉是弹层，在滚动区域里容易点不动，
                     // 而且 from_label("") 会和页面上别的下拉共用同一个 id。
                     // 单选按钮就在当前布局里，最稳。
-                    ui.horizontal_wrapped(|ui| {
-                        for p in gpu::PRESETS {
+                    // 固定 3 + 3 两行：交给 horizontal_wrapped 自动换行会排成 5 + 1，
+                    // 最后一项孤零零占一行，看着像出了错。
+                    ui.horizontal(|ui| {
+                        for p in &gpu::PRESETS[..3] {
+                            let short = p.trim_start_matches("NVIDIA GeForce ");
+                            ui.radio_value(&mut self.spoof_target, (*p).to_owned(), short);
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        for p in &gpu::PRESETS[3..] {
                             let short = p.trim_start_matches("NVIDIA GeForce ");
                             ui.radio_value(&mut self.spoof_target, (*p).to_owned(), short);
                         }
