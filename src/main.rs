@@ -2314,22 +2314,34 @@ impl eframe::App for App {
                     // 单选按钮就在当前布局里，最稳。
                     // 固定 3 + 3 两行：交给 horizontal_wrapped 自动换行会排成 5 + 1，
                     // 最后一项孤零零占一行，看着像出了错。
+                    // 用 selectable_value 而不是 radio_value：radio 被选中时只多画一个
+                    // 小圆点（实测整行只有 32 个像素变化），看着像没点动；
+                    // selectable_value 选中后整个选项底色变绿，一眼可见，点击区域也更大。
                     ui.horizontal(|ui| {
                         for p in &gpu::PRESETS[..3] {
                             let short = p.trim_start_matches("NVIDIA GeForce ");
-                            ui.radio_value(&mut self.spoof_target, (*p).to_owned(), short);
+                            ui.selectable_value(&mut self.spoof_target, (*p).to_owned(), short);
                         }
                     });
                     ui.horizontal(|ui| {
                         for p in &gpu::PRESETS[3..] {
                             let short = p.trim_start_matches("NVIDIA GeForce ");
-                            ui.radio_value(&mut self.spoof_target, (*p).to_owned(), short);
+                            ui.selectable_value(&mut self.spoof_target, (*p).to_owned(), short);
                         }
                     });
                     ui.label(theme::hint(format!("已选中：{}", self.spoof_target)));
 
                     ui.add_space(4.0);
-                    ui.checkbox(&mut self.spoof_ack, "我已阅读并理解上面的副作用");
+                    // 不用 ui.checkbox：egui 0.36 勾选后只是在 8px 的小方框里画一条
+                    // 1 像素宽的细对勾，方框底色完全不变。实测勾上前后整行只差 32 个
+                    // 像素，肉眼几乎看不出勾没勾上 —— 用户会以为「点了没反应」。
+                    // toggle_value 选中时整行变绿，状态一眼可见，而且点击区域大得多。
+                    let ack_text = if self.spoof_ack {
+                        "已勾选：我已阅读并理解上面的副作用（再点一次取消）"
+                    } else {
+                        "点这里勾选：我已阅读并理解上面的副作用"
+                    };
+                    ui.toggle_value(&mut self.spoof_ack, ack_text);
 
                     ui.add_space(4.0);
                     ui.horizontal(|ui| {
