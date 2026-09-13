@@ -54,10 +54,9 @@ Rust + egui/eframe。**不许用** Electron / Tauri / WebView。
 | 变量 | 作用 |
 |---|---|
 | `DLSSG_AUTOSCAN=1` | 启动就扫一次游戏库 |
-| `DLSSG_AUTOCHECK=1` | 启动就跑一次「检查更新」（资产清单才会显示出来） |
 | `DLSSG_SPOOF_OPEN=1` | 显卡名称伪装卡片默认展开 |
 | `DLSSG_NO_CJK_FONT=1` | 不加载中文字体，用来量化字体占多少内存 |
-| `DLSSG_FAKE_NEWVER=0.9.9` | 假装远端有新版本，验证右上角那个下载入口（本地远端同版本时看不到） |
+| `DLSSG_FAKE_NEWVER=0.9.9` | 假装远端有新版本，验证标题栏那个下载入口（本地远端同版本时看不到） |
 
 界面自测只能靠截图像素分析（本机没有可自动化的 GUI 断言框架），所以这些开关很关键。
 **注意**：分析截图时要按窗口标题 FrameGen Manager 找窗口 —— debug 版是控制台程序，
@@ -225,7 +224,9 @@ Cargo.toml 用 $false（不加 BOM）；installer.iss 用 $true（要 BOM，Inno
 两套东西：
 
 * **上游 Mod 更新**（sdli1995/dlssg_for_sm86）—— 只在用户点「检查更新」时跑，走 raw 的 ETag。
-* **本软件更新**（XiaoQAQ10086/FrameGen-Manager）—— 启动时自动跑一次，可在界面上关掉。
+* **本软件更新**（XiaoQAQ10086/FrameGen-Manager）—— 启动时自动跑一次，另外标题栏
+  有个「检查更新」可以手动再查。这一项默认就开，界面上不设开关，入口也别放回资产
+  卡片里 —— 放那儿会被当成上游 Mod 的更新。
 
 本软件更新**读的是我们自己仓库 main 分支上的 Cargo.toml 的 version 字段**。为什么不用
 Releases 接口：

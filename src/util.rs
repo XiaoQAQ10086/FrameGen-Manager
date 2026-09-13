@@ -120,7 +120,7 @@ fn do_migrate_backups() -> Option<String> {
 const CONFIG_NAME: &str = "framegen-manager.json";
 
 /// 应用配置。默认放在 exe 同级（便携，解压即用）；exe 同级不可写时回退 %APPDATA%。
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AppConfig {
     /// 用户自定义的资产目录。None 表示用默认位置。
     #[serde(default)]
@@ -131,26 +131,6 @@ pub struct AppConfig {
     /// 备用下载源前缀，会拼在官方地址前面。留空表示用内置镜像列表。
     #[serde(default)]
     pub backup_prefix: String,
-    /// 启动时自动检查上游更新。默认开。
-    #[serde(default = "yes")]
-    pub auto_check: bool,
-}
-
-fn yes() -> bool {
-    true
-}
-
-/// Default 要手写：配置文件不存在时 load_config 会回退到 Default，
-/// 而 bool 的 Default 是 false —— 那样全新安装反而默认是关的。
-impl Default for AppConfig {
-    fn default() -> Self {
-        Self {
-            asset_dir: None,
-            allow_backup_source: false,
-            backup_prefix: String::new(),
-            auto_check: true,
-        }
-    }
 }
 
 pub fn exe_dir() -> Option<PathBuf> {

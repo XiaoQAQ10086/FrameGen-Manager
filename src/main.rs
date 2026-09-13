@@ -1252,7 +1252,8 @@ enum Msg {
     /// 用户点了取消下载。这不是失败，不该弹「改用备用源重试」。
     Cancelled,
     /// 软件自身的版本检查回来了。None 表示没查到（网络问题）。
-    SelfVersionChecked(Option<String>),
+    /// manual = 用户自己点的「检查更新」；自动检查时没查到就不要打扰他。
+    SelfVersionChecked { latest: Option<String>, manual: bool },
 }
 
 struct App {
@@ -1279,7 +1280,7 @@ struct App {
     busy: bool,
     logs: Vec<String>,
     autoscan_done: bool,
-    /// 调试开关：启动时自动跑一次更新检查（DLSSG_AUTOCHECK=1）
+    /// 启动时的那一次「检查本软件新版本」跑过没有
     autocheck_done: bool,
 
     // ---- 代理入口推荐
@@ -1294,8 +1295,6 @@ struct App {
     adapters: Vec<gpu::GpuAdapter>,
 
     // ---- 显卡名称伪装
-    /// 启动时自动检查「本软件」有没有新版本（界面上可关，存配置里）
-    auto_check: bool,
     /// 查到的新版本号。Some 时右上角会出现下载入口。
     new_version: Option<String>,
     spoof_open: bool,
@@ -1378,8 +1377,6 @@ impl App {
             gpu_route,
             driver,
             adapters,
-            // 调试开关：为截图/排查用，正常启动是收起的
-            auto_check: cfg.auto_check,
             new_version: None,
             spoof_open: std::env::var_os("DLSSG_SPOOF_OPEN").is_some(),
             // 默认指向 5060：既是最常见的目标，也和社区流传的做法一致
@@ -1552,11 +1549,15 @@ impl App {
                     }
                 }
             }
-            Msg::SelfVersionChecked(latest) => {
+            Msg::SelfVersionChecked { latest, manual } => {
+                // 只有手动点的那次才会把 busy 立起来，所以也只有它需要放下来
+                if manual {
+                    self.busy = false;
+                }
                 match latest {
                     Some(v) if update::is_newer(&v, update::SELF_VERSION) => {
                         let m = format!(
-                            "发现新版本 {v}（当前 {}），点右上角去发布页下载",
+                            "发现新版本 {v}（当前 v{}），点标题栏的「有新版本」去下载",
                             update::SELF_VERSION
                         );
                         self.logs.push(m.clone());
@@ -1564,14 +1565,24 @@ impl App {
                         self.new_version = Some(v);
                     }
                     Some(v) => {
-                        self.logs.push(format!(
-                            "已是最新版本（本地 {}，远端 {v}）",
-                            update::SELF_VERSION
-                        ));
+                        // 远端版本没变，之前那个入口该撤掉
+                        self.new_version = None;
+                        let m = format!("已是最新版本（当前 v{}，远端 {v}）", update::SELF_VERSION);
+                        self.logs.push(m.clone());
+                        if manual {
+                            self.status = m;
+                        }
                     }
                     None => {
-                        self.logs
-                            .push("检查软件新版本失败（网络问题），不影响使用".to_owned());
+                        self.new_version = None;
+                        let m = format!(
+                            "检查新版本失败（网络问题），不影响使用。当前 v{}",
+                            update::SELF_VERSION
+                        );
+                        self.logs.push(m.clone());
+                        if manual {
+                            self.status = m;
+                        }
                     }
                 }
             }
@@ -1599,7 +1610,6 @@ impl App {
             asset_dir: util::load_config().asset_dir,
             allow_backup_source: self.use_backup,
             backup_prefix: self.backup_prefix.clone(),
-            auto_check: self.auto_check,
         };
         if let Err(e) = util::save_config(&cfg) {
             self.logs.push(format!("保存配置失败: {e}"));
@@ -1617,7 +1627,6 @@ impl App {
         cfg.asset_dir = Some(dir.clone());
         cfg.allow_backup_source = self.use_backup;
         cfg.backup_prefix = self.backup_prefix.clone();
-        cfg.auto_check = self.auto_check;
         if let Err(e) = util::save_config(&cfg) {
             self.status = format!("保存配置失败: {e}");
             return;
@@ -1942,16 +1951,22 @@ impl App {
 
     /// 检查 FrameGen Manager 自己有没有新版本。
     /// 读我们仓库 raw 上的 Cargo.toml，不占任何 API 配额（见 update::fetch_latest_self_version）。
-    fn start_self_update_check(&mut self) {
-        self.spawn(|tx, ctx| {
+    /// manual = 用户自己点的标题栏「检查更新」。点了得立刻有反应，
+    /// 不然就是「点了没动静」；启动时那次则安静地跑，别打断用户。
+    fn start_self_update_check(&mut self, manual: bool) {
+        if manual {
+            self.busy = true;
+            self.status = "正在检查新版本…".to_owned();
+        }
+        self.spawn(move |tx, ctx| {
             // 调试开关：DLSSG_FAKE_NEWVER=0.9.9 可以假装远端有新版本，
-            // 用来验证「右上角出现下载入口」这条路径（不然本地远端同版本看不到）。
+            // 用来验证「标题栏出现下载入口」这条路径（不然本地远端同版本看不到）。
             let latest = std::env::var("DLSSG_FAKE_NEWVER").ok().or_else(|| {
                 update::client()
                     .ok()
                     .and_then(|c| update::fetch_latest_self_version(&c))
             });
-            let _ = tx.send(Msg::SelfVersionChecked(latest));
+            let _ = tx.send(Msg::SelfVersionChecked { latest, manual });
             ctx.request_repaint();
         });
     }
@@ -2133,12 +2148,12 @@ impl eframe::App for App {
             self.autoscan_done = true;
             self.start_scan();
         }
-        // 启动时检查「本软件」有没有新版本。可以在界面上关掉。
-        // 注意这不是上游 Mod 的更新检查 —— 那个仍然只在你点「检查更新」时才跑。
-        if !self.autocheck_done && (self.auto_check || std::env::var_os("DLSSG_AUTOCHECK").is_some())
-        {
+        // 启动时检查「本软件」有没有新版本，默认就开，界面上不设开关。
+        // 注意这不是上游 Mod 的更新检查 —— 那个仍然只在你点资产卡片里的
+        // 「检查更新」时才跑，两者是两回事，所以入口也不放在一起。
+        if !self.autocheck_done {
             self.autocheck_done = true;
-            self.start_self_update_check();
+            self.start_self_update_check(false);
         }
 
         // ---------------- 顶栏
@@ -2172,6 +2187,20 @@ impl eframe::App for App {
                             }
                             ui.add_space(6.0);
                         }
+                        // 本软件的更新检查。放标题栏，和资产卡片里那个「检查 Mod 更新」
+                        // 从位置上就分开，免得被当成上游 Mod 的更新。
+                        if theme::ghost_button(ui, "检查更新", !self.busy)
+                            .on_hover_text(format!(
+                                "检查 FrameGen Manager 自己有没有新版本（当前 v{}）",
+                                update::SELF_VERSION
+                            ))
+                            .clicked()
+                        {
+                            self.start_self_update_check(true);
+                        }
+                        ui.add_space(2.0);
+                        ui.label(theme::hint(format!("v{}", update::SELF_VERSION)));
+                        ui.add_space(6.0);
                         let version = self
                             .update_state
                             .version
@@ -2461,27 +2490,6 @@ impl eframe::App for App {
                         }
                         if theme::ghost_button(ui, "检查更新", !self.busy).clicked() {
                             self.start_update_check();
-                        }
-                    });
-
-                    // 启动自动检查「本软件」新版本的开关。
-                    // 用 toggle_value 而不是 checkbox —— egui 的 checkbox 勾上
-                    // 只有一条 1px 细线，看不出状态。
-                    let auto_text = if self.auto_check {
-                        "启动时自动检查新版本：开"
-                    } else {
-                        "启动时自动检查新版本：关"
-                    };
-                    ui.horizontal(|ui| {
-                        if ui.toggle_value(&mut self.auto_check, auto_text).changed() {
-                            self.save_config();
-                        }
-                        let cur = update::SELF_VERSION;
-                        if theme::ghost_button(ui, "检查新版本", true)
-                            .on_hover_text(format!("当前版本 {cur}"))
-                            .clicked()
-                        {
-                            self.start_self_update_check();
                         }
                     });
 
