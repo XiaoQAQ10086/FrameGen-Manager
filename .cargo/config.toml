@@ -1,0 +1,7 @@
+# 静态链接 MSVC 运行库。
+# 默认的 Rust 构建会依赖 vcruntime140.dll（VC++ 运行库，Windows 不自带），
+# 用户机器上没装过就会报「找不到 VCRUNTIME140.dll」。
+# 打开 crt-static 后依赖降到 17 个全系统 DLL，代价是 exe 大约 +170 KB。
+# 实测：24 个依赖 -> 17 个，vcruntime140.dll 消失。
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
