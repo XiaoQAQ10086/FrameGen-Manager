@@ -20,6 +20,11 @@ use anticheat::{AcReport, AcTier};
 use scan::GameEntry;
 
 fn main() -> eframe::Result<()> {
+    // 一次性搬迁：老版本的备份在 %APPDATA%，现在放到程序同级。
+    // 放在最前面，这样 GUI 和所有命令行模式看到的是同一份备份。
+    // 结果会缓存，App::new() 里再调用拿到的就是同一句话。
+    let _ = util::migrate_backups();
+
     // 无界面自检：cargo run -- --selftest
     if std::env::args().any(|a| a == "--selftest") {
         selftest();
@@ -1032,6 +1037,8 @@ impl App {
 
         // 清掉上次被强杀可能留下的半成品
         let cleaned = update::clean_stale_partials();
+        // 老版本的备份在 %APPDATA%，新版本放到程序同级，这里做一次性搬迁
+        let migrated = util::migrate_backups();
         let gpu_name = scan::detect_gpu();
         let gpu_route = gpu_name
             .as_deref()
@@ -1041,6 +1048,19 @@ impl App {
         let adapters = gpu::enumerate();
         let driver = gpu::detect_driver(&adapters);
         let cfg = util::load_config();
+
+        let mut boot_notes: Vec<String> = Vec::new();
+        if cleaned > 0 {
+            boot_notes.push(format!("已清理 {cleaned} 个未完成的下载残留"));
+        }
+        if let Some(m) = migrated {
+            boot_notes.push(m);
+        }
+        let boot_status = if boot_notes.is_empty() {
+            "就绪".to_owned()
+        } else {
+            format!("就绪（{}）", boot_notes.join("；"))
+        };
 
         Self {
             ctx: cc.egui_ctx.clone(),
@@ -1057,14 +1077,10 @@ impl App {
             deploy_state: deploy::DeployState::NotDeployed,
             update_state: update::load_state(),
             update_summary: None,
-            status: if cleaned > 0 {
-                format!("就绪（已清理 {cleaned} 个未完成的下载残留）")
-            } else {
-                "就绪".to_owned()
-            },
+            status: boot_status,
             progress: None,
             busy: false,
-            logs: Vec::new(),
+            logs: boot_notes,
             autoscan_done: false,
             advice: None,
             gpu_name,
@@ -2048,7 +2064,9 @@ impl eframe::App for App {
                     theme::card_title(ui, "部署");
                     ui.horizontal(|ui| {
                         ui.label(egui::RichText::new("代理入口").size(12.0).color(theme::TEXT_MUTED));
-                        egui::ComboBox::from_label("")
+                        // 必须给唯一 salt：from_label("") 会用空字符串当 id，
+                        // 和界面上别的下拉撞 id 就会点不动
+                        egui::ComboBox::from_id_salt("proxy-entry")
                             .selected_text(self.proxy.clone())
                             .show_ui(ui, |ui| {
                                 for p in scan::PROXY_PRIORITY {
@@ -2286,24 +2304,21 @@ impl eframe::App for App {
                     }
 
                     ui.add_space(6.0);
-                    ui.horizontal(|ui| {
-                        ui.label(
-                            egui::RichText::new("伪装成")
-                                .size(12.0)
-                                .color(theme::TEXT_MUTED),
-                        );
-                        egui::ComboBox::from_label("")
-                            .selected_text(self.spoof_target.clone())
-                            .show_ui(ui, |ui| {
-                                for p in gpu::PRESETS {
-                                    ui.selectable_value(
-                                        &mut self.spoof_target,
-                                        (*p).to_owned(),
-                                        *p,
-                                    );
-                                }
-                            });
+                    ui.label(
+                        egui::RichText::new("伪装成（点一下选中）")
+                            .size(12.0)
+                            .color(theme::TEXT_MUTED),
+                    );
+                    // 这里故意不用下拉框：下拉是弹层，在滚动区域里容易点不动，
+                    // 而且 from_label("") 会和页面上别的下拉共用同一个 id。
+                    // 单选按钮就在当前布局里，最稳。
+                    ui.horizontal_wrapped(|ui| {
+                        for p in gpu::PRESETS {
+                            let short = p.trim_start_matches("NVIDIA GeForce ");
+                            ui.radio_value(&mut self.spoof_target, (*p).to_owned(), short);
+                        }
                     });
+                    ui.label(theme::hint(format!("已选中：{}", self.spoof_target)));
 
                     ui.add_space(4.0);
                     ui.checkbox(&mut self.spoof_ack, "我已阅读并理解上面的副作用");

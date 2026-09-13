@@ -45,9 +45,74 @@ pub fn app_data_dir() -> Result<PathBuf> {
 }
 
 pub fn backups_dir() -> Result<PathBuf> {
-    let d = app_data_dir()?.join("backups");
-    std::fs::create_dir_all(&d)?;
+    let d = default_backups_dir();
+    std::fs::create_dir_all(&d).with_context(|| format!("创建备份目录失败: {}", d.display()))?;
     Ok(d)
+}
+
+/// 备份目录：优先 exe 同级的 backups（跟解压出来的文件夹一起走，便携），
+/// 同级不可写时回退 %APPDATA%。策略和 assets / 配置文件保持一致。
+pub fn default_backups_dir() -> PathBuf {
+    if let Some(dir) = exe_dir() {
+        let b = dir.join("backups");
+        if is_writable(&b) {
+            return b;
+        }
+    }
+    app_data_dir()
+        .map(|d| d.join("backups"))
+        .unwrap_or_else(|_| PathBuf::from("backups"))
+}
+
+/// 老版本把备份放在 %APPDATA%\FrameGen-Manager\backups，只用于一次性搬迁。
+fn legacy_backups_dir() -> Option<PathBuf> {
+    app_data_dir().ok().map(|d| d.join("backups"))
+}
+
+fn copy_tree(from: &Path, to: &Path) -> Result<()> {
+    std::fs::create_dir_all(to)?;
+    for e in std::fs::read_dir(from)? {
+        let e = e?;
+        let src = e.path();
+        let dst = to.join(e.file_name());
+        if src.is_dir() {
+            copy_tree(&src, &dst)?;
+        } else {
+            std::fs::copy(&src, &dst)?;
+        }
+    }
+    Ok(())
+}
+
+/// 搬迁结果只算一次：main() 一进来就调用它，界面再调用时拿到的是同一句话。
+static MIGRATED: OnceLock<Option<String>> = OnceLock::new();
+
+/// 把老位置的备份搬到跟 exe 同级的新位置。
+/// 只在「新位置为空」且「老位置有东西」时搬；全部复制成功才删老目录，
+/// 任何一步失败都保留老目录 —— 绝不因为搬家把备份弄丢。
+pub fn migrate_backups() -> Option<String> {
+    MIGRATED.get_or_init(do_migrate_backups).clone()
+}
+
+fn do_migrate_backups() -> Option<String> {
+    let new = backups_dir().ok()?;
+    let old = legacy_backups_dir()?;
+    if new == old || !old.is_dir() {
+        return None;
+    }
+    // 新位置已经有东西就不动，避免覆盖
+    if std::fs::read_dir(&new).ok()?.next().is_some() {
+        return None;
+    }
+    let old_count = std::fs::read_dir(&old).ok()?.count();
+    if old_count == 0 {
+        return None;
+    }
+    if copy_tree(&old, &new).is_err() {
+        return None;
+    }
+    let _ = std::fs::remove_dir_all(&old);
+    Some(format!("已把旧位置的 {old_count} 项备份搬到程序目录的 backups\\"))
 }
 
 // ---------------------------------------------------------------- 配置与资产目录

@@ -57,7 +57,7 @@ Windows 桌面工具，把 [sdli1995/dlssg_for_sm86](https://github.com/sdli1995
   `HardwareID`、`CompatibleIDs`、`Driver`、`Service`、`Mfg` 一律不碰
 - 型号**只能从固定名单里选**（5090 / 5080 / 5070 Ti / 5070 / 5060 Ti / 5060），不支持手动输入
   —— 就是为了避免把型号填错
-- 写之前会先把原值备份到 `%APPDATA%\FrameGen-Manager\backups\gpu-name\` 并**读回校验**，
+- 写之前会先把原值备份到程序同级的 `backups\gpu-name\` 并**读回校验**，
   校验不过就中止，不会动注册表
 - 需要管理员权限（点下去会弹一次 UAC），**重启之后才生效**
 - 随时可以还原，两种目标任选：
@@ -95,11 +95,20 @@ Windows 桌面工具，把 [sdli1995/dlssg_for_sm86](https://github.com/sdli1995
 
 ## 数据放在哪
 
-- **程序同级的 assets 文件夹** —— 下载的资产（约 79 MB）。
-  想做成绿色便携版，整个文件夹拷走就行
-- **%APPDATA%\FrameGen-Manager** —— 部署备份、显卡名备份和设置。
-  备份故意不跟 exe 走，免得误删程序文件夹后没法还原游戏或显卡名
+全部在**程序所在的那个文件夹**里，整个文件夹拷走就是完整的绿色便携版：
+
+| 位置 | 内容 |
+|---|---|
+| `assets\` | 下载的资产（约 79 MB） |
+| `backups\` | 游戏部署备份、显卡名备份 |
+| `framegen-manager.json` | 设置 |
+
 - 资产目录可以在界面上改成别的位置
+- 程序目录不可写时（比如装在 `C:\Program Files`），`backups\` 和设置会自动回退到
+  `%APPDATA%\FrameGen-Manager\`
+
+> ⚠ **代价**：备份跟着程序目录走，所以删掉本程序文件夹，游戏的备份也就一起没了，
+> 之后没法一键还原游戏目录。要还原请趁早。
 
 ## 许可
 
