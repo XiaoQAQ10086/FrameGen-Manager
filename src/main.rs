@@ -567,6 +567,9 @@ fn selftest() {
                 update::INI_REPO_PATH,
             ];
             println!("  逐个 HEAD 取内容指纹（0 次 API 调用）：");
+            // 这一段以前要 15 秒以上：release 直链是 github.com，第一次探测会先干等
+            // 连接超时才轮到镜像。现在直链探测改镜像优先，连接超时也从 15s 收到 8s。
+            let t_head = std::time::Instant::now();
             for path in specs {
                 match update::probe_remote(&c, path) {
                     Ok(r) => {
@@ -599,6 +602,10 @@ fn selftest() {
                     if ready { "已就绪(NVIDIA 签名)" } else { "未下载" }
                 );
             }
+            println!(
+                "  取指纹总耗时 {:.1}s（以前光等 github.com 连接超时就要 15s）",
+                t_head.elapsed().as_secs_f64()
+            );
         }
         Err(e) => println!("  客户端创建失败: {e}"),
     }
@@ -758,15 +765,18 @@ fn downloadtest() {
         }
     };
 
-    let url = update::official_url(repo_path);
     let cancel = AtomicBool::new(false);
-    match update::download(
+    // 走生产路径（多源自动回退），而不是死磕官方那一个地址 ——
+    // 官方 raw 现在会间歇性卡十几秒，测试跟着一起卡就没意义了。
+    match update::download_auto(
         &c,
         repo_path,
         &dest,
-        &url,
         Some(&remote.etag),
         &cancel,
+        "",
+        false,
+        &|_p| Ok(()),
         &mut |got, total| {
             if total > 0 && got >= total {
                 println!("  已下载 {got} / {total} 字节");
@@ -789,6 +799,35 @@ fn downloadtest() {
             );
             println!("  本地内容 sha256 = {}", dl.sha256);
             println!("  内容 blob sha = {blob}");
+
+            // local_is_current 是「跳过重复下载」的依据，两条路径都验一遍：
+            // 记录 + 文件都在 -> 已是最新；把文件删掉 -> 必须立刻变回「需要下载」。
+            let mut st = update::load_state();
+            st.files.insert(
+                update::local_name(repo_path),
+                update::LocalFile {
+                    blob_sha: blob.clone(),
+                    etag: remote.etag.clone(),
+                    sha256: dl.sha256.clone(),
+                    bytes: dl.bytes,
+                    downloaded_at: util::now_utc(),
+                },
+            );
+            let probe = dest.with_file_name("iscurrent-probe.tmp");
+            let _ = std::fs::copy(&dest, &probe);
+            let present =
+                update::local_is_current(&st, &update::local_name(repo_path), &probe, &remote.etag);
+            let _ = std::fs::remove_file(&probe);
+            let gone =
+                update::local_is_current(&st, &update::local_name(repo_path), &probe, &remote.etag);
+            println!(
+                "  [{}] 记录和文件都在时判定为「已是最新」",
+                if present { "PASS" } else { "FAIL" }
+            );
+            println!(
+                "  [{}] 文件被删掉后判定为「需要下载」",
+                if !gone { "PASS" } else { "FAIL" }
+            );
             println!("  保存于: {}", dest.display());
             println!(
                 "  内容:\n{}",
@@ -1611,11 +1650,24 @@ impl App {
                     update::proxy_repo_path(&proxy).to_owned(),
                     update::INI_REPO_PATH.to_owned(),
                 ];
+                let mut skipped = 0usize;
                 for path in specs {
                     // HEAD 拿期望的内容 SHA-256（不占 API 配额，官方源和镜像都会给）
                     let remote = update::probe_remote(&c, &path)?;
                     let local = update::local_name(&path);
                     let dest = update::asset_path(&local)?;
+
+                    // 已经是最新版就不重下 —— 15 MB 的代理 DLL 没必要每次都拉一遍。
+                    // 判定要求「记录在 + 指纹一致 + 文件真的在且大小对」，缺一不可。
+                    if update::local_is_current(&state, &local, &dest, &remote.etag) {
+                        let _ = tx.send(Msg::Progress(
+                            format!("{local} 已是最新版，跳过下载"),
+                            1.0,
+                        ));
+                        ctx.request_repaint();
+                        skipped += 1;
+                        continue;
+                    }
 
                     let tx2 = tx.clone();
                     let ctx2 = ctx.clone();
@@ -1692,10 +1744,14 @@ impl App {
                     })?;
                 }
 
-                Ok(format!(
-                    "资产已下载并校验完成 -> {}",
-                    util::assets_dir()?.display()
-                ))
+                Ok(if skipped > 0 {
+                    format!(
+                        "资产已就绪（{skipped} 个文件本来就是最新版，未重复下载）-> {}",
+                        util::assets_dir()?.display()
+                    )
+                } else {
+                    format!("资产已下载并校验完成 -> {}", util::assets_dir()?.display())
+                })
             })();
             let _ = tx.send(match res {
                 Ok(m) => Msg::Done(m),

@@ -104,7 +104,9 @@ pub fn client() -> Result<reqwest::blocking::Client> {
     reqwest::blocking::Client::builder()
         .user_agent(USER_AGENT)
         .timeout(Duration::from_secs(120))
-        .connect_timeout(Duration::from_secs(15))
+        // 连接超时别设太长：源被墙时每个候选都要空等这么久。
+        // 能用的源 1 秒内就连上了，8 秒足够宽容。
+        .connect_timeout(Duration::from_secs(8))
         .build()
         .context("创建 HTTP 客户端失败")
 }
@@ -204,6 +206,9 @@ pub fn probe_remote(client: &reqwest::blocking::Client, repo_path: &str) -> Resu
     try_sources(&official, &ms, false, |url| {
         let resp = client
             .head(url)
+            // 单个 HEAD 只有 1KB 不到，6 秒足够。raw 现在会间歇性卡十几秒，
+            // 不给单请求超时的话，官方优先反而变成「每次先干等十几秒」。
+            .timeout(Duration::from_secs(6))
             .send()
             .map_err(|e| anyhow::anyhow!(friendly_error(&e)))?;
         if !resp.status().is_success() {
@@ -240,12 +245,26 @@ pub fn extract_version(text: &str) -> Option<String> {
 }
 
 pub fn fetch_version(client: &reqwest::blocking::Client) -> Option<String> {
-    let url = format!("https://raw.githubusercontent.com/{REPO}/{BRANCH}/README.md");
-    if let Ok(resp) = client.get(&url).send() {
-        if let Ok(text) = resp.text() {
-            if let Some(v) = extract_version(&text) {
-                return Some(v);
-            }
+    let official = format!("https://raw.githubusercontent.com/{REPO}/{BRANCH}/README.md");
+    let ms = mirrors("");
+    // 这里也要能换源 + 限时：raw 卡十几秒会把整个「检查更新」拖住，
+    // 而它只是用来在界面上显示一个版本号而已。
+    let fetched = try_sources(&official, &ms, false, |url| {
+        let resp = client
+            .get(url)
+            .timeout(Duration::from_secs(10))
+            .send()
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        if !resp.status().is_success() {
+            bail!("HTTP {}", resp.status().as_u16());
+        }
+        resp.text().map_err(|e| anyhow::anyhow!("{e}"))
+    })
+    .ok();
+
+    if let Some(text) = fetched {
+        if let Some(v) = extract_version(&text) {
+            return Some(v);
         }
     }
     // 兜底：本地已下载的 INI 第一行注释里也有版本号，网络抖一下不至于显示「未知」
@@ -298,6 +317,28 @@ pub fn clean_stale_partials() -> usize {
         }
     }
     n
+}
+
+/// 本地这份文件是不是已经是最新版。
+///
+/// **必须同时满足三条**：下载记录在、指纹和远端一致、而且文件真的还在且大小对得上。
+/// 只看记录会造成「文件被删了却认为无需下载」—— asset_state 那边踩过同样的坑。
+pub fn local_is_current(
+    state: &UpdateState,
+    local_name: &str,
+    dest: &Path,
+    remote_etag: &str,
+) -> bool {
+    let Some(r) = state.files.get(local_name) else {
+        return false;
+    };
+    if r.etag.is_empty() || !r.etag.eq_ignore_ascii_case(remote_etag) {
+        return false;
+    }
+    // metadata 拿不到（文件不存在）就是 false
+    std::fs::metadata(dest)
+        .map(|m| m.len() == r.bytes)
+        .unwrap_or(false)
 }
 
 /// 自动选源下载一个仓库文件。这就是界面上「下载 / 更新资产」走的路径，
@@ -726,9 +767,16 @@ pub fn download_raw(
 /// HEAD 任意 URL，拿 (大小, ETag)。发布资产也有 Content-Length，够界面显示用了。
 /// 同样先官方后镜像，失败返回 None（只是显示不出大小，不影响下载）。
 pub fn probe_url(client: &reqwest::blocking::Client, url: &str) -> Option<(u64, String)> {
+    // release 直链是 github.com，墙内直连要干等连接超时 —— 而这里只是问个文件大小
+    // 给界面显示，没有「指纹必须来自 GitHub」的要求（zip 解压后靠 NVIDIA 签名校验），
+    // 所以直接走镜像优先。
     let ms = mirrors("");
-    try_sources(url, &ms, false, |u| {
-        let r = client.head(u).send().map_err(|e| anyhow::anyhow!("{e}"))?;
+    try_sources(url, &ms, true, |u| {
+        let r = client
+            .head(u)
+            .timeout(Duration::from_secs(6))
+            .send()
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
         if !r.status().is_success() {
             bail!("HTTP {}", r.status().as_u16());
         }
