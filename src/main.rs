@@ -3,6 +3,7 @@
 
 mod anticheat;
 mod deploy;
+mod gpu;
 mod icon;
 mod scan;
 mod theme;
@@ -22,6 +23,32 @@ fn main() -> eframe::Result<()> {
     // 无界面自检：cargo run -- --selftest
     if std::env::args().any(|a| a == "--selftest") {
         selftest();
+        return Ok(());
+    }
+
+    // 显卡与驱动只读自检（不写任何东西）：cargo run -- --gpuinfo
+    if std::env::args().any(|a| a == "--gpuinfo") {
+        gpuinfo();
+        return Ok(());
+    }
+
+    // 提权子进程入口。父进程用 ShellExecuteW("runas") 拉起下面两个模式，
+    // 结果通过一个临时 JSON 文件回传。必须排在创建窗口之前。
+    //   framegen-manager.exe --gpuspoof-apply "NVIDIA GeForce RTX 5060" <结果文件>
+    //   framegen-manager.exe --gpuspoof-restore driver|backup <结果文件>
+    let argv_gpu: Vec<String> = std::env::args().collect();
+    if let Some(i) = argv_gpu.iter().position(|a| a == "--gpuspoof-apply") {
+        gpuspoof_apply(
+            argv_gpu.get(i + 1).map(String::as_str).unwrap_or(""),
+            argv_gpu.get(i + 2).map(String::as_str).unwrap_or(""),
+        );
+        return Ok(());
+    }
+    if let Some(i) = argv_gpu.iter().position(|a| a == "--gpuspoof-restore") {
+        gpuspoof_restore(
+            argv_gpu.get(i + 1).map(String::as_str).unwrap_or(""),
+            argv_gpu.get(i + 2).map(String::as_str).unwrap_or(""),
+        );
         return Ok(());
     }
 
@@ -286,6 +313,107 @@ fn main() -> eframe::Result<()> {
 }
 
 // ------------------------------------------------------------------ 自检
+
+// ---------------------------------------------------------------- 显卡：自检与提权子进程
+
+/// 只读自检：把所有渠道看到的显卡名列出来，用来判断到底哪一层被改过。
+/// cargo run -- --gpuinfo
+fn gpuinfo() {
+    let adapters = gpu::enumerate();
+    println!("=== 显卡实例（{} 个）===", adapters.len());
+    for a in &adapters {
+        println!("  类键实例    : {}", a.class_sub);
+        println!("  驱动记录名  : {}", a.driver_name);
+        println!("  驱动版本    : {}", a.driver_version);
+        println!("  Enum 键     : HKLM\\{}", a.enum_key);
+        println!("  硬件 ID     : {}", a.hardware_id);
+        match &a.device_desc {
+            Some(d) => {
+                println!("  DeviceDesc  : {d}");
+                println!("  实际显示名  : {}", gpu::display_name(d));
+            }
+            None => println!("  DeviceDesc  : (该值不存在)"),
+        }
+        println!("  是否被改过  : {}", if a.spoofed() { "是" } else { "否" });
+        println!();
+    }
+
+    println!("=== 驱动 ===");
+    match gpu::detect_driver(&adapters) {
+        Some(d) => {
+            println!("  市场版本     : {}（来源 {}）", d.marketing, d.source);
+            if let Some(w) = &d.windows {
+                println!("  Windows 版本 : {w}");
+            }
+            println!(
+                "  低于 {}      : {}",
+                gpu::MIN_FG_DRIVER_TEXT,
+                if d.too_old() { "是（界面会警告）" } else { "否" }
+            );
+        }
+        None => println!("  读取失败：既没有 nvidia-smi，注册表里也没有 DriverVersion"),
+    }
+
+    println!();
+    match gpu::load_backup() {
+        Some(b) => {
+            println!("=== 备份（{}）===", b.saved_at);
+            for e in &b.entries {
+                println!("  {}", e.key);
+                println!("    原值        : {:?}", e.original);
+                println!("    本工具写入  : {}", e.applied);
+            }
+        }
+        None => println!("=== 备份 === 没有找到备份记录"),
+    }
+    println!();
+    match gpu::backup_path() {
+        Ok(p) => println!("备份文件位置: {}", p.display()),
+        Err(e) => println!("备份文件位置: 无法确定（{e}）"),
+    }
+}
+
+/// 提权子进程入口：改显卡名。写结果 JSON 后直接退出，不创建窗口。
+fn gpuspoof_apply(name: &str, out: &str) {
+    use anyhow::Context as _;
+    let r = (|| -> anyhow::Result<String> {
+        let adapters = gpu::enumerate();
+        let a = gpu::primary(&adapters).context("没有找到可操作的 NVIDIA 显卡注册表实例")?;
+        gpu::apply(a, name)
+    })();
+    write_result(out, r);
+}
+
+/// 提权子进程入口：还原显卡名。mode = "driver"（驱动记录的名称）| "backup"（改动前的值）
+fn gpuspoof_restore(mode: &str, out: &str) {
+    use anyhow::Context as _;
+    let to = match mode {
+        "backup" => gpu::RestoreTo::BackupOriginal,
+        _ => gpu::RestoreTo::DriverName,
+    };
+    let r = (|| -> anyhow::Result<String> {
+        let adapters = gpu::enumerate();
+        let a = gpu::primary(&adapters).context("没有找到可操作的 NVIDIA 显卡注册表实例")?;
+        gpu::restore(a, to)
+    })();
+    write_result(out, r);
+}
+
+fn write_result(out: &str, r: anyhow::Result<String>) {
+    let payload = match r {
+        Ok(m) => serde_json::json!({ "ok": true, "msg": m }),
+        Err(e) => serde_json::json!({ "ok": false, "msg": format!("{e:#}") }),
+    };
+    let text = payload.to_string();
+    if out.is_empty() {
+        // 没给结果文件参数时打到控制台，方便手动跑
+        println!("{text}");
+        return;
+    }
+    if let Err(e) = std::fs::write(out, &text) {
+        println!("写结果文件失败: {e}");
+    }
+}
 
 fn selftest() {
     println!("===== FrameGen Manager 自检 =====");
@@ -834,6 +962,8 @@ enum Msg {
     Failed(String),
     /// 下载失败。单独一个变体，是为了在界面上给出「改用备用源」的提示。
     DownloadFailed(String),
+    /// 提权子进程改完 / 还原完显卡名了
+    GpuOpDone(Result<String, String>),
 }
 
 struct App {
@@ -867,6 +997,19 @@ struct App {
     // ---- 显卡
     gpu_name: Option<String>,
     gpu_route: scan::GpuRoute,
+    /// 驱动版本。低于建议版本时界面会警告。
+    driver: Option<gpu::DriverInfo>,
+    /// 所有 NVIDIA PCI 显示适配器的注册表实例（名称伪装用）
+    adapters: Vec<gpu::GpuAdapter>,
+
+    // ---- 显卡名称伪装
+    spoof_open: bool,
+    spoof_target: String,
+    spoof_ack: bool,
+    /// 待用户确认的伪装操作。Some 时显示确认弹窗。
+    spoof_pending: Option<gpu::Op>,
+    /// 驱动过旧时点「部署」需要再确认一次
+    confirm_old_driver: bool,
 
     // ---- 下载控制
     cancel: Option<Arc<AtomicBool>>,
@@ -894,6 +1037,9 @@ impl App {
             .as_deref()
             .map(scan::classify_gpu)
             .unwrap_or(scan::GpuRoute::Unknown);
+        // 显卡实例和驱动版本都是读注册表，很快（nvidia-smi 兜底约 35ms）
+        let adapters = gpu::enumerate();
+        let driver = gpu::detect_driver(&adapters);
         let cfg = util::load_config();
 
         Self {
@@ -923,6 +1069,15 @@ impl App {
             advice: None,
             gpu_name,
             gpu_route,
+            driver,
+            adapters,
+            // 调试开关：为截图/排查用，正常启动是收起的
+            spoof_open: std::env::var_os("DLSSG_SPOOF_OPEN").is_some(),
+            // 默认指向 5060：既是最常见的目标，也和社区流传的做法一致
+            spoof_target: gpu::PRESETS.last().copied().unwrap_or_default().to_owned(),
+            spoof_ack: false,
+            spoof_pending: None,
+            confirm_old_driver: false,
             cancel: None,
             use_backup: cfg.allow_backup_source,
             // 配置里没填过就用内置备用源，省得用户自己去查网址
@@ -1047,6 +1202,22 @@ impl App {
                 self.progress = None;
                 self.cancel = None;
                 self.download_failed = true;
+            }
+            Msg::GpuOpDone(r) => {
+                self.busy = false;
+                // 不论成败都重新读一遍，界面上显示的必须是注册表的真实状态
+                self.adapters = gpu::enumerate();
+                self.driver = gpu::detect_driver(&self.adapters);
+                match r {
+                    Ok(m) => {
+                        self.logs.push(m.clone());
+                        self.status = m;
+                    }
+                    Err(e) => {
+                        self.logs.push(format!("显卡名操作失败: {e}"));
+                        self.status = format!("显卡名操作失败: {e}");
+                    }
+                }
             }
         }
     }
@@ -1293,7 +1464,16 @@ impl App {
         }
     }
 
+    /// 部署入口。驱动低于建议版本时先弹一次确认，避免用户白忙一场。
     fn start_deploy(&mut self) {
+        if self.driver.as_ref().map(|d| d.too_old()).unwrap_or(false) {
+            self.confirm_old_driver = true;
+            return;
+        }
+        self.do_deploy();
+    }
+
+    fn do_deploy(&mut self) {
         let Some(dir) = self.game_dir.clone() else {
             self.status = "请先选择游戏目录".to_owned();
             return;
@@ -1384,7 +1564,45 @@ impl App {
             ctx.request_repaint();
         });
     }
+
+    /// 启动提权子进程去改注册表。会弹一次 UAC，用户在弹窗上点「是」才继续。
+    fn start_gpu_op(&mut self, op: gpu::Op) {
+        let Ok(exe) = std::env::current_exe() else {
+            self.status = "无法定位自身可执行文件，操作已取消".to_owned();
+            return;
+        };
+        self.busy = true;
+        self.status = "已请求管理员权限，请在弹窗上点「是」...".to_owned();
+        self.logs.push(format!(
+            "正在{}显卡名称（会弹一次 UAC）",
+            if matches!(op, gpu::Op::Restore(_)) {
+                "还原"
+            } else {
+                "修改"
+            }
+        ));
+        self.spawn(move |tx, ctx| {
+            let r = gpu::run_elevated(&exe, &op);
+            let _ = tx.send(Msg::GpuOpDone(match r {
+                Ok(m) => Ok(m),
+                Err(e) => Err(format!("{e:#}")),
+            }));
+            ctx.request_repaint();
+        });
+    }
 }
+
+/// 改显卡名的副作用。界面上必须完整展示，动手前要用户勾选确认。
+const SPOOF_WARNINGS: [&str; 8] = [
+    "显卡名和硬件 ID（DEV_xxxx）不一致，内核级反作弊可能判定异常 —— 有封号风险，请自行判断。",
+    "NVIDIA App / 驱动安装程序可能识别错型号，导致驱动更新或「优化」失败。",
+    "重装驱动或大版本更新后会被重置，需要重新设一次。",
+    "dxdiag、设备管理器、任务管理器里显示的显卡名都会跟着变。",
+    "不保证一定生效：如果游戏改用硬件 ID 判断型号，改名没有任何作用。",
+    "本工具只提供固定型号名单，避免填错；填了不存在的型号可能让游戏崩溃或拒绝运行。",
+    "部分按型号生效的 NVIDIA 功能（DLSS 覆盖、控制面板选项）可能受影响。",
+    "需要重启才生效；出问题可以随时点「还原」，原始值在改之前就已经备份好了。",
+];
 
 /// 用资源管理器打开目录。注意 explorer.exe 成功时也常返回非 0 退出码，所以不检查状态。
 fn open_in_explorer(path: &Path) {
@@ -1537,6 +1755,11 @@ impl eframe::App for App {
                     theme::card_title(ui, "上游资产");
 
                     // 显卡与路由
+                    // 先克隆出来，后面在闭包里用，避免和 self 的可变借用打架
+                    let driver_badge: Option<(String, bool)> = self
+                        .driver
+                        .as_ref()
+                        .map(|d| (d.marketing.clone(), d.too_old()));
                     match self.gpu_name.clone() {
                         Some(n) => {
                             let (txt, col) = match self.gpu_route {
@@ -1549,12 +1772,53 @@ impl eframe::App for App {
                             ui.horizontal(|ui| {
                                 theme::badge(ui, txt, col);
                                 ui.label(theme::hint(n));
+                                match &driver_badge {
+                                    Some((ver, true)) => {
+                                        theme::badge(
+                                            ui,
+                                            &format!("驱动 {ver} 过旧"),
+                                            theme::DANGER,
+                                        );
+                                    }
+                                    Some((ver, false)) => {
+                                        theme::badge(
+                                            ui,
+                                            &format!("驱动 {ver}"),
+                                            theme::OK,
+                                        );
+                                    }
+                                    None => {
+                                        theme::badge(ui, "驱动版本未知", theme::NEUTRAL);
+                                    }
+                                }
                             });
                         }
                         None => {
                             ui.label(theme::hint(
                                 "读不到显卡信息，将按上游默认 SM86 处理，请自行确认。",
                             ));
+                        }
+                    }
+                    // 驱动过旧：这里就给红字，不用等用户点到部署
+                    if let Some((ver, true)) = &driver_badge {
+                        let mut go_driver_page = false;
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "驱动 {ver} 低于 {}，帧生成可能不生效，建议先更新显卡驱动。",
+                                    gpu::MIN_FG_DRIVER_TEXT
+                                ))
+                                .size(11.5)
+                                .color(theme::DANGER),
+                            );
+                            if theme::ghost_button(ui, "打开驱动下载页", true).clicked() {
+                                go_driver_page = true;
+                            }
+                        });
+                        if go_driver_page {
+                            if let Err(e) = util::open_url(gpu::DRIVER_URL) {
+                                self.status = format!("打开驱动下载页失败: {e}");
+                            }
                         }
                     }
 
@@ -1849,6 +2113,19 @@ impl eframe::App for App {
                         );
                     }
 
+                    // 驱动过旧警告：放在按钮正上方，免得点完才发现白忙一场
+                    if let Some(d) = self.driver.as_ref().filter(|d| d.too_old()) {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "⚠ 当前驱动 {} 低于 {}，帧生成可能不生效（点「部署」时会再确认一次）。",
+                                d.marketing,
+                                gpu::MIN_FG_DRIVER_TEXT
+                            ))
+                            .size(11.5)
+                            .color(theme::DANGER),
+                        );
+                    }
+
                     ui.add_space(2.0);
                     ui.horizontal(|ui| {
                         let can = !self.busy && self.game_dir.is_some();
@@ -1918,6 +2195,182 @@ impl eframe::App for App {
                             }
                         }
                     }
+                });
+
+                // --- 显卡名称伪装（高级 · 谨慎）
+                theme::card(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        let (rect, _) =
+                            ui.allocate_exact_size(egui::vec2(3.0, 15.0), egui::Sense::hover());
+                        ui.painter()
+                            .rect_filled(rect, egui::CornerRadius::same(1), theme::WARN);
+                        ui.label(
+                            egui::RichText::new("显卡名称伪装（高级 · 谨慎）")
+                                .size(14.0)
+                                .color(theme::TEXT)
+                                .strong(),
+                        );
+                        ui.with_layout(
+                            egui::Layout::right_to_left(egui::Align::Center),
+                            |ui| {
+                                if theme::ghost_button(
+                                    ui,
+                                    if self.spoof_open { "收起" } else { "展开" },
+                                    true,
+                                )
+                                .clicked()
+                                {
+                                    self.spoof_open = !self.spoof_open;
+                                }
+                            },
+                        );
+                    });
+
+                    // 找到要操作的那块 NVIDIA 显卡；找不到就整个功能禁用
+                    let Some(a) = gpu::primary(&self.adapters).cloned() else {
+                        ui.label(theme::hint(
+                            "没有找到 NVIDIA 显卡的注册表实例，这个功能在本机不可用。",
+                        ));
+                        return;
+                    };
+
+                    // 状态行收起时也可见：一眼看出名字有没有被改过
+                    ui.horizontal(|ui| {
+                        if a.spoofed() {
+                            theme::badge(ui, "已伪装", theme::WARN);
+                        } else {
+                            theme::badge(ui, "未伪装", theme::NEUTRAL);
+                        }
+                        ui.label(theme::hint(format!(
+                            "当前显示「{}」，驱动记录为「{}」",
+                            a.current_name().unwrap_or_else(|| "(空)".to_owned()),
+                            a.driver_name
+                        )));
+                    });
+
+                    if !self.spoof_open {
+                        return;
+                    }
+
+                    ui.add_space(6.0);
+                    ui.label(theme::hint(
+                        "只有在某个游戏的「帧生成」选项不出现、并且已经按上面的步骤正常部署过时，才建议尝试。这个功能不是必须的。",
+                    ));
+
+                    ui.add_space(6.0);
+                    theme::warn_box(ui, |ui| {
+                        ui.label(
+                            egui::RichText::new("动手前请先读完（点「应用伪装」即代表你已了解）：")
+                                .size(12.0)
+                                .color(theme::WARN)
+                                .strong(),
+                        );
+                        ui.add_space(2.0);
+                        for w in SPOOF_WARNINGS {
+                            ui.label(
+                                egui::RichText::new(format!("· {w}"))
+                                    .size(11.0)
+                                    .color(theme::TEXT),
+                            );
+                        }
+                    });
+
+                    ui.add_space(6.0);
+                    ui.label(theme::hint("本工具只会改这一个注册表值，其它一律不碰："));
+                    ui.label(theme::path_text(format!(
+                        "HKLM\\{}\\DeviceDesc",
+                        a.enum_key
+                    )));
+                    if let Some(d) = &a.device_desc {
+                        ui.label(theme::path_text(format!("    现在的值：{d}")));
+                    }
+
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new("伪装成")
+                                .size(12.0)
+                                .color(theme::TEXT_MUTED),
+                        );
+                        egui::ComboBox::from_label("")
+                            .selected_text(self.spoof_target.clone())
+                            .show_ui(ui, |ui| {
+                                for p in gpu::PRESETS {
+                                    ui.selectable_value(
+                                        &mut self.spoof_target,
+                                        (*p).to_owned(),
+                                        *p,
+                                    );
+                                }
+                            });
+                    });
+
+                    ui.add_space(4.0);
+                    ui.checkbox(&mut self.spoof_ack, "我已阅读并理解上面的副作用");
+
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        let can = !self.busy && self.spoof_ack;
+                        if theme::primary_button(ui, "应用伪装", can)
+                            .on_hover_text(if self.spoof_ack {
+                                "先备份原值并读回校验，再改注册表；需要管理员权限（弹一次 UAC）"
+                            } else {
+                                "请先勾选上面的「我已阅读并理解」"
+                            })
+                            .clicked()
+                        {
+                            self.spoof_pending =
+                                Some(gpu::Op::Apply(self.spoof_target.clone()));
+                        }
+                    });
+
+                    // 还原有两种目标，差别很大，所以拆成两个按钮，别让用户猜
+                    let bk_orig = gpu::backup_original_of(&a);
+                    ui.horizontal(|ui| {
+                        let can_driver = !self.busy && a.spoofed();
+                        if theme::danger_button(ui, "还原为驱动记录的名称", can_driver)
+                            .on_hover_text(if can_driver {
+                                "写回驱动自己记录的名称，等于彻底去掉伪装"
+                            } else {
+                                "当前没有被改过，不需要还原"
+                            })
+                            .clicked()
+                        {
+                            self.spoof_pending =
+                                Some(gpu::Op::Restore(gpu::RestoreTo::DriverName));
+                        }
+                        // 备份值要和「驱动记录名」和「当前显示名」都不同，还原才有意义
+                        let cur_name = a.current_name().unwrap_or_default();
+                        let can_backup = !self.busy
+                            && bk_orig
+                                .as_deref()
+                                .map(|o| {
+                                    !o.eq_ignore_ascii_case(&a.driver_name)
+                                        && !o.eq_ignore_ascii_case(&cur_name)
+                                })
+                                .unwrap_or(false);
+                        if theme::ghost_button(ui, "还原为改动前的值", can_backup)
+                            .on_hover_text(match &bk_orig {
+                                Some(o) if can_backup => format!(
+                                    "写回本工具第一次改动之前的值：{}",
+                                    gpu::display_name(o)
+                                ),
+                                _ => "没有可用的备份记录，或备份值就是驱动记录的名称".to_owned(),
+                            })
+                            .clicked()
+                        {
+                            self.spoof_pending =
+                                Some(gpu::Op::Restore(gpu::RestoreTo::BackupOriginal));
+                        }
+                    });
+
+                    ui.label(theme::hint(match gpu::backup_path() {
+                        Ok(p) => format!("备份位置：{}", p.display()),
+                        Err(_) => "备份位置：无法确定".to_owned(),
+                    }));
+                    ui.label(theme::hint(
+                        "生效需要重启。重启后 dxdiag 的「Card name」应该变成你选的型号。",
+                    ));
                 });
 
                 // --- 操作日志
@@ -2086,6 +2539,136 @@ impl eframe::App for App {
                 open_in_explorer(&p);
             }
         });
+
+        // ---------------- 显卡名操作的确认弹窗
+        // 改注册表属于不可逆操作（虽然能还原），所以这里再让用户看一眼「原值 -> 新值」。
+        if let Some(op) = self.spoof_pending.clone() {
+            let ctx = self.ctx.clone();
+            let (mut go, mut close) = (false, false);
+            let title = match &op {
+                gpu::Op::Apply(_) => "确认修改显卡名称",
+                gpu::Op::Restore(_) => "确认还原显卡名称",
+            };
+            let adapters = self.adapters.clone();
+            egui::Window::new(title)
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+                .show(&ctx, |ui| {
+                    ui.set_max_width(460.0);
+                    let a = gpu::primary(&adapters).cloned();
+                    match &op {
+                        gpu::Op::Apply(name) => {
+                            if let Some(a) = &a {
+                                ui.label(theme::hint("要改的注册表值（只改这一个）："));
+                                ui.label(theme::path_text(format!(
+                                    "HKLM\\{}\\DeviceDesc",
+                                    a.enum_key
+                                )));
+                                ui.add_space(6.0);
+                                ui.label(format!(
+                                    "原值：{}",
+                                    a.current_name().unwrap_or_else(|| "(空)".to_owned())
+                                ));
+                                ui.label(
+                                    egui::RichText::new(format!("新值：{name}")).strong(),
+                                );
+                            }
+                            ui.add_space(6.0);
+                            ui.label(
+                                egui::RichText::new(
+                                    "重启后生效。有内核级反作弊的游戏请格外谨慎。",
+                                )
+                                .size(11.5)
+                                .color(theme::WARN),
+                            );
+                        }
+                        gpu::Op::Restore(to) => {
+                            let target = match to {
+                                gpu::RestoreTo::DriverName => a
+                                    .as_ref()
+                                    .map(|x| x.driver_name.clone())
+                                    .unwrap_or_default(),
+                                gpu::RestoreTo::BackupOriginal => a
+                                    .as_ref()
+                                    .and_then(gpu::backup_original_of)
+                                    .unwrap_or_default(),
+                            };
+                            ui.label("会把注册表里的显卡名写回下面这个值：");
+                            ui.add_space(6.0);
+                            ui.label(egui::RichText::new(target).strong());
+                        }
+                    }
+                    ui.add_space(10.0);
+                    ui.horizontal(|ui| {
+                        if theme::primary_button(ui, "确认并继续", true).clicked() {
+                            go = true;
+                        }
+                        if theme::ghost_button(ui, "取消", true).clicked() {
+                            close = true;
+                        }
+                    });
+                    ui.label(theme::hint(
+                        "继续后会弹出 Windows 的管理员确认框（UAC），点「是」才真正写入。",
+                    ));
+                });
+            if go {
+                self.spoof_pending = None;
+                self.start_gpu_op(op);
+            } else if close {
+                self.spoof_pending = None;
+                self.status = "已取消，没有改动任何注册表值".to_owned();
+            }
+        }
+
+        // ---------------- 驱动过旧时「部署」的二次确认
+        if self.confirm_old_driver {
+            let ctx = self.ctx.clone();
+            let ver = self
+                .driver
+                .as_ref()
+                .map(|d| d.marketing.clone())
+                .unwrap_or_default();
+            let (mut go, mut close) = (false, false);
+            egui::Window::new("驱动版本偏低")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+                .show(&ctx, |ui| {
+                    ui.set_max_width(440.0);
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "当前驱动 {ver} 低于建议的 {}。",
+                            gpu::MIN_FG_DRIVER_TEXT
+                        ))
+                        .size(13.0)
+                        .color(theme::DANGER)
+                        .strong(),
+                    );
+                    ui.add_space(6.0);
+                    ui.label(
+                        "驱动过旧时帧生成很可能不生效，部署了也是白部署。建议先更新显卡驱动再试。",
+                    );
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if theme::ghost_button(ui, "仍要继续部署", true).clicked() {
+                            go = true;
+                        }
+                        if theme::primary_button(ui, "先去更新驱动", true).clicked() {
+                            close = true;
+                        }
+                    });
+                });
+            if go {
+                self.confirm_old_driver = false;
+                self.do_deploy();
+            } else if close {
+                self.confirm_old_driver = false;
+                if let Err(e) = util::open_url(gpu::DRIVER_URL) {
+                    self.status = format!("打开驱动下载页失败: {e}");
+                }
+            }
+        }
     }
 }
 /// egui 自带字体不含汉字，不装字体整个中文界面会是方块。

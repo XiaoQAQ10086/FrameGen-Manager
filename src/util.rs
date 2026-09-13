@@ -250,3 +250,28 @@ pub fn format_bytes(n: u64) -> String {
         format!("{} B", n)
     }
 }
+
+/// 用系统默认浏览器打开网址。失败时返回 Err，由调用方决定怎么提示。
+pub fn open_url(url: &str) -> Result<()> {
+    use windows_sys::Win32::UI::Shell::ShellExecuteW;
+    use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+
+    let wide = |s: &str| -> Vec<u16> { s.encode_utf16().chain(std::iter::once(0)).collect() };
+    let verb = wide("open");
+    let target = wide(url);
+    let r = unsafe {
+        ShellExecuteW(
+            std::ptr::null_mut(),
+            verb.as_ptr(),
+            target.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            SW_SHOWNORMAL,
+        )
+    };
+    // ShellExecuteW 返回值 <= 32 即失败
+    if r as isize <= 32 {
+        bail!("打开浏览器失败（ShellExecuteW 返回 {}）", r as isize);
+    }
+    Ok(())
+}

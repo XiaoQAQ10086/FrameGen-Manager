@@ -159,6 +159,17 @@ pub fn card_title(ui: &mut Ui, text: &str) {
     });
 }
 
+/// 警示框：浅黄底 + 橙边。用来放「动手前你必须先知道」的风险说明。
+pub fn warn_box<R>(ui: &mut Ui, add: impl FnOnce(&mut Ui) -> R) -> R {
+    Frame::NONE
+        .fill(Color32::from_rgb(0xFF, 0xF8, 0xE6))
+        .stroke(Stroke::new(1.0, alpha(WARN, 90)))
+        .corner_radius(CornerRadius::same(R_CTRL))
+        .inner_margin(Margin::same(10))
+        .show(ui, add)
+        .inner
+}
+
 /// 圆角胶囊徽章
 pub fn badge(ui: &mut Ui, text: &str, color: Color32) {
     Frame::NONE

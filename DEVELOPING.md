@@ -36,6 +36,15 @@ Rust + egui/eframe。**不许用** Electron / Tauri / WebView。
     cargo run -- --idtest <文件>          # 看一个文件的签名身份
     cargo run -- --icontest <exe>         # 提取图标并打印尺寸/透明度统计
     cargo run -- --pedump <exe>           # 打印 PE 导入表
+    cargo run -- --gpuinfo                # 只读：显卡注册表实例 + 驱动版本 + 备份状态
+
+另有三个只给程序内部用的模式（主程序用 ShellExecuteW("runas") 拉起的提权子进程）：
+
+    --gpuspoof-apply <型号> <结果文件>
+    --gpuspoof-restore driver|backup <结果文件>
+
+它们把 JSON 结果写进结果文件后立刻退出，不创建窗口。手工调用等于自己给自己提权，
+一般用不上；`--gpuinfo` 已经能看全部状态。
 
 ## 打包
 
@@ -51,15 +60,21 @@ Rust + egui/eframe。**不许用** Electron / Tauri / WebView。
 
 | 指标 | 目标 | 实测 |
 |---|---|---|
-| exe 体积 | 安装包 < 10 MB | 6.35 MB |
+| exe 体积 | 安装包 < 10 MB | 6.42 MB |
 | exe 运行库依赖 | 不要求用户装 VC++ | 17 个系统 DLL，无 vcruntime140.dll |
-| 启动 | < 1 s | 约 150 ms |
+| 启动 | < 1 s | 约 170 ms |
 | 关闭即退出 | 是 | 是 |
-| 内存 | < 60 MB | 私有工作集约 64 MB，未达标 |
+| 内存 | < 60 MB | 私有工作集约 68.5 MB，未达标 |
 
 内存超标的部分几乎全部来自中文字体：加载 simhei.ttf（9.7 MB）会多占约 19 MB
 私有内存。要达标需要做字体子集化（build.rs + subsetter）。
 设 DLSSG_NO_CJK_FONT=1 可跳过字体加载，用来量化这部分开销。
+
+口径提醒：这里的「内存」指**私有工作集**（任务管理器「内存」列那个数），
+不是 `Process.WorkingSet64` —— 后者含共享 DLL 页，会虚高 30 MB 左右。
+要用 `Get-CimInstance Win32_PerfFormattedData_PerfProc_Process` 的
+`WorkingSetPrivate` 字段读才可比。实测：带字体 68.5 MB，DLSSG_NO_CJK_FONT=1 时 49.9 MB。
+显卡名伪装功能加入前后用同一套方法各测一次：68.4 MB vs 68.3 MB，没有可测量的差异。
 
 ## 上游（sdli1995/dlssg_for_sm86）的两个事实
 
@@ -112,12 +127,40 @@ PE 解析是**随机读取**的：先读头部拿节表，再按节表把 RVA �
 GitHub 未登录 API 每小时只有 60 次配额，所以更新检查用**两次目录列举**代替
 逐文件查询（从 8 次调用降到 4 次），并且本地文件状态完全按本地判断、不依赖网络。
 
+### 显卡名称伪装（注册表）
+
+只改 `HKLM\SYSTEM\CurrentControlSet\Enum\PCI\<设备>\<实例>\DeviceDesc` 一个值。
+几条不能破的规矩：
+
+1. **只写 DeviceDesc。** `HardwareID`、`CompatibleIDs`、`Driver`、`Service`、`Mfg`
+   一律不碰 —— 改这些会让驱动绑定失效。
+2. **三重过滤定位目标**：`VEN_10DE` 前缀 + `ClassGUID={4d36e968-...}` +
+   `Service=nvlddmkm`。只按 `VEN_10DE` 匹配会把 NVIDIA 高清音频控制器一起改掉
+   （DEV_228B 就是音频设备，ClassGUID 是 {4d36e97d-...}）。
+3. **故意不改类键的 `DriverDesc`。** 本程序自己的 SM86 / SM75 路由判断读的就是它；
+   改掉之后程序会把 RTX 30 系误判成「RTX 50 系，不需要本 Mod」。
+4. **写之前必须备份并读回校验。** 备份落在 `%APPDATA%\FrameGen-Manager\backups\gpu-name\`，
+   存的是「第一次改动之前」的值，之后重复改不会把它覆盖掉。
+5. **型号只能从 `gpu::PRESETS` 里选**，`apply()` 会再校验一次，不在名单里直接拒绝。
+
+还原有两种目标：`RestoreTo::DriverName`（回到驱动记录的真名，彻底去掉伪装）和
+`RestoreTo::BackupOriginal`（回到本工具动手之前的值）。在「之前已被别的工具改过」的
+机器上这两者不一样，所以界面上必须让用户自己选，不能替他决定。
+
+提权走 `ShellExecuteW("runas")` 重新拉起自身，**不申请 UAC 清单** —— 主程序保持免提权，
+便携运行才不会每次启动都弹框。见 `gpu::run_elevated()`。
+
+驱动版本：优先问 `nvidia-smi`（驱动自报，约 35 ms），读不到就解析注册表
+`DriverVersion`（`32.0.16.1692` -> 取数字后 5 位 -> `616.92`，已用 nvidia-smi 交叉验证）。
+阈值是 `gpu::MIN_FG_DRIVER = (591, 86)`。
+
 ## 目录结构
 
     src/
       main.rs        UI + 后台线程 + 命令行自测入口
       deploy.rs      部署 / 备份 / 还原（多文件 + manifest）
-      scan.rs        Steam/Epic 扫描 + 最小 VDF 解析 + PE 解析 + 入口推荐 + 显卡识别
+      scan.rs        Steam/Epic 扫描 + 最小 VDF 解析 + PE 解析 + 入口推荐 + 显卡路由识别
+      gpu.rs         驱动版本检测 + 显卡注册表实例枚举 + 名称伪装 / 备份 / 还原 + 提权
       anticheat.rs   反作弊检测（注册表服务 + 游戏目录特征）
       update.rs      上游更新检查 + 下载 + zip 解压 + INI 改写
       icon.rs        从 EXE 提取图标
