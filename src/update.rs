@@ -22,11 +22,11 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::scan::{self, GpuRoute};
 use crate::util;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 pub const REPO: &str = "sdli1995/dlssg_for_sm86";
 pub const BRANCH: &str = "main";
@@ -103,7 +103,11 @@ impl UpdateState {
 pub fn client() -> Result<reqwest::blocking::Client> {
     reqwest::blocking::Client::builder()
         .user_agent(USER_AGENT)
-        .timeout(Duration::from_secs(120))
+        // 总超时只用来兜底「服务器彻底不响应」。判「慢」交给看门狗
+        // （见 WATCHDOG_* / min_kbps），它在 3 秒内就能把慢源踢掉，
+        // 比让用户干等一个总超时有用得多。
+        // 300 秒是按最坏情况算的：28.9 MB 的运行库压缩包在 300 KB/s 下约 96 秒。
+        .timeout(Duration::from_secs(300))
         // 连接超时别设太长：源被墙时每个候选都要空等这么久。
         // 能用的源 1 秒内就连上了，8 秒足够宽容。
         .connect_timeout(Duration::from_secs(8))
@@ -119,74 +123,53 @@ fn cancelled(cancel: Option<&AtomicBool>) -> bool {
     cancel.map(|c| c.load(Ordering::Relaxed)).unwrap_or(false)
 }
 
-/// 记住每个「主机 + 用途」上一次哪个候选成功，下次从它开始试。
-///
-/// 下标 = 主机 * 2 + 用途（0 探测 / 1 下载）：
-///   主机 0 = raw.githubusercontent.com，主机 1 = github.com（release 直链）
-/// 不记的话，github.com 被墙的机器每次都要先干等 15 秒连接超时。
-static PREF: [AtomicUsize; 4] = [
-    AtomicUsize::new(0),
-    AtomicUsize::new(0),
-    AtomicUsize::new(0),
-    AtomicUsize::new(0),
-];
+/// 原来这里记的是「每个主机上次哪个候选**成功**了」，现在换成了记**实测速率**
+/// （见下面的 SourceSpeeds）。区别很重要：镜像的快慢是按用户线路和时间变的，
+/// 「上次能连上」不代表「这次够快」，而慢源不换掉就是用户抱怨的那个问题。
 
-fn pref_slot(official: &str, download: bool) -> &'static AtomicUsize {
-    let host = if official.contains("raw.githubusercontent.com") {
-        0
-    } else {
-        1
-    };
-    &PREF[host * 2 + usize::from(download)]
-}
-
-/// 按候选顺序依次尝试，第一个成功的胜出，并记住它的位置。
+/// 按候选顺序依次尝试，第一个成功的胜出。
 ///
 /// **探测和下载的优先级是反的，这是故意的**：
 /// * 探测（HEAD，拿 ETag 指纹）走**官方优先** —— 指纹要从 GitHub 自己那里拿才可信。
 ///   HEAD 很小，官方 raw 即使是慢速链路也能秒回。
-/// * 下载走**镜像优先** —— 镜像实测快几十倍，而内容仍然用官方拿到的指纹校验，
-///   所以既快又不牺牲可信度。
+/// * 下载走**镜像优先**，镜像之间再按**实测速率**从快到慢排（见 rank_mirrors）。
+///   内容仍然用官方拿到的指纹校验，所以既快又不牺牲可信度。
+///
+/// attempt 拿到的是 (完整 URL, 源前缀)；前缀空串表示官方源。
 fn try_sources<T>(
     official: &str,
     mirrors: &[String],
     download: bool,
     cancel: Option<&AtomicBool>,
-    mut attempt: impl FnMut(&str) -> Result<T>,
+    mut attempt: impl FnMut(&str, &str) -> Result<T>,
 ) -> Result<T> {
-    let mut urls: Vec<(String, &'static str)> = Vec::with_capacity(mirrors.len() + 1);
+    let mut urls: Vec<(String, String, &'static str)> = Vec::with_capacity(mirrors.len() + 1);
     if download {
         for m in mirrors {
-            urls.push((format!("{m}{official}"), "备用源"));
+            urls.push((format!("{m}{official}"), m.clone(), "备用源"));
         }
-        urls.push((official.to_owned(), "官方源"));
+        urls.push((official.to_owned(), String::new(), "官方源"));
     } else {
-        urls.push((official.to_owned(), "官方源"));
+        urls.push((official.to_owned(), String::new(), "官方源"));
         for m in mirrors {
-            urls.push((format!("{m}{official}"), "备用源"));
+            urls.push((format!("{m}{official}"), m.clone(), "备用源"));
         }
     }
 
-    let slot = pref_slot(official, download);
-    let start = slot.load(Ordering::Relaxed).min(urls.len() - 1);
     let mut errs: Vec<String> = Vec::new();
-    for k in 0..urls.len() {
+    for (url, prefix, label) in &urls {
         // 用户点了取消就立刻停，不要再去试下一个源 ——
         // 否则会一路试完所有镜像才报错，看起来像「所有源都坏了」。
         if cancelled(cancel) {
             bail!("{}", CANCELLED_MSG);
         }
-        let i = (start + k) % urls.len();
-        match attempt(&urls[i].0) {
-            Ok(v) => {
-                slot.store(i, Ordering::Relaxed);
-                return Ok(v);
-            }
+        match attempt(url, prefix) {
+            Ok(v) => return Ok(v),
             Err(e) => {
                 if cancelled(cancel) {
                     bail!("{}", CANCELLED_MSG);
                 }
-                errs.push(format!("{}：{e}", urls[i].1));
+                errs.push(format!("{label}：{e}"));
             }
         }
     }
@@ -218,7 +201,7 @@ pub const RELEASES_URL: &str = "https://github.com/XiaoQAQ10086/FrameGen-Manager
 pub fn fetch_latest_self_version(client: &reqwest::blocking::Client) -> Option<String> {
     let official = format!("https://raw.githubusercontent.com/{SELF_REPO}/main/Cargo.toml");
     let ms = mirrors("");
-    let text = try_sources(&official, &ms, false, None, |url| {
+    let text = try_sources(&official, &ms, false, None, |url, _src| {
         let resp = client
             .get(url)
             .timeout(Duration::from_secs(8))
@@ -296,7 +279,7 @@ fn content_length_of(resp: &reqwest::blocking::Response) -> u64 {
 pub fn probe_remote(client: &reqwest::blocking::Client, repo_path: &str) -> Result<RemoteFile> {
     let official = official_url(repo_path);
     let ms = mirrors("");
-    try_sources(&official, &ms, false, None, |url| {
+    try_sources(&official, &ms, false, None, |url, _src| {
         let resp = client
             .head(url)
             // 单个 HEAD 只有 1KB 不到，6 秒足够。raw 现在会间歇性卡十几秒，
@@ -342,7 +325,7 @@ pub fn fetch_version(client: &reqwest::blocking::Client) -> Option<String> {
     let ms = mirrors("");
     // 这里也要能换源 + 限时：raw 卡十几秒会把整个「检查更新」拖住，
     // 而它只是用来在界面上显示一个版本号而已。
-    let fetched = try_sources(&official, &ms, false, None, |url| {
+    let fetched = try_sources(&official, &ms, false, None, |url, _src| {
         let resp = client
             .get(url)
             .timeout(Duration::from_secs(10))
@@ -453,15 +436,67 @@ pub fn download_auto(
     cancel: &AtomicBool,
     custom_prefix: &str,
     prefer_mirror: bool,
+    min_kbps: u64,
     verify: &dyn Fn(&Path) -> Result<()>,
-    progress: &mut dyn FnMut(u64, u64),
+    progress: &mut dyn FnMut(u64, u64, &str),
 ) -> Result<Downloaded> {
     let official = official_url(repo_path);
     let ms = mirrors(custom_prefix);
-    try_sources(&official, &ms, prefer_mirror, Some(cancel), |url| {
-        let dl = download(client, repo_path, dest, url, expect_etag, cancel, progress)?;
-        verify(dest)?;
-        Ok(dl)
+    let too_slow = AtomicBool::new(false);
+
+    match download_pass(
+        client, repo_path, dest, expect_etag, cancel, &official, &ms, prefer_mirror, min_kbps,
+        verify, &too_slow, progress,
+    ) {
+        Ok(v) => Ok(v),
+        Err(e) => {
+            // 所有源都低于阈值时不能就这么失败：退回「不看速率」再试一遍。
+            // 慢一点也总比下不下来强，用户至少还有取消按钮。
+            if min_kbps > 0 && too_slow.load(Ordering::Relaxed) {
+                download_pass(
+                    client, repo_path, dest, expect_etag, cancel, &official, &ms, prefer_mirror, 0,
+                    verify, &too_slow, progress,
+                )
+                .map_err(|e2| anyhow::anyhow!("{e2}（不限速重试也没成功；先前：{e}）"))
+            } else {
+                Err(e)
+            }
+        }
+    }
+}
+
+/// 按候选顺序走一遍。抽成函数是因为「太慢」时要能整体再走一遍，
+/// 写成一个闭包会和 progress 的可变借用打架。
+#[allow(clippy::too_many_arguments)]
+pub fn download_pass(
+    client: &reqwest::blocking::Client,
+    repo_path: &str,
+    dest: &Path,
+    expect_etag: Option<&str>,
+    cancel: &AtomicBool,
+    official: &str,
+    ms: &[String],
+    prefer_mirror: bool,
+    min_kbps: u64,
+    verify: &dyn Fn(&Path) -> Result<()>,
+    too_slow: &AtomicBool,
+    progress: &mut dyn FnMut(u64, u64, &str),
+) -> Result<Downloaded> {
+    try_sources(official, ms, prefer_mirror, Some(cancel), |url, src| {
+        match download(
+            client, repo_path, dest, url, expect_etag, cancel, src, min_kbps, progress,
+        ) {
+            Ok(dl) => {
+                verify(dest)?;
+                Ok(dl)
+            }
+            Err(e) => {
+                if e.to_string().starts_with(TOO_SLOW_PREFIX) {
+                    too_slow.store(true, Ordering::Relaxed);
+                }
+                Err(e)
+            }
+        }
     })
 }
 
@@ -496,7 +531,11 @@ pub fn download(
     url: &str,
     expect_etag: Option<&str>,
     cancel: &AtomicBool,
-    progress: &mut dyn FnMut(u64, u64),
+    // 正在用的是哪个源（空串 = 官方源），跟着进度一起报给界面
+    source: &str,
+    // 低于这个速率（KB/s）就中止并换源。0 = 不看速率（兜底那一遍用）
+    min_kbps: u64,
+    progress: &mut dyn FnMut(u64, u64, &str),
 ) -> Result<Downloaded> {
     let tmp = part_path(dest);
     let _ = std::fs::remove_file(&tmp);
@@ -515,10 +554,15 @@ pub fn download(
     let mut buf: Vec<u8> = Vec::with_capacity(total as usize);
     let mut chunk = vec![0u8; 64 * 1024];
     let mut got: u64 = 0;
+    // 看门狗：前 3 秒不判（TLS 握手 + 慢启动），之后一旦实测速率低于阈值就
+    // 立刻放弃这个源。这是「慢」和「坏」的分界 —— 坏源有连接超时兜着，
+    // 慢源以前没有任何机制，用户只能眼睁睁看 30 MB 一点点爬完。
+    let t0 = Instant::now();
+    let watch = min_kbps > 0 && (total == 0 || total >= WATCHDOG_MIN_BYTES);
     loop {
         if cancel.load(Ordering::Relaxed) {
             let _ = std::fs::remove_file(&tmp);
-            bail!("已取消下载");
+            bail!("{}", CANCELLED_MSG);
         }
         let n = resp
             .read(&mut chunk)
@@ -528,7 +572,17 @@ pub fn download(
         }
         buf.extend_from_slice(&chunk[..n]);
         got += n as u64;
-        progress(got, total);
+        progress(got, total, source);
+        if watch {
+            let el = t0.elapsed().as_secs_f64();
+            if el >= WATCHDOG_GRACE_SECS {
+                let kbps = got as f64 / el / 1024.0;
+                if kbps < min_kbps as f64 {
+                    let _ = std::fs::remove_file(&tmp);
+                    bail!("{TOO_SLOW_PREFIX}（实测 {kbps:.0} KB/s，低于 {min_kbps} KB/s）");
+                }
+            }
+        }
     }
 
     // 指纹比对：下载响应说的必须是同一份内容
@@ -555,12 +609,22 @@ pub fn download(
     std::fs::write(&tmp, &buf)?;
     util::atomic_replace(&tmp, dest)?;
     util::clear_motw(dest);
+    record_download_speed(source, buf.len() as u64, t0.elapsed().as_secs_f64());
     Ok(Downloaded {
         bytes: buf.len() as u64,
         sha256: util::sha256_hex(&buf),
         blob_sha: util::git_blob_sha1(&buf),
         etag: resp_etag,
     })
+}
+
+/// 下载成功后把实测速率记下来，下次排序就有依据了。
+/// 太小的样本不记 —— 581 字节的 ini 算出来的数没有意义。
+fn record_download_speed(source: &str, bytes: u64, secs: f64) {
+    if bytes < SPEED_RECORD_MIN_BYTES || secs < 0.3 {
+        return;
+    }
+    record_speed(source, (bytes as f64 / secs / 1024.0) as u64);
 }
 
 fn state_path() -> Result<PathBuf> {
@@ -694,18 +758,149 @@ pub const MIRRORS: [&str; 3] = [
 /// 默认备用源（= 最快的那个镜像）。界面上「当前备用源」显示的就是它。
 pub const DEFAULT_BACKUP_PREFIX: &str = "https://gh-proxy.com/";
 
-/// 实际要试的镜像列表。
+/// 实际要试的镜像列表，按**实测速率**从快到慢排。
 ///
-/// 用户在界面上填了自定义前缀就只试它；留空、或者填的正好是内置的那几个，
-/// 就用完整的内置列表 —— 这样才能自动在多个镜像之间回退。
+/// 用户选中的源（界面上的测速列表，或手填的前缀）排在最前面，其余内置镜像跟在
+/// 后面兜底 —— 选中的源整个挂掉时不至于直接失败。
 fn mirrors(custom: &str) -> Vec<String> {
     let c = custom.trim();
-    if c.is_empty() || MIRRORS.contains(&c) {
-        MIRRORS.iter().map(|s| (*s).to_owned()).collect()
+    let rest: Vec<String> = MIRRORS
+        .iter()
+        .filter(|m| **m != c)
+        .map(|s| (*s).to_owned())
+        .collect();
+    let rest = rank_mirrors(&rest);
+    if c.is_empty() {
+        rest
     } else {
-        vec![c.to_owned()]
+        let mut out = vec![c.to_owned()];
+        out.extend(rest);
+        out
     }
 }
+
+// ---------------------------------------------------------- 选源：实测速率记忆
+//
+// 为什么要这套东西：镜像的快慢**按用户线路和时间剧烈变化**。实测同一个
+// gh-proxy.com，同一台机器，相隔一小时能从 6.9 MB/s 掉到 0.34 MB/s。
+// 只记「上次哪个源成功了」根本察觉不到这种变化，用户就得陪着慢源一起等。
+
+/// 一个源的实测速率记录。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SpeedSample {
+    /// KB/s
+    pub kbps: u64,
+    /// unix 秒
+    pub at: i64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SourceSpeeds {
+    pub entries: BTreeMap<String, SpeedSample>,
+}
+
+/// 低于这个速率（KB/s）就认为这个源慢得没法用：既用来触发换源，也用来排序。
+pub const DEFAULT_MIN_SPEED_KBPS: u64 = 300;
+
+/// 超过这段时间没再测过的记录就不算数 —— 镜像速率是按小时变的。
+const SPEED_TTL_SECS: i64 = 6 * 3600;
+
+fn speed_path() -> Result<PathBuf> {
+    Ok(util::app_data_dir()?.join("source_speed.json"))
+}
+
+pub fn load_speeds() -> SourceSpeeds {
+    speed_path()
+        .ok()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default()
+}
+
+fn save_speeds(s: &SourceSpeeds) {
+    if let Ok(p) = speed_path() {
+        if let Ok(t) = serde_json::to_string_pretty(s) {
+            let _ = std::fs::write(p, t);
+        }
+    }
+}
+
+fn now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// 记下一次实测速率。prefix 空串表示官方源。
+pub fn record_speed(prefix: &str, kbps: u64) {
+    let mut s = load_speeds();
+    s.entries.insert(prefix.to_owned(), SpeedSample { kbps, at: now_unix() });
+    save_speeds(&s);
+}
+
+/// 取某个源的实测速率。没测过、或记录太旧，都返回 None。
+fn speed_of(s: &SourceSpeeds, prefix: &str) -> Option<u64> {
+    let e = s.entries.get(prefix)?;
+    if now_unix() - e.at > SPEED_TTL_SECS {
+        return None;
+    }
+    Some(e.kbps)
+}
+
+/// 按实测速率排序：确认够快的在前（越快越前），没测过的居中，确认太慢的垫底。
+pub fn rank_mirrors(ms: &[String]) -> Vec<String> {
+    let s = load_speeds();
+    let items: Vec<(String, Option<u64>)> =
+        ms.iter().map(|m| (m.clone(), speed_of(&s, m))).collect();
+    rank_by_scores(&items)
+}
+
+/// 纯粹按 (源, 实测速率) 排序，和磁盘状态无关，方便自测。
+/// None = 没测过。
+pub fn rank_by_scores(items: &[(String, Option<u64>)]) -> Vec<String> {
+    let (mut good, mut unknown, mut slow) = (Vec::new(), Vec::new(), Vec::new());
+    for (m, score) in items {
+        match score {
+            Some(k) if *k >= DEFAULT_MIN_SPEED_KBPS => good.push((*k, m.clone())),
+            Some(k) => slow.push((*k, m.clone())),
+            None => unknown.push(m.clone()),
+        }
+    }
+    good.sort_by(|a, b| b.0.cmp(&a.0));
+    slow.sort_by(|a, b| b.0.cmp(&a.0));
+    let mut out: Vec<String> = good.into_iter().map(|(_, m)| m).collect();
+    out.extend(unknown);
+    out.extend(slow.into_iter().map(|(_, m)| m));
+    out
+}
+
+/// 把源前缀变成给人看的名字。空串 = 官方源。
+pub fn source_label(prefix: &str) -> String {
+    let p = prefix.trim();
+    if p.is_empty() {
+        return "官方源".to_owned();
+    }
+    p.trim_start_matches("https://")
+        .trim_start_matches("http://")
+        .trim_end_matches('/')
+        .to_owned()
+}
+
+// ------------------------------------------------------------------ 看门狗
+
+/// 换源文案。上层靠这个前缀区分「这个源太慢」和「这个源坏了」，
+/// 因为「所有源都太慢」时要退回不限速再试一遍，不能让用户下不了。
+pub const TOO_SLOW_PREFIX: &str = "这个源太慢";
+
+/// 只对大文件开看门狗。581 字节的 ini 秒下完，判速没意义。
+const WATCHDOG_MIN_BYTES: u64 = 4 * 1024 * 1024;
+
+/// 宽限期：TLS 握手 + TCP 慢启动都要时间，太早判会误杀好源。
+const WATCHDOG_GRACE_SECS: f64 = 3.0;
+
+/// 下载中至少攒够这么多字节才值得记速率（小文件测出来的数没意义）。
+const SPEED_RECORD_MIN_BYTES: u64 = 512 * 1024;
 
 /// 运行库来源仓库
 pub const DLSS_REPO: &str = "RankFTW/rhi-repo";
@@ -816,7 +1011,10 @@ pub fn download_raw(
     url: &str,
     dest: &Path,
     cancel: &AtomicBool,
-    progress: &mut dyn FnMut(u64, u64),
+    // 同 download()：哪个源、速率低于多少就换源
+    source: &str,
+    min_kbps: u64,
+    progress: &mut dyn FnMut(u64, u64, &str),
 ) -> Result<u64> {
     let tmp = part_path(dest);
     let _ = std::fs::remove_file(&tmp);
@@ -833,10 +1031,13 @@ pub fn download_raw(
 
     let mut buf: Vec<u8> = Vec::with_capacity(total as usize);
     let mut chunk = vec![0u8; 64 * 1024];
+    let mut got: u64 = 0;
+    let t0 = Instant::now();
+    let watch = min_kbps > 0 && (total == 0 || total >= WATCHDOG_MIN_BYTES);
     loop {
         if cancel.load(Ordering::Relaxed) {
             let _ = std::fs::remove_file(&tmp);
-            bail!("已取消下载");
+            bail!("{}", CANCELLED_MSG);
         }
         let n = resp
             .read(&mut chunk)
@@ -845,7 +1046,18 @@ pub fn download_raw(
             break;
         }
         buf.extend_from_slice(&chunk[..n]);
-        progress(buf.len() as u64, total);
+        got += n as u64;
+        progress(got, total, source);
+        if watch {
+            let el = t0.elapsed().as_secs_f64();
+            if el >= WATCHDOG_GRACE_SECS {
+                let kbps = got as f64 / el / 1024.0;
+                if kbps < min_kbps as f64 {
+                    let _ = std::fs::remove_file(&tmp);
+                    bail!("{TOO_SLOW_PREFIX}（实测 {kbps:.0} KB/s，低于 {min_kbps} KB/s）");
+                }
+            }
+        }
     }
 
     if let Some(parent) = dest.parent() {
@@ -854,6 +1066,7 @@ pub fn download_raw(
     std::fs::write(&tmp, &buf)?;
     util::atomic_replace(&tmp, dest)?;
     util::clear_motw(dest);
+    record_download_speed(source, got, t0.elapsed().as_secs_f64());
     Ok(buf.len() as u64)
 }
 
@@ -864,7 +1077,7 @@ pub fn probe_url(client: &reqwest::blocking::Client, url: &str) -> Option<(u64, 
     // 给界面显示，没有「指纹必须来自 GitHub」的要求（zip 解压后靠 NVIDIA 签名校验），
     // 所以直接走镜像优先。
     let ms = mirrors("");
-    try_sources(url, &ms, true, None, |u| {
+    try_sources(url, &ms, true, None, |u, _src| {
         let r = client
             .head(u)
             .timeout(Duration::from_secs(6))
@@ -885,13 +1098,138 @@ fn download_with_mirror(
     official: &str,
     dest: &Path,
     cancel: &AtomicBool,
-    progress: &mut dyn FnMut(u64, u64),
+    min_kbps: u64,
+    progress: &mut dyn FnMut(u64, u64, &str),
 ) -> Result<u64> {
     let ms = mirrors("");
-    try_sources(official, &ms, true, Some(cancel), |url| {
-        progress(0, 0);
-        download_raw(client, url, dest, cancel, progress)
-    })
+    let too_slow = AtomicBool::new(false);
+
+    let run = |min_kbps: u64,
+                   too_slow: &AtomicBool,
+                   progress: &mut dyn FnMut(u64, u64, &str)|
+     -> Result<u64> {
+        try_sources(official, &ms, true, Some(cancel), |url, src| {
+            progress(0, 0, src);
+            match download_raw(client, url, dest, cancel, src, min_kbps, progress) {
+                Ok(n) => Ok(n),
+                Err(e) => {
+                    if e.to_string().starts_with(TOO_SLOW_PREFIX) {
+                        too_slow.store(true, Ordering::Relaxed);
+                    }
+                    Err(e)
+                }
+            }
+        })
+    };
+
+    match run(min_kbps, &too_slow, progress) {
+        Ok(v) => Ok(v),
+        Err(e) => {
+            // 同 download_auto：全部太慢就退回不限速再走一遍
+            if min_kbps > 0 && too_slow.load(Ordering::Relaxed) {
+                run(0, &too_slow, progress)
+                    .map_err(|e2| anyhow::anyhow!("{e2}（不限速重试也没成功；先前：{e}）"))
+            } else {
+                Err(e)
+            }
+        }
+    }
+}
+
+// ------------------------------------------------------------------ 测速
+
+/// 一个源的测速结果。
+#[derive(Debug, Clone)]
+pub struct SourceSpeed {
+    /// 镜像前缀。空串 = 官方源（这一行只做展示，不可选）。
+    pub prefix: String,
+    /// 给人看的名字
+    pub label: String,
+    /// 实测 KB/s。error 非空时无意义。
+    pub kbps: u64,
+    pub error: Option<String>,
+}
+
+/// 测速时读的样本大小。够判断数量级了，又不会真的把 15 MB 拖下来。
+const SPEED_TEST_BYTES: u64 = 512 * 1024;
+/// 单个源的测速上限。慢源不能在测速阶段把用户卡住。
+const SPEED_TEST_CAP_SECS: f64 = 4.0;
+
+/// 测一个源的下载速率：只读前若干字节就断开，**不落盘、不校验**。
+fn measure_source(client: &reqwest::blocking::Client, url: &str, cancel: &AtomicBool) -> Result<u64> {
+    let mut resp = client
+        .get(url)
+        .timeout(Duration::from_secs(SPEED_TEST_CAP_SECS as u64 + 6))
+        .send()
+        .map_err(|e| anyhow::anyhow!(friendly_error(&e)))?;
+    if !resp.status().is_success() {
+        bail!("HTTP {}", resp.status().as_u16());
+    }
+    let t0 = Instant::now();
+    let mut chunk = vec![0u8; 64 * 1024];
+    let mut got: u64 = 0;
+    while got < SPEED_TEST_BYTES {
+        if cancelled(Some(cancel)) {
+            bail!("{}", CANCELLED_MSG);
+        }
+        if t0.elapsed().as_secs_f64() >= SPEED_TEST_CAP_SECS {
+            break;
+        }
+        let n = resp.read(&mut chunk).map_err(|e| anyhow::anyhow!("{e}"))?;
+        if n == 0 {
+            break;
+        }
+        got += n as u64;
+    }
+    let el = t0.elapsed().as_secs_f64();
+    // 连 32 KB 都拿不到就别报速率了，报上去会误导用户
+    if got < 32 * 1024 || el <= 0.05 {
+        bail!("{:.1} 秒里只拿到 {} 字节", el, got);
+    }
+    Ok((got as f64 / el / 1024.0) as u64)
+}
+
+/// 把所有候选源测一遍。顺序：官方 raw、各镜像、官方 Release 直链。
+///
+/// 为什么这件事必须由用户自己的机器来做：镜像快慢是按**用户线路**变的。
+/// 开发者这边 gh-proxy 快，不代表用户的线路也快，反过来也一样。
+pub fn speed_test_all(
+    client: &reqwest::blocking::Client,
+    cancel: &AtomicBool,
+    mut on_progress: impl FnMut(String),
+) -> Vec<SourceSpeed> {
+    let raw = official_url("version.dll");
+    let mut targets: Vec<(String, String, String)> = Vec::new();
+    targets.push(("官方源（raw）".to_owned(), String::new(), raw.clone()));
+    for m in MIRRORS {
+        targets.push((source_label(m), m.to_owned(), format!("{m}{raw}")));
+    }
+    targets.push((
+        "官方源（Release 直链）".to_owned(),
+        String::new(),
+        release_url("dlssg-310.9.1", "nvngx_dlssg_310.9.1.zip"),
+    ));
+
+    let mut out = Vec::new();
+    for (label, prefix, url) in targets {
+        if cancelled(Some(cancel)) {
+            break;
+        }
+        on_progress(format!("正在测速：{label}"));
+        let r = measure_source(client, &url, cancel);
+        let (kbps, error) = match r {
+            Ok(k) => {
+                // 官方源的那两行不记：下载顺序里官方永远排最后，记了也没用
+                if !prefix.is_empty() {
+                    record_speed(&prefix, k);
+                }
+                (k, None)
+            }
+            Err(e) => (0, Some(e.to_string())),
+        };
+        out.push(SourceSpeed { prefix, label, kbps, error });
+    }
+    out
 }
 
 // ---------------------------------------------------------------- ZIP 单文件解压
@@ -1057,6 +1395,7 @@ pub fn ensure_dlss_runtime(
     cancel: &AtomicBool,
     plan: &[RuntimeStep],
     ctx: ProgressCtx,
+    min_kbps: u64,
     mut progress: impl FnMut(String, f32),
 ) -> Result<Vec<PathBuf>> {
     let dir = util::assets_dir()?;
@@ -1095,19 +1434,20 @@ pub fn ensure_dlss_runtime(
 
         let got_bytes: u64;
         let direct = {
-            let mut relay = |got: u64, len: u64| {
+            let mut relay = |got: u64, len: u64, src: &str| {
                 let t = if len > 0 { len } else { step.size };
                 progress(
                     format!(
-                        "第 {step_no}/{} 步 · 下载 {label} {} / {}",
+                        "第 {step_no}/{} 步 · 下载 {label} {} / {} · 经 {}",
                         ctx.total_steps,
                         util::format_bytes(got),
-                        util::format_bytes(t)
+                        util::format_bytes(t),
+                        source_label(src)
                     ),
                     frac(done + got),
                 );
             };
-            download_with_mirror(client, &step.url, &zip_path, cancel, &mut relay)
+            download_with_mirror(client, &step.url, &zip_path, cancel, min_kbps, &mut relay)
         };
 
         match direct {
@@ -1124,20 +1464,22 @@ pub fn ensure_dlss_runtime(
                     ),
                     frac(done),
                 );
-                let mut relay = |got: u64, len: u64| {
+                let mut relay = |got: u64, len: u64, src: &str| {
                     let t = if len > 0 { len } else { asset.size };
                     progress(
                         format!(
-                            "第 {step_no}/{} 步 · 下载 {label} {} / {}",
+                            "第 {step_no}/{} 步 · 下载 {label} {} / {} · 经 {}",
                             ctx.total_steps,
                             util::format_bytes(got),
-                            util::format_bytes(t)
+                            util::format_bytes(t),
+                            source_label(src)
                         ),
                         frac(done + got),
                     );
                 };
-                got_bytes =
-                    download_with_mirror(client, &asset.url, &zip_path, cancel, &mut relay)?;
+                got_bytes = download_with_mirror(
+                    client, &asset.url, &zip_path, cancel, min_kbps, &mut relay,
+                )?;
             }
         }
         done += got_bytes;

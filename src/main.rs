@@ -81,6 +81,19 @@ fn main() -> eframe::Result<()> {
         return Ok(());
     }
 
+    // 选源排序 + 看门狗自测（本地起慢服务器，不依赖外网）：cargo run -- --sourcetest
+    if std::env::args().any(|a| a == "--sourcetest") {
+        sourcetest();
+        return Ok(());
+    }
+
+    // 把所有候选源实测一遍并打印速度表：cargo run -- --speedall
+    // 和界面上「测速」按钮走的是同一个函数，用来验证选源这条链路。
+    if std::env::args().any(|a| a == "--speedall") {
+        speedall();
+        return Ok(());
+    }
+
     // 调试图标提取：cargo run -- --icontest <exe>
     let argv_i: Vec<String> = std::env::args().collect();
     if let Some(pos) = argv_i.iter().position(|a| a == "--icontest") {
@@ -163,7 +176,7 @@ fn main() -> eframe::Result<()> {
             base_step: 0,
             total_steps: plan.len(),
         };
-        match update::ensure_dlss_runtime(&c, &cancel, &plan, ctx, |msg, _f| {
+        match update::ensure_dlss_runtime(&c, &cancel, &plan, ctx, 0, |msg, _f| {
             println!("  {msg}");
         }) {
             Ok(paths) => {
@@ -244,7 +257,17 @@ fn main() -> eframe::Result<()> {
         );
         println!("  内置备用源 = {}", update::DEFAULT_BACKUP_PREFIX);
         println!("  实际请求   = {url}");
-        match update::download(&c, path, &dest, &url, Some(&remote.etag), &cancel, &mut |_, _| {}) {
+        match update::download(
+            &c,
+            path,
+            &dest,
+            &url,
+            Some(&remote.etag),
+            &cancel,
+            update::DEFAULT_BACKUP_PREFIX,
+            0,
+            &mut |_, _, _| {},
+        ) {
             Ok(dl) => {
                 // 通过标准是「长度对得上」。有些镜像（比如现在的 gh-proxy.com）
                 // 不转发 GitHub 的 ETag，拿不到就没法比指纹 —— 那是镜像的特性，
@@ -490,6 +513,7 @@ fn speedtest() {
         &cancel,
         "",
         true,
+        update::DEFAULT_MIN_SPEED_KBPS,
         // 和界面里一样：代理 DLL 必须带本项目签名
         &|p: &Path| {
             let id = scan::identify_dll(p);
@@ -499,7 +523,7 @@ fn speedtest() {
                 Err(anyhow::anyhow!("签名校验失败，判定为「{}」", id.label()))
             }
         },
-        &mut |got, _| {
+        &mut |got, _, _src| {
             if got.saturating_sub(last) >= 4 * 1024 * 1024 {
                 last = got;
                 println!("      ... {} MB", got / (1024 * 1024));
@@ -524,6 +548,210 @@ fn speedtest() {
             println!("  保存于 {}", dest.display());
         }
         Err(e) => println!("  [FAIL] {e}"),
+    }
+}
+
+/// 本地起一个 HTTP 服务，按 chunk/delay 的节奏往外吐 bytes 字节。
+/// 用来把「看门狗」和「不限速兜底」真跑一遍 —— 不依赖外网，结果可重复。
+fn spawn_http_server(bytes: u64, chunk: u64, delay_ms: u64) -> (u16, Arc<AtomicBool>) {
+    use std::io::{Read as _, Write as _};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("绑定本地端口失败");
+    let port = listener.local_addr().expect("拿本地端口失败").port();
+    let stop = Arc::new(AtomicBool::new(false));
+    let s2 = stop.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            if s2.load(Ordering::Relaxed) {
+                break;
+            }
+            let Ok(mut sock) = stream else { continue };
+            // 客户端中途放弃时不能让这里一直阻塞
+            let _ = sock.set_write_timeout(Some(std::time::Duration::from_secs(2)));
+            let mut req = [0u8; 2048];
+            let _ = sock.read(&mut req);
+            let head = format!(
+                "HTTP/1.1 200 OK
+Content-Length: {bytes}
+Content-Type: application/octet-stream
+
+"
+            );
+            if sock.write_all(head.as_bytes()).is_err() {
+                continue;
+            }
+            let buf = vec![0u8; chunk as usize];
+            for _ in 0..bytes.div_ceil(chunk.max(1)) {
+                if s2.load(Ordering::Relaxed) || sock.write_all(&buf).is_err() {
+                    break;
+                }
+                let _ = sock.flush();
+                if delay_ms > 0 {
+                    std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+                }
+            }
+        }
+    });
+    (port, stop)
+}
+
+/// 实测每个候选源的下载速率，打印成表。
+/// **和界面上「测速」按钮调的是同一个 speed_test_all**，所以这个命令的
+/// 结果就代表了那个按钮会不会工作。
+fn speedall() {
+    println!("===== 下载源实测（每个源拉 512 KB）=====");
+    let c = match update::client() {
+        Ok(c) => c,
+        Err(e) => {
+            println!("[FAIL] 建客户端失败: {e}");
+            return;
+        }
+    };
+    let cancel = AtomicBool::new(false);
+    let list = update::speed_test_all(&c, &cancel, |msg| println!("  {msg}"));
+    println!();
+    for s in &list {
+        match &s.error {
+            Some(e) => println!("  {:<26} 不可用（{e}）", s.label),
+            None => println!("  {:<26} {} KB/s", s.label, s.kbps),
+        }
+    }
+    println!("
+  下载时的实际尝试顺序：");
+    let builtins: Vec<String> = update::MIRRORS.iter().map(|s| (*s).to_owned()).collect();
+    for (i, m) in update::rank_mirrors(&builtins).iter().enumerate() {
+        println!("    {}. {}", i + 1, update::source_label(m));
+    }
+    println!("  （官方源永远排最后；低于 {} KB/s 的源下载中会被看门狗换掉）", update::DEFAULT_MIN_SPEED_KBPS);
+}
+
+fn ck(fails: &mut Vec<String>, ok: bool, what: &str) {
+    println!("  [{}] {what}", if ok { "PASS" } else { "FAIL" });
+    if !ok {
+        fails.push(what.to_owned());
+    }
+}
+
+/// 选源 / 看门狗自测。
+fn sourcetest() {
+    println!("===== 选源 + 看门狗 自测 =====");
+    let mut fails: Vec<String> = Vec::new();
+
+    println!("-- 源名字 --");
+    ck(&mut fails, update::source_label("") == "官方源", "空前缀认成「官方源」");
+    ck(
+        &mut fails,
+        update::source_label("https://gh-proxy.com/") == "gh-proxy.com",
+        "镜像前缀转成人能看的名字",
+    );
+
+    println!("-- 排序（快的在前、没测过居中、太慢的垫底）--");
+    let fast = "https://fast.example/".to_owned();
+    let mid = "https://mid.example/".to_owned();
+    let dead = "https://dead.example/".to_owned();
+    let items = vec![
+        (dead.clone(), Some(50u64)),
+        (mid.clone(), None),
+        (fast.clone(), Some(5000)),
+    ];
+    let ranked = update::rank_by_scores(&items);
+    ck(&mut fails, ranked.first() == Some(&fast), "实测 5000 KB/s 的排最前");
+    ck(&mut fails, ranked.get(1) == Some(&mid), "没测过的排中间");
+    ck(&mut fails, ranked.get(2) == Some(&dead), "实测 50 KB/s 的垫底");
+
+    let c = match update::client() {
+        Ok(c) => c,
+        Err(e) => {
+            println!("[FAIL] 建客户端失败: {e}");
+            return;
+        }
+    };
+    let cancel = AtomicBool::new(false);
+    let tmp = std::env::temp_dir();
+
+    // 慢源：8 MB 的响应，每 200ms 只给 32 KB，约 160 KB/s
+    let (slow_port, slow_stop) = spawn_http_server(8 * 1024 * 1024, 32 * 1024, 200);
+    let d1 = tmp.join("fgm-watchdog-test.bin");
+    let _ = std::fs::remove_file(&d1);
+    let u1 = format!("http://127.0.0.1:{slow_port}/slow");
+    println!("-- 看门狗：慢源（约 160 KB/s，阈值 300 KB/s）--");
+    let t0 = std::time::Instant::now();
+    let r1 = update::download(&c, "watchdog-test", &d1, &u1, None, &cancel, "本地慢源", 300, &mut |_, _, _| {});
+    let el = t0.elapsed().as_secs_f64();
+    let msg1 = match &r1 {
+        Ok(_) => "居然成功了".to_owned(),
+        Err(e) => e.to_string(),
+    };
+    ck(
+        &mut fails,
+        msg1.starts_with(update::TOO_SLOW_PREFIX),
+        &format!("慢源被拦下：{msg1}"),
+    );
+    ck(&mut fails, el < 10.0, &format!("拦得够快（{el:.1} 秒，不是等整个文件）"));
+    ck(&mut fails, !d1.exists(), "被拦下后没留下文件");
+
+    // 小文件豁免：512 KB 的响应，看门狗不该管
+    let (small_port, small_stop) = spawn_http_server(512 * 1024, 64 * 1024, 0);
+    let d2 = tmp.join("fgm-small-test.bin");
+    let _ = std::fs::remove_file(&d2);
+    let u2 = format!("http://127.0.0.1:{small_port}/small");
+    let r2 = update::download(&c, "small-test", &d2, &u2, None, &cancel, "本地小源", 300, &mut |_, _, _| {});
+    println!("-- 小文件不受看门狗管 --");
+    ck(&mut fails, r2.is_ok(), "512 KB 的文件正常下完（阈值对它是摆设）");
+    ck(
+        &mut fails,
+        std::fs::metadata(&d2).map(|m| m.len() == 512 * 1024).unwrap_or(false),
+        "小文件字节数正确",
+    );
+
+    // min_kbps=0：大文件也不该被拦 —— 兜底那一遍靠的就是这个
+    let (big_port, big_stop) = spawn_http_server(4 * 1024 * 1024, 256 * 1024, 0);
+    let d3 = tmp.join("fgm-big-test.bin");
+    let _ = std::fs::remove_file(&d3);
+    let u3 = format!("http://127.0.0.1:{big_port}/big");
+    let r3 = update::download(&c, "big-test", &d3, &u3, None, &cancel, "本地快源", 0, &mut |_, _, _| {});
+    println!("-- min_kbps=0（不限速）--");
+    ck(&mut fails, r3.is_ok(), "4 MB 的文件不被拦");
+    ck(
+        &mut fails,
+        std::fs::metadata(&d3).map(|m| m.len() == 4 * 1024 * 1024).unwrap_or(false),
+        "大文件字节数正确",
+    );
+
+    // 兜底两遍：第一遍太慢被标，第二遍不限速拿到
+    println!("-- 全部太慢 -> 不限速重试（download_auto 的兜底路径）--");
+    let too_slow = AtomicBool::new(false);
+    let (s2_port, s2_stop) = spawn_http_server(8 * 1024 * 1024, 32 * 1024, 200);
+    let d4 = tmp.join("fgm-fallback-test.bin");
+    let _ = std::fs::remove_file(&d4);
+    let su = format!("http://127.0.0.1:{s2_port}/x");
+    let p1 = update::download_pass(
+        &c, "fallback-test", &d4, None, &cancel, &su, &[], true, 300, &|_| Ok(()), &too_slow,
+        &mut |_, _, _| {},
+    );
+    ck(
+        &mut fails,
+        p1.is_err() && too_slow.load(Ordering::Relaxed),
+        "第一遍：唯一的源太慢，被标记为「太慢」",
+    );
+    let (ok_port, ok_stop) = spawn_http_server(256 * 1024, 64 * 1024, 0);
+    let ou = format!("http://127.0.0.1:{ok_port}/y");
+    let p2 = update::download_pass(
+        &c, "fallback-test", &d4, None, &cancel, &ou, &[], true, 0, &|_| Ok(()), &too_slow,
+        &mut |_, _, _| {},
+    );
+    ck(&mut fails, p2.is_ok(), "第二遍：不限速重试拿到了文件");
+
+    for s in [&slow_stop, &small_stop, &big_stop, &s2_stop, &ok_stop] {
+        s.store(true, Ordering::Relaxed);
+    }
+    for d in [&d1, &d2, &d3, &d4] {
+        let _ = std::fs::remove_file(d);
+    }
+
+    println!("
+===== 结果: {} 项失败 =====", fails.len());
+    for f in &fails {
+        println!("  - {f}");
     }
 }
 
@@ -765,8 +993,9 @@ fn canceltest() {
         &cancel,
         "",
         false,
+        update::DEFAULT_MIN_SPEED_KBPS,
         &|_p| Ok(()),
-        &mut |_, _| {},
+        &mut |_, _, _| {},
     );
 
     let msg = match &r {
@@ -837,8 +1066,9 @@ fn downloadtest() {
         &cancel,
         "",
         false,
+        update::DEFAULT_MIN_SPEED_KBPS,
         &|_p| Ok(()),
-        &mut |got, total| {
+        &mut |got, total, _src| {
             if total > 0 && got >= total {
                 println!("  已下载 {got} / {total} 字节");
             }
@@ -1242,7 +1472,8 @@ struct UpdateSummary {
 enum Msg {
     Scanned(Vec<GameRow>),
     UpdateChecked(UpdateSummary),
-    Progress(String, f32),
+    /// 文案 / 总进度 / 总字节数（0 表示还没算出来）
+    Progress(String, f32, u64),
     Done(String),
     Failed(String),
     /// 下载失败。单独一个变体，是为了在界面上给出「改用备用源」的提示。
@@ -1254,6 +1485,8 @@ enum Msg {
     /// 软件自身的版本检查回来了。None 表示没查到（网络问题）。
     /// manual = 用户自己点的「检查更新」；自动检查时没查到就不要打扰他。
     SelfVersionChecked { latest: Option<String>, manual: bool },
+    /// 所有候选源的测速结果回来了
+    SpeedTested(Vec<update::SourceSpeed>),
 }
 
 struct App {
@@ -1282,6 +1515,8 @@ struct App {
     autoscan_done: bool,
     /// 启动时的那一次「检查本软件新版本」跑过没有
     autocheck_done: bool,
+    /// 调试开关：启动就跑一次测速（DLSSG_AUTOSPEED=1），只为截图/排查用
+    autospeed_done: bool,
 
     // ---- 代理入口推荐
     advice: Option<scan::ProxyAdvice>,
@@ -1310,6 +1545,15 @@ struct App {
     use_backup: bool,
     backup_prefix: String,
     download_failed: bool,
+    /// 低于这个速率（KB/s）就换源
+    min_speed_kbps: u64,
+    /// 测速结果，界面按它列候选源
+    speed_results: Vec<update::SourceSpeed>,
+    speed_testing: bool,
+    /// 本次下载的开始时刻 —— 用来算实时速度和剩余时间
+    dl_started: Option<std::time::Instant>,
+    dl_total: u64,
+    dl_done: u64,
 
     // ---- 本次部署对 INI 的改动说明
     ini_changes: Vec<String>,
@@ -1372,6 +1616,7 @@ impl App {
             logs: boot_notes,
             autoscan_done: false,
             autocheck_done: false,
+            autospeed_done: false,
             advice: None,
             gpu_name,
             gpu_route,
@@ -1393,6 +1638,12 @@ impl App {
                 cfg.backup_prefix
             },
             download_failed: false,
+            min_speed_kbps: cfg.min_speed_kbps as u64,
+            speed_results: Vec::new(),
+            speed_testing: false,
+            dl_started: None,
+            dl_total: 0,
+            dl_done: 0,
             ini_changes: Vec::new(),
             icon_textures: HashMap::new(),
         }
@@ -1506,8 +1757,47 @@ impl App {
                 self.update_state = update::load_state();
                 self.busy = false;
             }
-            Msg::Progress(text, f) => {
+            Msg::Progress(text, f, total) => {
                 self.progress = Some((text, f));
+                if total > 0 {
+                    // 计时从「真正开始传字节」那一刻起算，别把前面探测文件信息的
+                    // 时间算进去 —— 那样算出来的速度会偏低。
+                    if self.dl_started.is_none() {
+                        self.dl_started = Some(std::time::Instant::now());
+                    }
+                    self.dl_total = total;
+                    self.dl_done = (f * total as f32) as u64;
+                }
+            }
+            Msg::SpeedTested(list) => {
+                self.speed_testing = false;
+                self.busy = false;
+                self.progress = None;
+                let mut fastest: Option<(u64, String)> = None;
+                for s in &list {
+                    match &s.error {
+                        None => {
+                            self.logs.push(format!("测速 {}：{} KB/s", s.label, s.kbps));
+                            if !s.prefix.is_empty()
+                                && fastest.as_ref().map(|(k, _)| s.kbps > *k).unwrap_or(true)
+                            {
+                                fastest = Some((s.kbps, s.prefix.clone()));
+                            }
+                        }
+                        Some(e) => {
+                            self.logs.push(format!("测速 {}：不可用（{e}）", s.label))
+                        }
+                    }
+                }
+                self.speed_results = list;
+                self.status = match fastest {
+                    Some((k, p)) => format!(
+                        "测速完成，最快的是 {}（{} KB/s），在「下载源」里点一下就能选中",
+                        update::source_label(&p),
+                        k
+                    ),
+                    None => "测速完成，但一个能用的源都没测出来".to_owned(),
+                };
             }
             Msg::Done(m) => {
                 self.logs.push(m.clone());
@@ -1516,6 +1806,7 @@ impl App {
                 self.progress = None;
                 self.cancel = None;
                 self.download_failed = false;
+                self.dl_started = None;
                 self.refresh();
             }
             Msg::Failed(e) => {
@@ -1610,6 +1901,7 @@ impl App {
             asset_dir: util::load_config().asset_dir,
             allow_backup_source: self.use_backup,
             backup_prefix: self.backup_prefix.clone(),
+            min_speed_kbps: self.min_speed_kbps as u32,
         };
         if let Err(e) = util::save_config(&cfg) {
             self.logs.push(format!("保存配置失败: {e}"));
@@ -1627,6 +1919,7 @@ impl App {
         cfg.asset_dir = Some(dir.clone());
         cfg.allow_backup_source = self.use_backup;
         cfg.backup_prefix = self.backup_prefix.clone();
+        cfg.min_speed_kbps = self.min_speed_kbps as u32;
         if let Err(e) = util::save_config(&cfg) {
             self.status = format!("保存配置失败: {e}");
             return;
@@ -1763,10 +2056,15 @@ impl App {
         let proxy = self.proxy.clone();
         let use_backup = self.use_backup && !self.backup_prefix.trim().is_empty();
         let prefix = self.backup_prefix.trim().to_owned();
+        let min_kbps = self.min_speed_kbps;
         let cancel = Arc::new(AtomicBool::new(false));
         self.cancel = Some(cancel.clone());
         self.busy = true;
         self.download_failed = false;
+        // 速度/剩余时间从零开始算
+        self.dl_started = None;
+        self.dl_total = 0;
+        self.dl_done = 0;
         self.status = if use_backup {
             "正在从备用源下载并校验资产...".to_owned()
         } else {
@@ -1780,7 +2078,7 @@ impl App {
 
                 // 先把要下的东西全部探明、算出总字节数，进度条才能按「总进度」走。
                 // 否则每换一个文件进度条就回零，看起来像卡住了。
-                let _ = tx.send(Msg::Progress("正在获取文件信息...".to_owned(), 0.0));
+                let _ = tx.send(Msg::Progress("正在获取文件信息...".to_owned(), 0.0, 0));
                 ctx.request_repaint();
 
                 struct Item {
@@ -1815,6 +2113,7 @@ impl App {
                             util::format_bytes(remote.size)
                         ),
                         0.0,
+                        0,
                     ));
                     ctx.request_repaint();
                     items.push(Item {
@@ -1869,8 +2168,9 @@ impl App {
                         &cancel,
                         &prefix,
                         is_dll,
+                        min_kbps,
                         &verifier,
-                        &mut move |got, len| {
+                        &mut move |got, len, src| {
                             let denom = if len > 0 { len } else { expect };
                             // 进度按「总字节」算，不是当前这个文件的百分比 ——
                             // 否则每换一个文件进度条就回零。
@@ -1881,11 +2181,13 @@ impl App {
                             };
                             let _ = tx2.send(Msg::Progress(
                                 format!(
-                                    "{step_text} 下载 {label} {} / {}",
+                                    "{step_text} 下载 {label} {} / {} · 经 {}",
                                     util::format_bytes(got),
-                                    util::format_bytes(denom)
+                                    util::format_bytes(denom),
+                                    update::source_label(src)
                                 ),
                                 f,
+                                total,
                             ));
                             ctx2.request_repaint();
                         },
@@ -1916,8 +2218,8 @@ impl App {
                         base_step: mod_steps,
                         total_steps: steps,
                     };
-                    update::ensure_dlss_runtime(&c, &cancel, &plan, ctx, move |msg, f| {
-                        let _ = tx2.send(Msg::Progress(msg, f));
+                    update::ensure_dlss_runtime(&c, &cancel, &plan, ctx, min_kbps, move |msg, f| {
+                        let _ = tx2.send(Msg::Progress(msg, f, total));
                         ctx2.request_repaint();
                     })?;
                 }
@@ -1967,6 +2269,32 @@ impl App {
                     .and_then(|c| update::fetch_latest_self_version(&c))
             });
             let _ = tx.send(Msg::SelfVersionChecked { latest, manual });
+            ctx.request_repaint();
+        });
+    }
+
+    /// 把所有候选源各测一遍，把结果列出来让用户自己挑最快的。
+    ///
+    /// 为什么让用户选而不是程序自动定：镜像快慢是按**用户自己的线路**变的，
+    /// 我们这边测出来的名次对他们没有参考价值，只有他们本机测出来的才算数。
+    fn start_speed_test(&mut self) {
+        if self.speed_testing {
+            return;
+        }
+        self.speed_testing = true;
+        self.busy = true;
+        self.status = "正在测速（每个源拉 512 KB，最多几秒）...".to_owned();
+        self.spawn(|tx, ctx| {
+            let cancel = AtomicBool::new(false);
+            let list = update::client()
+                .map(|c| {
+                    update::speed_test_all(&c, &cancel, |msg| {
+                        let _ = tx.send(Msg::Progress(msg, 0.0, 0));
+                        ctx.request_repaint();
+                    })
+                })
+                .unwrap_or_default();
+            let _ = tx.send(Msg::SpeedTested(list));
             ctx.request_repaint();
         });
     }
@@ -2148,6 +2476,12 @@ impl eframe::App for App {
             self.autoscan_done = true;
             self.start_scan();
         }
+        // 调试开关：启动就跑一次测速，省得脚本去点按钮
+        if !self.autospeed_done && std::env::var_os("DLSSG_AUTOSPEED").is_some() {
+            self.autospeed_done = true;
+            self.start_speed_test();
+        }
+
         // 启动时检查「本软件」有没有新版本，默认就开，界面上不设开关。
         // 注意这不是上游 Mod 的更新检查 —— 那个仍然只在你点资产卡片里的
         // 「检查更新」时才跑，两者是两回事，所以入口也不放在一起。
@@ -2493,22 +2827,127 @@ impl eframe::App for App {
                         }
                     });
 
-                    // 当前是否在用备用源 —— 明确显示，并能一键切回官方
-                    if self.use_backup {
-                        ui.horizontal(|ui| {
-                            theme::badge(ui, "走备用源", theme::WARN);
-                            ui.label(theme::hint(self.backup_prefix.clone()));
-                            if theme::ghost_button(ui, "改回官方源", !self.busy).clicked() {
-                                self.use_backup = false;
-                                self.save_config();
-                                self.status = "已改回官方下载源".to_owned();
-                            }
-                        });
-                    }
+                    // ---- 下载源：先测速，再把结果摆出来让用户自己挑最快的
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("下载源").size(12.5).color(theme::TEXT));
+                        if theme::ghost_button(ui, "测速", !self.busy)
+                            .on_hover_text("对每个源各拉 512 KB，实测你这条线路上的真实速度")
+                            .clicked()
+                        {
+                            self.start_speed_test();
+                        }
+                        if self.speed_testing {
+                            ui.add(egui::Spinner::new().size(12.0));
+                        }
+                        if self.use_backup {
+                            theme::badge(ui, "已指定", theme::WARN);
+                        }
+                    });
 
-                    // 进度条就放在按钮下面
+                    // 没测过速就把内置镜像先列出来，照样能选
+                    let rows: Vec<(String, String, String)> = if self.speed_results.is_empty() {
+                        update::MIRRORS
+                            .iter()
+                            .map(|m| ((*m).to_owned(), update::source_label(m), "未测速".to_owned()))
+                            .collect()
+                    } else {
+                        self.speed_results
+                            .iter()
+                            .filter(|s| !s.prefix.is_empty())
+                            .map(|s| {
+                                (
+                                    s.prefix.clone(),
+                                    s.label.clone(),
+                                    match &s.error {
+                                        Some(_) => "不可用".to_owned(),
+                                        None => format!("{} KB/s", s.kbps),
+                                    },
+                                )
+                            })
+                            .collect()
+                    };
+                    let current = if self.use_backup {
+                        self.backup_prefix.trim().to_owned()
+                    } else {
+                        String::new()
+                    };
+                    let mut choice = current.clone();
+                    ui.horizontal_wrapped(|ui| {
+                        ui.selectable_value(&mut choice, String::new(), "自动");
+                        for (prefix, label, speed) in &rows {
+                            ui.selectable_value(
+                                &mut choice,
+                                prefix.clone(),
+                                format!("{label}  {speed}"),
+                            );
+                        }
+                    });
+                    if choice != current {
+                        self.use_backup = !choice.is_empty();
+                        if !choice.is_empty() {
+                            self.backup_prefix = choice.clone();
+                        }
+                        self.save_config();
+                        self.status = if choice.is_empty() {
+                            "已改为自动选源（按实测速率挑最快的）".to_owned()
+                        } else {
+                            format!("已选中下载源 {}", update::source_label(&choice))
+                        };
+                    }
+                    // 官方源单独列出来：让用户看见为什么默认不用它
+                    for s in &self.speed_results {
+                        if !s.prefix.is_empty() {
+                            continue;
+                        }
+                        let txt = match &s.error {
+                            Some(e) => format!("{}：不可用（{e}）", s.label),
+                            None => format!("{}：{} KB/s", s.label, s.kbps),
+                        };
+                        ui.label(theme::hint(txt));
+                    }
+                    ui.label(theme::hint(
+                        "选中的源排最前面，其余镜像仍会兜底；下载中低于阈值会自动换源。",
+                    ));
+                    ui.collapsing("填自己的源地址（高级）", |ui| {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.backup_prefix)
+                                .desired_width(260.0)
+                                .hint_text("https://xxx/"),
+                        );
+                        if theme::ghost_button(ui, "用这个源", true).clicked() {
+                            self.use_backup = !self.backup_prefix.trim().is_empty();
+                            self.save_config();
+                            self.status = "下载源已保存".to_owned();
+                        }
+                        ui.label(theme::hint(
+                            "前缀会拼在官方地址前面。填错也没关系，内容对不上会被自动拒绝。",
+                        ));
+                    });
+
+                    // 进度条就放在按钮下面，速度/剩余时间单独一行
                     if let Some((text, f)) = self.progress.clone() {
                         ui.add(egui::ProgressBar::new(f).text(text));
+                        if let (Some(t0), true) = (self.dl_started, self.dl_total > 0) {
+                            let el = t0.elapsed().as_secs_f64();
+                            if el >= 1.5 && self.dl_done > 0 {
+                                let bps = self.dl_done as f64 / el;
+                                let left = self.dl_total.saturating_sub(self.dl_done) as f64;
+                                let eta = if bps > 1.0 { left / bps } else { 0.0 };
+                                let eta_txt = if eta < 60.0 {
+                                    format!("{eta:.0} 秒")
+                                } else {
+                                    format!("{:.0} 分 {:.0} 秒", (eta / 60.0).floor(), eta % 60.0)
+                                };
+                                ui.label(theme::hint(format!(
+                                    "{} / {} · {:.2} MB/s · 剩余约 {}",
+                                    util::format_bytes(self.dl_done),
+                                    util::format_bytes(self.dl_total),
+                                    bps / 1024.0 / 1024.0,
+                                    eta_txt
+                                )));
+                            }
+                        }
                     }
 
                     // 下载失败 -> 一键改用备用源重试（内置地址，不用用户填）

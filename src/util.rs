@@ -120,7 +120,7 @@ fn do_migrate_backups() -> Option<String> {
 const CONFIG_NAME: &str = "framegen-manager.json";
 
 /// 应用配置。默认放在 exe 同级（便携，解压即用）；exe 同级不可写时回退 %APPDATA%。
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
     /// 用户自定义的资产目录。None 表示用默认位置。
     #[serde(default)]
@@ -128,9 +128,29 @@ pub struct AppConfig {
     /// 用户是否已同意改用备用下载源
     #[serde(default)]
     pub allow_backup_source: bool,
-    /// 备用下载源前缀，会拼在官方地址前面。留空表示用内置镜像列表。
+    /// 用户选定的下载源前缀。留空 = 自动（按实测速率挑最快的那个）。
     #[serde(default)]
     pub backup_prefix: String,
+    /// 低于这个速率（KB/s）就换源。0 = 关掉看门狗。
+    #[serde(default = "default_min_speed")]
+    pub min_speed_kbps: u32,
+}
+
+fn default_min_speed() -> u32 {
+    crate::update::DEFAULT_MIN_SPEED_KBPS as u32
+}
+
+/// Default 要手写：配置文件不存在时 load_config 会回退到 Default，
+/// 而 u32 的 Default 是 0 —— 那等于默认把看门狗关了，正好是这个功能要修的毛病。
+impl Default for AppConfig {
+    fn default() -> Self {
+        Self {
+            asset_dir: None,
+            allow_backup_source: false,
+            backup_prefix: String::new(),
+            min_speed_kbps: default_min_speed(),
+        }
+    }
 }
 
 pub fn exe_dir() -> Option<PathBuf> {
