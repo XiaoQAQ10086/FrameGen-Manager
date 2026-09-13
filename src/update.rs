@@ -111,6 +111,14 @@ pub fn client() -> Result<reqwest::blocking::Client> {
         .context("创建 HTTP 客户端失败")
 }
 
+/// 取消下载时的固定文案。上层靠它区分「用户点了取消」和「真的下载失败」——
+/// 否则取消会被一路当成失败，最后弹出一句「官方源下载失败」误导用户。
+pub const CANCELLED_MSG: &str = "已取消下载";
+
+fn cancelled(cancel: Option<&AtomicBool>) -> bool {
+    cancel.map(|c| c.load(Ordering::Relaxed)).unwrap_or(false)
+}
+
 /// 记住每个「主机 + 用途」上一次哪个候选成功，下次从它开始试。
 ///
 /// 下标 = 主机 * 2 + 用途（0 探测 / 1 下载）：
@@ -143,6 +151,7 @@ fn try_sources<T>(
     official: &str,
     mirrors: &[String],
     download: bool,
+    cancel: Option<&AtomicBool>,
     mut attempt: impl FnMut(&str) -> Result<T>,
 ) -> Result<T> {
     let mut urls: Vec<(String, &'static str)> = Vec::with_capacity(mirrors.len() + 1);
@@ -162,16 +171,100 @@ fn try_sources<T>(
     let start = slot.load(Ordering::Relaxed).min(urls.len() - 1);
     let mut errs: Vec<String> = Vec::new();
     for k in 0..urls.len() {
+        // 用户点了取消就立刻停，不要再去试下一个源 ——
+        // 否则会一路试完所有镜像才报错，看起来像「所有源都坏了」。
+        if cancelled(cancel) {
+            bail!("{}", CANCELLED_MSG);
+        }
         let i = (start + k) % urls.len();
         match attempt(&urls[i].0) {
             Ok(v) => {
                 slot.store(i, Ordering::Relaxed);
                 return Ok(v);
             }
-            Err(e) => errs.push(format!("{}：{e}", urls[i].1)),
+            Err(e) => {
+                if cancelled(cancel) {
+                    bail!("{}", CANCELLED_MSG);
+                }
+                errs.push(format!("{}：{e}", urls[i].1));
+            }
         }
     }
     bail!("{}", errs.join("；"))
+}
+
+// ---------------------------------------------------------------- 软件自身更新
+
+/// 我们自己的仓库。用来检查「FrameGen Manager 本身」有没有新版本 ——
+/// 注意这和上游 Mod 的更新检查是两回事。
+pub const SELF_REPO: &str = "XiaoQAQ10086/FrameGen-Manager";
+
+/// 当前版本，编译时从 Cargo.toml 取。
+pub const SELF_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// 发版页面。有新版本时点按钮跳这里。
+pub const RELEASES_URL: &str = "https://github.com/XiaoQAQ10086/FrameGen-Manager/releases";
+
+/// 读我们自己仓库 main 分支上的 Cargo.toml，取 version 字段。
+///
+/// **为什么不查 Releases 接口**：
+///   * api.github.com 未登录按 IP 限 60 次/小时 —— 正是这个项目一直在躲的东西；
+///   * gh-proxy 这类镜像**只代理资源文件、拒绝代理网页**（实测直接回
+///     "Web page content is not allowed"），所以 releases 页面和 releases.atom 都抓不到；
+///   * 而 raw 上的 Cargo.toml 只有 2KB，官方源和镜像都拿得到，且不占配额。
+///
+/// 前提：发布流程是「改版本号 -> 提交 -> 打标签 -> 发 Release」一条龙，
+/// 所以 main 上的版本号等于最新已发布版本。改流程的话这里要跟着改。
+pub fn fetch_latest_self_version(client: &reqwest::blocking::Client) -> Option<String> {
+    let official = format!("https://raw.githubusercontent.com/{SELF_REPO}/main/Cargo.toml");
+    let ms = mirrors("");
+    let text = try_sources(&official, &ms, false, None, |url| {
+        let resp = client
+            .get(url)
+            .timeout(Duration::from_secs(8))
+            .send()
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        if !resp.status().is_success() {
+            bail!("HTTP {}", resp.status().as_u16());
+        }
+        resp.text().map_err(|e| anyhow::anyhow!("{e}"))
+    })
+    .ok()?;
+
+    // 只要 [package] 段里的 version。依赖那行的键名不是单独的 version
+    // （形如 eframe = { version = ... }），所以按「键名等于 version」匹配够准。
+    for line in text.lines() {
+        let t = line.trim();
+        let Some((k, v)) = t.split_once('=') else {
+            continue;
+        };
+        if k.trim() != "version" {
+            continue;
+        }
+        let v = v.trim().trim_matches('"').trim().to_owned();
+        if !v.is_empty() {
+            return Some(v);
+        }
+    }
+    None
+}
+
+/// 把 "0.2.0" / "v0.2.0" 拆成三段数字。解析不了返回 None（宁可不提示，也别误报）。
+pub fn parse_version(s: &str) -> Option<(u64, u64, u64)> {
+    let t = s.trim().trim_start_matches('v');
+    let mut it = t.split('.');
+    let a = it.next()?.parse().ok()?;
+    let b = it.next().unwrap_or("0").parse().ok()?;
+    let c = it.next().unwrap_or("0").parse().ok()?;
+    Some((a, b, c))
+}
+
+/// remote 是不是比 local 新
+pub fn is_newer(remote: &str, local: &str) -> bool {
+    match (parse_version(remote), parse_version(local)) {
+        (Some(r), Some(l)) => r > l,
+        _ => false,
+    }
 }
 
 /// 取响应头里的 ETag，并确认它看起来就是内容的 SHA-256。
@@ -203,7 +296,7 @@ fn content_length_of(resp: &reqwest::blocking::Response) -> u64 {
 pub fn probe_remote(client: &reqwest::blocking::Client, repo_path: &str) -> Result<RemoteFile> {
     let official = official_url(repo_path);
     let ms = mirrors("");
-    try_sources(&official, &ms, false, |url| {
+    try_sources(&official, &ms, false, None, |url| {
         let resp = client
             .head(url)
             // 单个 HEAD 只有 1KB 不到，6 秒足够。raw 现在会间歇性卡十几秒，
@@ -249,7 +342,7 @@ pub fn fetch_version(client: &reqwest::blocking::Client) -> Option<String> {
     let ms = mirrors("");
     // 这里也要能换源 + 限时：raw 卡十几秒会把整个「检查更新」拖住，
     // 而它只是用来在界面上显示一个版本号而已。
-    let fetched = try_sources(&official, &ms, false, |url| {
+    let fetched = try_sources(&official, &ms, false, None, |url| {
         let resp = client
             .get(url)
             .timeout(Duration::from_secs(10))
@@ -365,7 +458,7 @@ pub fn download_auto(
 ) -> Result<Downloaded> {
     let official = official_url(repo_path);
     let ms = mirrors(custom_prefix);
-    try_sources(&official, &ms, prefer_mirror, |url| {
+    try_sources(&official, &ms, prefer_mirror, Some(cancel), |url| {
         let dl = download(client, repo_path, dest, url, expect_etag, cancel, progress)?;
         verify(dest)?;
         Ok(dl)
@@ -771,7 +864,7 @@ pub fn probe_url(client: &reqwest::blocking::Client, url: &str) -> Option<(u64, 
     // 给界面显示，没有「指纹必须来自 GitHub」的要求（zip 解压后靠 NVIDIA 签名校验），
     // 所以直接走镜像优先。
     let ms = mirrors("");
-    try_sources(url, &ms, true, |u| {
+    try_sources(url, &ms, true, None, |u| {
         let r = client
             .head(u)
             .timeout(Duration::from_secs(6))
@@ -795,7 +888,7 @@ fn download_with_mirror(
     progress: &mut dyn FnMut(u64, u64),
 ) -> Result<u64> {
     let ms = mirrors("");
-    try_sources(official, &ms, true, |url| {
+    try_sources(official, &ms, true, Some(cancel), |url| {
         progress(0, 0);
         download_raw(client, url, dest, cancel, progress)
     })
@@ -907,67 +1000,152 @@ pub fn zip_extract_dll(zip_path: &Path, out_path: &Path) -> Result<String> {
     Ok(name)
 }
 
-/// 确保两个 DLSS 运行库都在本地：缺就下载 -> 解压 -> 删掉压缩包 -> 校验 NVIDIA 签名。
-/// 返回两个 DLL 的本地路径。
+/// 一个待下载的 DLSS 运行库。界面算「总进度」要用到它的 size。
+#[derive(Debug, Clone)]
+pub struct RuntimeStep {
+    pub prefix: &'static str,
+    pub tag: &'static str,
+    pub zip_name: &'static str,
+    pub dll_name: &'static str,
+    pub label: &'static str,
+    pub url: String,
+    pub size: u64,
+}
+
+/// 进度条用的上下文。字节数决定进度条走多远，步数只用来写「第 n/N 步」。
+#[derive(Debug, Clone, Copy)]
+pub struct ProgressCtx {
+    pub base_bytes: u64,
+    pub total_bytes: u64,
+    pub base_step: usize,
+    pub total_steps: usize,
+}
+
+/// 列出**还需要下载**的 DLSS 运行库：本地已有且是 NVIDIA 签名的不列进来。
+/// size 是 HEAD 问来的（失败就是 0，只影响进度条的分母）。
+pub fn dlss_runtime_plan(client: &reqwest::blocking::Client) -> Vec<RuntimeStep> {
+    let mut out = Vec::new();
+    for (prefix, tag, zip_name, dll_name, label) in DLSS_RUNTIME {
+        let have = asset_path(dll_name)
+            .map(|p| p.is_file() && scan::identify_dll(&p) == scan::FileIdentity::Nvidia)
+            .unwrap_or(false);
+        if have {
+            continue;
+        }
+        let url = release_url(tag, zip_name);
+        let size = probe_url(client, &url).map(|(n, _)| n).unwrap_or(0);
+        out.push(RuntimeStep {
+            prefix,
+            tag,
+            zip_name,
+            dll_name,
+            label,
+            url,
+            size,
+        });
+    }
+    out
+}
+
+/// 把 plan 里的运行库逐个下下来：下载 -> 解压 -> 删掉压缩包 -> 校验 NVIDIA 签名。
+/// 返回全部 DLL 的本地路径（包括本来就有的）。
+///
+/// 进度按**全局字节**报：ctx.base_bytes 是这批之前已经下好的字节数。
+/// 这样界面上的进度条是「总进度」，不会每换一个文件就回零。
 pub fn ensure_dlss_runtime(
     client: &reqwest::blocking::Client,
     cancel: &AtomicBool,
+    plan: &[RuntimeStep],
+    ctx: ProgressCtx,
     mut progress: impl FnMut(String, f32),
 ) -> Result<Vec<PathBuf>> {
     let dir = util::assets_dir()?;
     let mut out = Vec::new();
 
-    for (prefix, tag, zip_name, dll_name, label) in DLSS_RUNTIME {
-        let dest = dir.join(dll_name);
-
-        if dest.is_file() && scan::identify_dll(&dest) == scan::FileIdentity::Nvidia {
-            progress(format!("{label} 已就绪，跳过下载"), 1.0);
-            out.push(dest);
-            continue;
+    // 已经在本地的也一起返回，只是它们不在 plan 里（不用再下）
+    for (_p, _t, _z, dll_name, _l) in DLSS_RUNTIME {
+        let p = dir.join(dll_name);
+        if p.is_file() && scan::identify_dll(&p) == scan::FileIdentity::Nvidia {
+            out.push(p);
         }
+    }
 
-        // 直链下载：这一步不消耗任何 GitHub API 配额
-        let official = release_url(tag, zip_name);
+    let frac = |done: u64| -> f32 {
+        if ctx.total_bytes > 0 {
+            (done as f64 / ctx.total_bytes as f64).min(1.0) as f32
+        } else {
+            0.0
+        }
+    };
+
+    let mut done = ctx.base_bytes;
+    for (i, step) in plan.iter().enumerate() {
+        if cancelled(Some(cancel)) {
+            bail!("{}", CANCELLED_MSG);
+        }
+        let (prefix, tag, zip_name, dll_name, label) =
+            (step.prefix, step.tag, step.zip_name, step.dll_name, step.label);
+        let step_no = ctx.base_step + i + 1;
+        let dest = dir.join(dll_name);
         let zip_path = dir.join(zip_name);
-        progress(format!("下载 {label}..."), 0.0);
+        progress(
+            format!("第 {step_no}/{} 步 · 下载 {label}...", ctx.total_steps),
+            frac(done),
+        );
 
+        let got_bytes: u64;
         let direct = {
-            let mut relay = |got: u64, total: u64| {
-                let f = if total > 0 { got as f32 / total as f32 } else { 0.0 };
+            let mut relay = |got: u64, len: u64| {
+                let t = if len > 0 { len } else { step.size };
                 progress(
                     format!(
-                        "下载 {label} {} / {}",
-                        util::format_bytes(got),
-                        util::format_bytes(total)
-                    ),
-                    f,
-                );
-            };
-            download_with_mirror(client, &official, &zip_path, cancel, &mut relay)
-        };
-
-        if let Err(e) = direct {
-            // 直链彻底失败才回退去问 releases API：作者删包 / 改名时会走到这里
-            let asset = find_release_zip(client, DLSS_REPO, prefix, tag).map_err(|e2| {
-                anyhow::anyhow!("直链下载失败（{e}）；改用 Releases 接口也没成功：{e2}")
-            })?;
-            progress(format!("{label} 改用 Releases 接口重试"), 0.0);
-            let mut relay = |got: u64, total: u64| {
-                let t = if total > 0 { total } else { asset.size };
-                let f = if t > 0 { got as f32 / t as f32 } else { 0.0 };
-                progress(
-                    format!(
-                        "下载 {label} {} / {}",
+                        "第 {step_no}/{} 步 · 下载 {label} {} / {}",
+                        ctx.total_steps,
                         util::format_bytes(got),
                         util::format_bytes(t)
                     ),
-                    f,
+                    frac(done + got),
                 );
             };
-            download_with_mirror(client, &asset.url, &zip_path, cancel, &mut relay)?;
-        }
+            download_with_mirror(client, &step.url, &zip_path, cancel, &mut relay)
+        };
 
-        progress(format!("解压 {label} ..."), 1.0);
+        match direct {
+            Ok(n) => got_bytes = n,
+            Err(e) => {
+                // 直链彻底失败才回退去问 releases API：作者删包 / 改名时会走到这里
+                let asset = find_release_zip(client, DLSS_REPO, prefix, tag).map_err(|e2| {
+                    anyhow::anyhow!("直链下载失败（{e}）；改用 Releases 接口也没成功：{e2}")
+                })?;
+                progress(
+                    format!(
+                        "第 {step_no}/{} 步 · {label} 改用 Releases 接口重试",
+                        ctx.total_steps
+                    ),
+                    frac(done),
+                );
+                let mut relay = |got: u64, len: u64| {
+                    let t = if len > 0 { len } else { asset.size };
+                    progress(
+                        format!(
+                            "第 {step_no}/{} 步 · 下载 {label} {} / {}",
+                            ctx.total_steps,
+                            util::format_bytes(got),
+                            util::format_bytes(t)
+                        ),
+                        frac(done + got),
+                    );
+                };
+                got_bytes =
+                    download_with_mirror(client, &asset.url, &zip_path, cancel, &mut relay)?;
+            }
+        }
+        done += got_bytes;
+
+        progress(
+            format!("第 {step_no}/{} 步 · 解压 {label} ...", ctx.total_steps),
+            frac(done),
+        );
         let extracted = zip_extract_dll(&zip_path, &dest)?;
         // 按用户要求：解压完就删掉压缩包
         let _ = std::fs::remove_file(&zip_path);
@@ -983,10 +1161,11 @@ pub fn ensure_dlss_runtime(
         let size = std::fs::metadata(&dest).map(|m| m.len()).unwrap_or(0);
         progress(
             format!(
-                "{label} 就绪（已校验 NVIDIA 签名，{}）",
+                "第 {step_no}/{} 步 · {label} 就绪（已校验 NVIDIA 签名，{}）",
+                ctx.total_steps,
                 util::format_bytes(size)
             ),
-            1.0,
+            frac(done),
         );
         out.push(dest);
     }

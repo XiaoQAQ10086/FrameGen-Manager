@@ -1,4 +1,4 @@
-; FrameGen Manager - Inno Setup 6 打包脚本
+﻿; FrameGen Manager - Inno Setup 6 打包脚本
 ; 编译： iscc packaging\installer.iss
 ;
 ; 设计要点：
@@ -12,7 +12,7 @@
 #define AppName "FrameGen Manager"
 ; 版本号可由打包脚本传入：iscc /DAppVersion=1.2.3 installer.iss
 #ifndef AppVersion
-#define AppVersion "0.2.0"
+#define AppVersion "0.3.0"
 #endif
 #define AppExeName "framegen-manager.exe"
 

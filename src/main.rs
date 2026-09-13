@@ -31,6 +31,12 @@ fn main() -> eframe::Result<()> {
         return Ok(());
     }
 
+    // 软件自身版本检查自测：cargo run -- --selfupdate
+    if std::env::args().any(|a| a == "--selfupdate") {
+        selfupdatetest();
+        return Ok(());
+    }
+
     // 下载测速：走生产路径（镜像优先 + 官方指纹校验）拉一遍 version.dll
     if std::env::args().any(|a| a == "--speedtest") {
         speedtest();
@@ -149,10 +155,16 @@ fn main() -> eframe::Result<()> {
             }
         }
         let cancel = AtomicBool::new(false);
-        match update::ensure_dlss_runtime(&c, &cancel, |msg, f| {
-            if f >= 0.999 {
-                println!("  {msg}");
-            }
+        let plan = update::dlss_runtime_plan(&c);
+        let total: u64 = plan.iter().map(|s| s.size).sum();
+        let ctx = update::ProgressCtx {
+            base_bytes: 0,
+            total_bytes: total,
+            base_step: 0,
+            total_steps: plan.len(),
+        };
+        match update::ensure_dlss_runtime(&c, &cancel, &plan, ctx, |msg, _f| {
+            println!("  {msg}");
         }) {
             Ok(paths) => {
                 for p in &paths {
@@ -395,6 +407,45 @@ fn write_result(out: &str, r: anyhow::Result<String>) {
     }
 }
 
+/// 软件自身版本检查自测。这一套是「FrameGen Manager 自己有没有新版本」，
+/// 和上游 Mod 的更新检查是两回事。
+fn selfupdatetest() {
+    println!("===== 软件自身更新检查 =====");
+    println!("  本地版本 = {}", update::SELF_VERSION);
+    println!("  仓库     = {}", update::SELF_REPO);
+    println!("  发布页   = {}", update::RELEASES_URL);
+
+    println!("  版本比较：");
+    let cases: [(&str, &str, bool); 6] = [
+        ("0.3.0", "0.2.0", true),
+        ("v0.3.0", "0.2.0", true),
+        ("0.2.0", "0.2.0", false),
+        ("0.1.9", "0.2.0", false),
+        ("0.2.10", "0.2.9", true),
+        // 解析不出来的绝不能当成「有新版本」，否则会误报
+        ("abc", "0.2.0", false),
+    ];
+    for (remote, local, want) in cases {
+        let got = update::is_newer(remote, local);
+        println!(
+            "    [{}] is_newer({remote}, {local}) = {got}",
+            if got == want { "PASS" } else { "FAIL" }
+        );
+    }
+
+    println!("  实际查询：");
+    match update::client().ok().and_then(|c| update::fetch_latest_self_version(&c)) {
+        Some(v) => {
+            println!("    远端版本 = {v}");
+            println!(
+                "    需要更新 = {}",
+                update::is_newer(&v, update::SELF_VERSION)
+            );
+        }
+        None => println!("    [FAIL] 取远端版本失败（网络问题）"),
+    }
+}
+
 /// 下载测速。走的就是界面上「下载 / 更新资产」那条路径，
 /// 所以测出来的数就是用户实际会遇到的数。
 fn speedtest() {
@@ -466,7 +517,8 @@ fn speedtest() {
             match &dl.etag {
                 Some(e) => println!("  ETag 比对：通过（响应 ETag = {e}）"),
                 None => println!(
-                    "  ETag 比对：该源不转发 ETag，跳过 —— 已由签名校验兜住（这正是                      download_auto 里 prefer_mirror=true 时必须配 verify 的原因）"
+                    "  ETag 比对：这次是从镜像拿的，镜像不转发 ETag，跳过 —— \
+                     已由签名校验兜住（这正是 download_auto 里 prefer_mirror=true 时必须配 verify 的原因）"
                 ),
             }
             println!("  保存于 {}", dest.display());
@@ -701,28 +753,37 @@ fn canceltest() {
     let part = dest.with_file_name("cancel-test.ini.part");
     let _ = std::fs::remove_file(&part);
 
-    // 一开始就把取消标志置上，下载循环应当在第一次读取前就退出
+    // 一开始就把取消标志置上，下载循环应当在第一次读取前就退出。
+    // 走 download_auto 是为了连「多源回退」一起验：取消绝不能被当成
+    // 「官方源失败 -> 试备用源」，那样会一路试完所有镜像才报错。
     let cancel = AtomicBool::new(true);
-    let url = update::official_url(update::INI_REPO_PATH);
-    let r = update::download(
+    let r = update::download_auto(
         &c,
         update::INI_REPO_PATH,
         &dest,
-        &url,
         Some(&remote.etag),
         &cancel,
+        "",
+        false,
+        &|_p| Ok(()),
         &mut |_, _| {},
     );
 
-    println!(
-        "  下载结果: {}",
-        match &r {
-            Ok(_) => "意外成功了".to_owned(),
-            Err(e) => format!("如期失败 -> {e}"),
-        }
-    );
+    let msg = match &r {
+        Ok(_) => "意外成功了".to_owned(),
+        Err(e) => format!("{e}"),
+    };
+    println!("  下载结果: {msg}");
     println!("  [{}] 目标文件未被创建", if dest.exists() { "FAIL" } else { "PASS" });
     println!("  [{}] 没有 .part 残留", if part.exists() { "FAIL" } else { "PASS" });
+    println!(
+        "  [{}] 取消被识别为「已取消」而不是下载失败",
+        if msg.contains(update::CANCELLED_MSG) { "PASS" } else { "FAIL" }
+    );
+    println!(
+        "  [{}] 没有继续去试后面的镜像",
+        if msg.contains("备用源") { "FAIL" } else { "PASS" }
+    );
 
     // 手工造一个残留，验证清理函数能扫到
     let _ = std::fs::write(&part, b"leftover");
@@ -786,17 +847,27 @@ fn downloadtest() {
         Ok(dl) => {
             let data = std::fs::read(&dest).unwrap_or_default();
             let blob = util::git_blob_sha1(&data);
-            let ok = dl
-                .etag
-                .as_deref()
-                .map(|e| e.eq_ignore_ascii_case(&remote.etag))
-                .unwrap_or(false);
+            // 字节数是两条路径都拿得到的一致性信号，先看这个
             println!(
-                "  [{}] 响应 ETag = {}（HEAD 拿到 {}）",
-                if ok { "PASS" } else { "FAIL" },
-                dl.etag.clone().unwrap_or_else(|| "(无)".to_owned()),
-                remote.etag
+                "  [{}] 响应字节数 = {}（HEAD 拿到 {}）",
+                if dl.bytes == remote.size { "PASS" } else { "FAIL" },
+                dl.bytes,
+                remote.size
             );
+            // ETag 只有官方源给。官方 raw 抽风时会自动回退到镜像，镜像不转发 ETag，
+            // 这时候「没得比」和「比出来不一样」是两码事，不能都算 FAIL。
+            match dl.etag.as_deref().map(|e| e.eq_ignore_ascii_case(&remote.etag)) {
+                Some(true) => println!("  [PASS] 响应 ETag 和 HEAD 一致"),
+                Some(false) => println!(
+                    "  [FAIL] 响应 ETag = {} 和 HEAD 拿到的 {} 不一致，内容可能不是同一个版本",
+                    dl.etag.as_deref().unwrap_or(""),
+                    remote.etag
+                ),
+                None => println!(
+                    "  [INFO] 这次是从加速镜像拿到的，镜像不转发 ETag，没得比 —— \
+                     正式路径上 ini 靠字节数 + 本机记录，DLL 靠本项目签名兜底"
+                ),
+            }
             println!("  本地内容 sha256 = {}", dl.sha256);
             println!("  内容 blob sha = {blob}");
 
@@ -1178,6 +1249,10 @@ enum Msg {
     DownloadFailed(String),
     /// 提权子进程改完 / 还原完显卡名了
     GpuOpDone(Result<String, String>),
+    /// 用户点了取消下载。这不是失败，不该弹「改用备用源重试」。
+    Cancelled,
+    /// 软件自身的版本检查回来了。None 表示没查到（网络问题）。
+    SelfVersionChecked(Option<String>),
 }
 
 struct App {
@@ -1219,6 +1294,10 @@ struct App {
     adapters: Vec<gpu::GpuAdapter>,
 
     // ---- 显卡名称伪装
+    /// 启动时自动检查「本软件」有没有新版本（界面上可关，存配置里）
+    auto_check: bool,
+    /// 查到的新版本号。Some 时右上角会出现下载入口。
+    new_version: Option<String>,
     spoof_open: bool,
     spoof_target: String,
     spoof_ack: bool,
@@ -1300,6 +1379,8 @@ impl App {
             driver,
             adapters,
             // 调试开关：为截图/排查用，正常启动是收起的
+            auto_check: cfg.auto_check,
+            new_version: None,
             spoof_open: std::env::var_os("DLSSG_SPOOF_OPEN").is_some(),
             // 默认指向 5060：既是最常见的目标，也和社区流传的做法一致
             spoof_target: gpu::PRESETS.last().copied().unwrap_or_default().to_owned(),
@@ -1471,6 +1552,45 @@ impl App {
                     }
                 }
             }
+            Msg::SelfVersionChecked(latest) => {
+                match latest {
+                    Some(v) if update::is_newer(&v, update::SELF_VERSION) => {
+                        let m = format!(
+                            "发现新版本 {v}（当前 {}），点右上角去发布页下载",
+                            update::SELF_VERSION
+                        );
+                        self.logs.push(m.clone());
+                        self.status = m;
+                        self.new_version = Some(v);
+                    }
+                    Some(v) => {
+                        self.logs.push(format!(
+                            "已是最新版本（本地 {}，远端 {v}）",
+                            update::SELF_VERSION
+                        ));
+                    }
+                    None => {
+                        self.logs
+                            .push("检查软件新版本失败（网络问题），不影响使用".to_owned());
+                    }
+                }
+            }
+            Msg::Cancelled => {
+                // 取消不是失败：清一遍残留（正常都已在下载循环里删干净了），
+                // 也别去碰 download_failed，否则会弹出「改用备用源重试」误导用户。
+                let n = update::clean_stale_partials();
+                let m = if n > 0 {
+                    format!("已取消下载（清理了 {n} 个未完成的临时文件）")
+                } else {
+                    "已取消下载（未留下任何残留）".to_owned()
+                };
+                self.logs.push(m.clone());
+                self.status = m;
+                self.busy = false;
+                self.progress = None;
+                self.cancel = None;
+                self.download_failed = false;
+            }
         }
     }
 
@@ -1479,6 +1599,7 @@ impl App {
             asset_dir: util::load_config().asset_dir,
             allow_backup_source: self.use_backup,
             backup_prefix: self.backup_prefix.clone(),
+            auto_check: self.auto_check,
         };
         if let Err(e) = util::save_config(&cfg) {
             self.logs.push(format!("保存配置失败: {e}"));
@@ -1496,6 +1617,7 @@ impl App {
         cfg.asset_dir = Some(dir.clone());
         cfg.allow_backup_source = self.use_backup;
         cfg.backup_prefix = self.backup_prefix.clone();
+        cfg.auto_check = self.auto_check;
         if let Err(e) = util::save_config(&cfg) {
             self.status = format!("保存配置失败: {e}");
             return;
@@ -1646,10 +1768,25 @@ impl App {
             let res = (|| -> anyhow::Result<String> {
                 let c = update::client()?;
                 let mut state = update::load_state();
+
+                // 先把要下的东西全部探明、算出总字节数，进度条才能按「总进度」走。
+                // 否则每换一个文件进度条就回零，看起来像卡住了。
+                let _ = tx.send(Msg::Progress("正在获取文件信息...".to_owned(), 0.0));
+                ctx.request_repaint();
+
+                struct Item {
+                    path: String,
+                    local: String,
+                    dest: PathBuf,
+                    etag: String,
+                    size: u64,
+                }
+
                 let specs = [
                     update::proxy_repo_path(&proxy).to_owned(),
                     update::INI_REPO_PATH.to_owned(),
                 ];
+                let mut items: Vec<Item> = Vec::new();
                 let mut skipped = 0usize;
                 for path in specs {
                     // HEAD 拿期望的内容 SHA-256（不占 API 配额，官方源和镜像都会给）
@@ -1660,24 +1797,47 @@ impl App {
                     // 已经是最新版就不重下 —— 15 MB 的代理 DLL 没必要每次都拉一遍。
                     // 判定要求「记录在 + 指纹一致 + 文件真的在且大小对」，缺一不可。
                     if update::local_is_current(&state, &local, &dest, &remote.etag) {
-                        let _ = tx.send(Msg::Progress(
-                            format!("{local} 已是最新版，跳过下载"),
-                            1.0,
-                        ));
-                        ctx.request_repaint();
                         skipped += 1;
                         continue;
                     }
+                    let _ = tx.send(Msg::Progress(
+                        format!(
+                            "已获取 {local} 信息（{}）",
+                            util::format_bytes(remote.size)
+                        ),
+                        0.0,
+                    ));
+                    ctx.request_repaint();
+                    items.push(Item {
+                        path,
+                        local,
+                        dest,
+                        etag: remote.etag,
+                        size: remote.size,
+                    });
+                }
 
+                // 运行库那边还要下多少也先问清楚，总字节数才算得准
+                let plan = update::dlss_runtime_plan(&c);
+                let total: u64 = items.iter().map(|i| i.size).sum::<u64>()
+                    + plan.iter().map(|s| s.size).sum::<u64>();
+                let steps = items.len() + plan.len();
+                let mod_steps = items.len();
+                let mut done: u64 = 0;
+
+                for (n, it) in items.into_iter().enumerate() {
                     let tx2 = tx.clone();
                     let ctx2 = ctx.clone();
-                    let label = local.clone();
+                    let label = it.local.clone();
+                    let step_text = format!("第 {}/{} 步 ·", n + 1, steps);
+                    let base = done;
+                    let expect = it.size;
 
                     // 代理 DLL 走镜像优先（快几十倍），但 gh-proxy.com 不转发 ETag，
                     // ETag 比对会落空 —— 所以必须再加一道签名校验：这 5 个 DLL 都由
                     // DLSSG Native Project 自签，镜像伪造不出来。
                     // ini 只有 581 字节，走官方优先：官方会返回 ETag，比对能真正生效。
-                    let is_dll = path.to_ascii_lowercase().ends_with(".dll");
+                    let is_dll = it.path.to_ascii_lowercase().ends_with(".dll");
                     let verifier = move |p: &Path| -> anyhow::Result<()> {
                         if !is_dll {
                             return Ok(());
@@ -1694,25 +1854,27 @@ impl App {
 
                     let dl = update::download_auto(
                         &c,
-                        &path,
-                        &dest,
-                        Some(&remote.etag),
+                        &it.path,
+                        &it.dest,
+                        Some(&it.etag),
                         &cancel,
                         &prefix,
                         is_dll,
                         &verifier,
-                        &mut move |got, total| {
+                        &mut move |got, len| {
+                            let denom = if len > 0 { len } else { expect };
+                            // 进度按「总字节」算，不是当前这个文件的百分比 ——
+                            // 否则每换一个文件进度条就回零。
                             let f = if total > 0 {
-                                got as f32 / total as f32
+                                ((base + got) as f64 / total as f64).min(1.0) as f32
                             } else {
                                 0.0
                             };
                             let _ = tx2.send(Msg::Progress(
                                 format!(
-                                    "下载 {} {} / {}",
-                                    label,
+                                    "{step_text} 下载 {label} {} / {}",
                                     util::format_bytes(got),
-                                    util::format_bytes(total)
+                                    util::format_bytes(denom)
                                 ),
                                 f,
                             ));
@@ -1720,11 +1882,12 @@ impl App {
                         },
                     )?;
 
+                    done += dl.bytes;
                     state.files.insert(
-                        local,
+                        it.local,
                         update::LocalFile {
                             blob_sha: dl.blob_sha,
-                            etag: remote.etag.clone(),
+                            etag: it.etag.clone(),
                             sha256: dl.sha256,
                             bytes: dl.bytes,
                             downloaded_at: util::now_utc(),
@@ -1738,7 +1901,13 @@ impl App {
                 {
                     let tx2 = tx.clone();
                     let ctx2 = ctx.clone();
-                    update::ensure_dlss_runtime(&c, &cancel, move |msg, f| {
+                    let ctx = update::ProgressCtx {
+                        base_bytes: done,
+                        total_bytes: total,
+                        base_step: mod_steps,
+                        total_steps: steps,
+                    };
+                    update::ensure_dlss_runtime(&c, &cancel, &plan, ctx, move |msg, f| {
                         let _ = tx2.send(Msg::Progress(msg, f));
                         ctx2.request_repaint();
                     })?;
@@ -1755,8 +1924,34 @@ impl App {
             })();
             let _ = tx.send(match res {
                 Ok(m) => Msg::Done(m),
-                Err(e) => Msg::DownloadFailed(e.to_string()),
+                Err(e) => {
+                    // 用户点了取消时，错误信息会是 CANCELLED_MSG（也可能是取消标志已置位），
+                    // 这不算失败，单独报「已取消」。
+                    if cancel.load(Ordering::Relaxed)
+                        || e.to_string().contains(update::CANCELLED_MSG)
+                    {
+                        Msg::Cancelled
+                    } else {
+                        Msg::DownloadFailed(e.to_string())
+                    }
+                }
             });
+            ctx.request_repaint();
+        });
+    }
+
+    /// 检查 FrameGen Manager 自己有没有新版本。
+    /// 读我们仓库 raw 上的 Cargo.toml，不占任何 API 配额（见 update::fetch_latest_self_version）。
+    fn start_self_update_check(&mut self) {
+        self.spawn(|tx, ctx| {
+            // 调试开关：DLSSG_FAKE_NEWVER=0.9.9 可以假装远端有新版本，
+            // 用来验证「右上角出现下载入口」这条路径（不然本地远端同版本看不到）。
+            let latest = std::env::var("DLSSG_FAKE_NEWVER").ok().or_else(|| {
+                update::client()
+                    .ok()
+                    .and_then(|c| update::fetch_latest_self_version(&c))
+            });
+            let _ = tx.send(Msg::SelfVersionChecked(latest));
             ctx.request_repaint();
         });
     }
@@ -1938,9 +2133,12 @@ impl eframe::App for App {
             self.autoscan_done = true;
             self.start_scan();
         }
-        if !self.autocheck_done && std::env::var_os("DLSSG_AUTOCHECK").is_some() {
+        // 启动时检查「本软件」有没有新版本。可以在界面上关掉。
+        // 注意这不是上游 Mod 的更新检查 —— 那个仍然只在你点「检查更新」时才跑。
+        if !self.autocheck_done && (self.auto_check || std::env::var_os("DLSSG_AUTOCHECK").is_some())
+        {
             self.autocheck_done = true;
-            self.start_update_check();
+            self.start_self_update_check();
         }
 
         // ---------------- 顶栏
@@ -1962,6 +2160,18 @@ impl eframe::App for App {
                     ui.label(theme::hint("为 RTX 20 / 30 系一键部署 DLSS 帧生成"));
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        // 本软件有新版本 —— 放最右边，最显眼
+                        if let Some(v) = self.new_version.clone() {
+                            if theme::primary_button(ui, &format!("有新版本 {v}"), true)
+                                .on_hover_text("点一下打开 GitHub 发布页下载新版")
+                                .clicked()
+                            {
+                                if let Err(e) = util::open_url(update::RELEASES_URL) {
+                                    self.status = format!("打开发布页失败: {e}");
+                                }
+                            }
+                            ui.add_space(6.0);
+                        }
                         let version = self
                             .update_state
                             .version
@@ -2251,6 +2461,27 @@ impl eframe::App for App {
                         }
                         if theme::ghost_button(ui, "检查更新", !self.busy).clicked() {
                             self.start_update_check();
+                        }
+                    });
+
+                    // 启动自动检查「本软件」新版本的开关。
+                    // 用 toggle_value 而不是 checkbox —— egui 的 checkbox 勾上
+                    // 只有一条 1px 细线，看不出状态。
+                    let auto_text = if self.auto_check {
+                        "启动时自动检查新版本：开"
+                    } else {
+                        "启动时自动检查新版本：关"
+                    };
+                    ui.horizontal(|ui| {
+                        if ui.toggle_value(&mut self.auto_check, auto_text).changed() {
+                            self.save_config();
+                        }
+                        let cur = update::SELF_VERSION;
+                        if theme::ghost_button(ui, "检查新版本", true)
+                            .on_hover_text(format!("当前版本 {cur}"))
+                            .clicked()
+                        {
+                            self.start_self_update_check();
                         }
                     });
 

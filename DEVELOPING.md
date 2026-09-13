@@ -30,6 +30,7 @@ Rust + egui/eframe。**不许用** Electron / Tauri / WebView。
     cargo run -- --canceltest      # 取消下载 + 残留清理
     cargo run -- --downloadtest    # HEAD 取 ETag -> 下载 581B 的 ini -> 校验指纹（0 次 API）
     cargo run -- --speedtest       # 走生产路径（镜像优先 + 签名校验）实测下载速度
+    cargo run -- --selfupdate      # 软件自身版本检查 + 版本号比较的边界用例
     cargo run -- --backuptest      # 实测备用源，并验证镜像也会透传 ETag
     cargo run -- --dlssrun         # 下载 DLSS 运行库：直链 -> 下载 -> 解压 -> 删包 -> 验签
     cargo run -- --ziptest <zip> <输出>   # 单独测 zip 解压
@@ -56,6 +57,7 @@ Rust + egui/eframe。**不许用** Electron / Tauri / WebView。
 | `DLSSG_AUTOCHECK=1` | 启动就跑一次「检查更新」（资产清单才会显示出来） |
 | `DLSSG_SPOOF_OPEN=1` | 显卡名称伪装卡片默认展开 |
 | `DLSSG_NO_CJK_FONT=1` | 不加载中文字体，用来量化字体占多少内存 |
+| `DLSSG_FAKE_NEWVER=0.9.9` | 假装远端有新版本，验证右上角那个下载入口（本地远端同版本时看不到） |
 
 界面自测只能靠截图像素分析（本机没有可自动化的 GUI 断言框架），所以这些开关很关键。
 **注意**：分析截图时要按窗口标题 FrameGen Manager 找窗口 —— debug 版是控制台程序，
@@ -201,6 +203,43 @@ gh-proxy.com 不转发 ETag，等于下载侧少了一道校验，所以 `downlo
 
 `fetch_version()` 也走多源回退：它只是给界面显示一个版本号，不该因为 raw 卡住而
 把整个「检查更新」拖住。
+
+### 改版本号（这个坑踩过两次）
+
+**别用 PS 的 Get-Content / Set-Content 去改 Cargo.toml。** PS 5.1 按 ANSI 码页读无 BOM 的
+UTF-8 文件，中文注释里全角句号后面紧跟 CRLF 时，那个  会被当成双字节字符的尾字节吃掉
+—— 注释行和下一行合并，Cargo.toml 立刻变成非法 TOML（`cargo metadata` 报
+"key with no value, expected ="），而且 Set-Content 还会把已经乱掉的文本再二次编码一遍。
+
+用 .NET 显式指定编码，并且路径给绝对的（Set-Location 不影响 .NET 的当前目录）：
+
+    $noBom = New-Object System.Text.UTF8Encoding($false)
+    $t = [System.IO.File]::ReadAllText($abs, [System.Text.Encoding]::UTF8)
+    [System.IO.File]::WriteAllText($abs, $t.Replace('0.2.0', '0.3.0'), $noBom)
+
+Cargo.toml 用 $false（不加 BOM）；installer.iss 用 $true（要 BOM，Inno Setup 才认中文）。
+改完拿 `cargo metadata --no-deps` 验一下版本号读出来对不对，别等编译到一半才发现。
+
+### 软件自身更新检查（别和上游 Mod 的更新混了）
+
+两套东西：
+
+* **上游 Mod 更新**（sdli1995/dlssg_for_sm86）—— 只在用户点「检查更新」时跑，走 raw 的 ETag。
+* **本软件更新**（XiaoQAQ10086/FrameGen-Manager）—— 启动时自动跑一次，可在界面上关掉。
+
+本软件更新**读的是我们自己仓库 main 分支上的 Cargo.toml 的 version 字段**。为什么不用
+Releases 接口：
+
+* api.github.com 未登录按 IP 限 60 次/小时 —— 正是这个项目一直在躲的东西；
+* gh-proxy 这类镜像**只代理资源文件、拒绝代理网页**（实测直接回
+  "Web page content is not allowed"），所以 releases 页面和 releases.atom 都拿不到；
+* raw 上的 Cargo.toml 只有 2KB，官方源和镜像都拿得到，且不占配额。
+
+**前提**：发布流程必须是「改版本号 -> 提交 -> 打标签 -> 发 Release」一条龙，
+这样 main 上的版本号才等于最新已发布版本。改了发布流程就要回来改这里。
+
+版本号比较用手写的三段数字比较（`0.2.10 > 0.2.9` 这种要正确），解析不出来时
+一律当作「没有新版本」—— 宁可漏报也别误报。`--selfupdate` 里有边界用例。
 
 ### 资产状态与部署的几条规矩
 
