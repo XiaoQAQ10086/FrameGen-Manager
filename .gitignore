@@ -1,0 +1,7 @@
+/target
+/dist
+/assets
+
+# 下载来的第三方 DLL 和临时文件，绝对不能提交进仓库
+*.part
+

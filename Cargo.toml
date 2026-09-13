@@ -1,0 +1,65 @@
+[package]
+name = "framegen-manager"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+description = "Lightweight manager for dlssg_for_sm86 - deploy DLSS Frame Generation to game directories"
+license = "MIT"
+
+[dependencies]
+# eframe 默认后端是 wgpu（会拉 wgpu-core/naga/ash，体积巨大）。
+# 显式改用 glow(OpenGL) 并关掉 accesskit / wayland / x11 / links。
+eframe = { version = "0.36", default-features = false, features = [
+    "glow",
+    "default_fonts",
+] }
+egui = "0.36"
+rfd = "0.17"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# 关键：不要用默认 TLS。reqwest 默认的 default-tls -> rustls -> aws-lc-rs -> aws-lc-sys，
+# 那个 crate 需要 CMake + NASM 才能编译。native-tls 在 Windows 上走 schannel，零 C 依赖。
+reqwest = { version = "0.13", default-features = false, features = [
+    "blocking",
+    "native-tls",
+    "system-proxy",
+] }
+sha2 = "0.11"
+# sha1 只用来算 git blob 哈希（和 GitHub contents API 返回的 sha 直接比对）
+sha1 = "0.11"
+# 解压 DLSS 运行库的 zip。flate2 本来就在依赖树里（png -> image -> arboard/eframe 拉的），
+# 所以加为直接依赖不会新增任何下载，也不增加体积。
+flate2 = "1"
+directories = "6"
+anyhow = "1"
+winreg = "0.56"
+walkdir = "2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    # 取游戏图标：Shell 拿 HICON，GDI 转成 RGBA 像素
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_Graphics_Gdi",
+] }
+
+# 反作弊模块（模块 3）需要读注册表服务项 / PE 导入表时再加，不要现在加
+# windows = { version = "0.62", features = ["Win32_System_Registry", "Win32_Security_WinTrust"] }
+
+# ---- 体积优先：目标安装包 < 10 MB ----
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+incremental = false
+
+# egui 在 dev 下若依赖不优化会非常卡，这里把依赖单独拉到 O3
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
