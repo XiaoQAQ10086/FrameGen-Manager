@@ -109,6 +109,51 @@ pub fn client() -> Result<reqwest::blocking::Client> {
         .context("创建 HTTP 客户端失败")
 }
 
+/// 记住上一次哪个源能用，下次先试它。
+///
+/// 不这么做的话：github.com 被墙的机器上，每次检查都要先干等 15 秒连接超时
+/// 才轮到镜像；运行库直链正是 github.com，于是白白多等两次。
+/// 两个主机分别记：raw.githubusercontent.com 通常直连没问题，
+/// github.com（release 直链）在墙内往往要等 15 秒连接超时才轮到镜像。
+/// 共用一个标志会被两边来回覆盖，等于没缓存。
+static PREFER_MIRROR_RAW: AtomicBool = AtomicBool::new(false);
+static PREFER_MIRROR_GH: AtomicBool = AtomicBool::new(false);
+
+fn prefer_slot(url: &str) -> &'static AtomicBool {
+    if url.contains("raw.githubusercontent.com") {
+        &PREFER_MIRROR_RAW
+    } else {
+        &PREFER_MIRROR_GH
+    }
+}
+
+/// 依次尝试官方源和镜像，顺序由上次的成功经验决定。
+/// attempt(url, 是不是镜像) 负责实际请求。
+fn try_both<T>(official: &str, mut attempt: impl FnMut(&str, bool) -> Result<T>) -> Result<T> {
+    let slot = prefer_slot(official);
+    let mirror = format!("{}{}", DEFAULT_BACKUP_PREFIX, official);
+    let order: [(String, bool); 2] = if slot.load(Ordering::Relaxed) {
+        [(mirror, true), (official.to_owned(), false)]
+    } else {
+        [(official.to_owned(), false), (mirror, true)]
+    };
+
+    let mut errs: Vec<String> = Vec::new();
+    for (url, is_mirror) in order {
+        match attempt(&url, is_mirror) {
+            Ok(v) => {
+                slot.store(is_mirror, Ordering::Relaxed);
+                return Ok(v);
+            }
+            Err(e) => errs.push(format!(
+                "{}失 {e}",
+                if is_mirror { "备用源" } else { "官方源" }
+            )),
+        }
+    }
+    bail!("{}", errs.join("；"))
+}
+
 /// 取响应头里的 ETag，并确认它看起来就是内容的 SHA-256。
 ///
 /// raw.githubusercontent.com（以及实测会透传的 ghproxy 镜像）返回的 ETag 就是
@@ -137,29 +182,23 @@ fn content_length_of(resp: &reqwest::blocking::Response) -> u64 {
 /// 同样能拿到期望哈希，下载完照样能校验。
 pub fn probe_remote(client: &reqwest::blocking::Client, repo_path: &str) -> Result<RemoteFile> {
     let official = official_url(repo_path);
-    let mirror = format!("{DEFAULT_BACKUP_PREFIX}{official}");
-    let mut last = String::from("没有可用的源");
-
-    for (label, url) in [("官方源", official), ("备用源", mirror)] {
-        match client.head(&url).send() {
-            Ok(resp) if resp.status().is_success() => {
-                let size = content_length_of(&resp);
-                match etag_of(&resp) {
-                    Some(etag) => {
-                        return Ok(RemoteFile {
-                            name: repo_path.to_owned(),
-                            size,
-                            etag,
-                        })
-                    }
-                    None => last = format!("{label} 没返回可用的 ETag"),
-                }
-            }
-            Ok(resp) => last = format!("{label} 返回 HTTP {}", resp.status().as_u16()),
-            Err(e) => last = format!("{label} {}", friendly_error(&e)),
+    try_both(&official, |url, _| {
+        let resp = client
+            .head(url)
+            .send()
+            .map_err(|e| anyhow::anyhow!(friendly_error(&e)))?;
+        if !resp.status().is_success() {
+            bail!("返回 HTTP {}", resp.status().as_u16());
         }
-    }
-    bail!("拿不到 {repo_path} 的内容指纹（{last}）")
+        let size = content_length_of(&resp);
+        let etag = etag_of(&resp).ok_or_else(|| anyhow::anyhow!("没返回可用的 ETag"))?;
+        Ok(RemoteFile {
+            name: repo_path.to_owned(),
+            size,
+            etag,
+        })
+    })
+    .map_err(|e| anyhow::anyhow!("拿不到 {repo_path} 的内容指纹（{e}）"))
 }
 
 /// 版本号同时出现在两处，格式略有不同：
@@ -611,14 +650,14 @@ pub fn download_raw(
 /// HEAD 任意 URL，拿 (大小, ETag)。发布资产也有 Content-Length，够界面显示用了。
 /// 同样先官方后镜像，失败返回 None（只是显示不出大小，不影响下载）。
 pub fn probe_url(client: &reqwest::blocking::Client, url: &str) -> Option<(u64, String)> {
-    for u in [url.to_owned(), format!("{}{}", DEFAULT_BACKUP_PREFIX, url)] {
-        if let Ok(r) = client.head(&u).send() {
-            if r.status().is_success() {
-                return Some((content_length_of(&r), etag_of(&r).unwrap_or_default()));
-            }
+    try_both(url, |u, _| {
+        let r = client.head(u).send().map_err(|e| anyhow::anyhow!("{e}"))?;
+        if !r.status().is_success() {
+            bail!("HTTP {}", r.status().as_u16());
         }
-    }
-    None
+        Ok((content_length_of(&r), etag_of(&r).unwrap_or_default()))
+    })
+    .ok()
 }
 
 /// 先试官方地址，失败再试镜像前缀。
@@ -630,15 +669,10 @@ fn download_with_mirror(
     cancel: &AtomicBool,
     progress: &mut dyn FnMut(u64, u64),
 ) -> Result<u64> {
-    match download_raw(client, official, dest, cancel, progress) {
-        Ok(n) => Ok(n),
-        Err(e1) => {
-            let mirror = format!("{}{}", DEFAULT_BACKUP_PREFIX, official);
-            progress(0, 0);
-            download_raw(client, &mirror, dest, cancel, progress)
-                .map_err(|e2| anyhow::anyhow!("官方源失败（{e1}）；备用源也失败（{e2}）"))
-        }
-    }
+    try_both(official, |url, _| {
+        progress(0, 0);
+        download_raw(client, url, dest, cancel, progress)
+    })
 }
 
 // ---------------------------------------------------------------- ZIP 单文件解压

@@ -795,6 +795,106 @@ fn deploytest() {
         }
     }
 
+    // 重部署：上游更新之后用户会再点一次「部署」。
+    // 关键：这时不能把我们上次部署进去的文件当成「游戏原文件」重新备份，
+    // 否则真正的原件会被覆盖掉，「还原」就还原不回游戏原样了。
+    println!("
+-- 重部署（模拟上游更新后再部署一次）--");
+    // 这里只部署 INI、不带 DLL：deploy 会检查目标里同名文件的签名，测试用的假字节
+    // 没有本项目签名，第二次部署会被正当地拒掉。真实的已签名 DLL（15 MB）没法在自测里
+    // 造出来，所以这一段专门验证「原始备份不被自己的旧版本覆盖」。
+    let t4 = root.join("redeploy");
+    let _ = fs::create_dir_all(&t4);
+    fs::write(t4.join(deploy::INI_NAME), orig_ini).unwrap();
+    let ini_only = [deploy::DeployFile::new(deploy::INI_NAME, &ini_src)];
+    fs::write(&ini_src, b"FAKE_INI_PAYLOAD_V1").unwrap();
+    match deploy::deploy(&t4, "version.dll", &ini_only) {
+        Ok(_) => {
+            // 上游更新了：源文件换成 V2，注意中间**没有**先还原
+            fs::write(&ini_src, b"FAKE_INI_PAYLOAD_V2").unwrap();
+            match deploy::deploy(&t4, "version.dll", &ini_only) {
+                Ok(_) => {
+                    check!(
+                        fs::read(t4.join(deploy::INI_NAME)).ok().as_deref()
+                            == Some(&b"FAKE_INI_PAYLOAD_V2"[..]),
+                        "重部署后 INI 已是新内容"
+                    );
+                    let orig_kept = deploy::load_manifest(&t4)
+                        .and_then(|m| {
+                            m.files.into_iter().find(|e| e.rel_path == deploy::INI_NAME)
+                        })
+                        .and_then(|e| e.original_sha256)
+                        .map(|h| h == util::sha256_hex(orig_ini))
+                        .unwrap_or(false);
+                    check!(
+                        orig_kept,
+                        "重部署后备份里仍是最初的用户原始 INI（没被自己的旧版本覆盖）"
+                    );
+                    match deploy::restore(&t4) {
+                        Ok(_) => check!(
+                            fs::read(t4.join(deploy::INI_NAME)).ok().as_deref() == Some(orig_ini),
+                            "重部署后仍能还原出最初的用户原始 INI"
+                        ),
+                        Err(e) => {
+                            println!("  [FAIL] 重部署后还原报错: {e}");
+                            fails += 1;
+                        }
+                    }
+                }
+                Err(e) => {
+                    println!("  [FAIL] 重部署报错: {e}");
+                    fails += 1;
+                }
+            }
+        }
+        Err(e) => {
+            println!("  [FAIL] 首次部署报错: {e}");
+            fails += 1;
+        }
+    }
+
+    // 换代理入口：旧入口不能留在目录里变成孤儿
+    println!("
+-- 换代理入口 --");
+    let t5 = root.join("switch");
+    let _ = fs::create_dir_all(&t5);
+    let winmm_src = src.join("winmm.dll");
+    fs::write(&winmm_src, b"FAKE_WINMM_V1").unwrap();
+    let only_version = [deploy::DeployFile::new("version.dll", &dll_src)];
+    let only_winmm = [deploy::DeployFile::new("winmm.dll", &winmm_src)];
+    match deploy::deploy(&t5, "version.dll", &only_version) {
+        Ok(_) => {
+            check!(t5.join("version.dll").is_file(), "先用 version.dll 部署成功");
+            match deploy::deploy(&t5, "winmm.dll", &only_winmm) {
+                Ok(_) => {
+                    check!(t5.join("winmm.dll").is_file(), "换入口后 winmm.dll 已部署");
+                    check!(
+                        !t5.join("version.dll").exists(),
+                        "换入口后旧的 version.dll 已被清掉（不再有两个代理并存）"
+                    );
+                    match deploy::restore(&t5) {
+                        Ok(_) => check!(
+                            !t5.join("winmm.dll").exists(),
+                            "换入口后仍能正常还原"
+                        ),
+                        Err(e) => {
+                            println!("  [FAIL] 换入口后还原报错: {e}");
+                            fails += 1;
+                        }
+                    }
+                }
+                Err(e) => {
+                    println!("  [FAIL] 换入口部署报错: {e}");
+                    fails += 1;
+                }
+            }
+        }
+        Err(e) => {
+            println!("  [FAIL] 首次部署报错: {e}");
+            fails += 1;
+        }
+    }
+
     // 冲突：目录里已有第三方的 version.dll
     println!("
 -- 入口冲突 --");
@@ -974,6 +1074,8 @@ struct App {
     busy: bool,
     logs: Vec<String>,
     autoscan_done: bool,
+    /// 调试开关：启动时自动跑一次更新检查（DLSSG_AUTOCHECK=1）
+    autocheck_done: bool,
 
     // ---- 代理入口推荐
     advice: Option<scan::ProxyAdvice>,
@@ -1061,6 +1163,7 @@ impl App {
             busy: false,
             logs: boot_notes,
             autoscan_done: false,
+            autocheck_done: false,
             advice: None,
             gpu_name,
             gpu_route,
@@ -1126,15 +1229,20 @@ impl App {
         );
     }
 
-    /// 资产当前状态。**完全按本地文件判断，不查网络** ——
-    /// 所以下载完立刻就能显示「已就绪」，也不必再消耗 GitHub 的调用配额。
-    fn asset_state(&self, row: &AssetRow) -> AssetState {
-        if let Some(name) = &row.runtime_file {
-            let ok = util::assets_dir()
-                .map(|d| {
-                    let p = d.join(name);
-                    p.is_file() && scan::identify_dll(&p) == scan::FileIdentity::Nvidia
-                })
+    /// 资产当前状态。**只看本地文件 + 下载记录，不查网络。**
+    ///
+    /// assets 目录由调用方解析一次传进来，避免每一行都去读配置文件。
+    ///
+    /// 关键：必须先确认文件真的还躺在 assets 目录里。早先这里只比对
+    /// update_state.json 里的下载记录，用户把资产文件删光之后，
+    /// 界面照样显示「已就绪」—— 记录还在，文件早就没了。
+    fn asset_state(&self, assets: Option<&Path>, row: &AssetRow) -> AssetState {
+        let local = assets.map(|d| d.join(&row.label));
+
+        if row.runtime_file.is_some() {
+            let ok = local
+                .as_deref()
+                .map(|p| p.is_file() && scan::identify_dll(p) == scan::FileIdentity::Nvidia)
                 .unwrap_or(false);
             return if ok {
                 AssetState::Ready
@@ -1142,14 +1250,29 @@ impl App {
                 AssetState::Missing
             };
         }
-        match (&row.remote_etag, self.update_state.files.get(&row.label)) {
-            (Some(remote), Some(local))
-                if !local.etag.is_empty() && local.etag.eq_ignore_ascii_case(remote) =>
-            {
+
+        let Some(p) = local else {
+            return AssetState::Missing;
+        };
+        if !p.is_file() {
+            return AssetState::Missing;
+        }
+        let Some(rec) = self.update_state.files.get(&row.label) else {
+            // 文件在，但不是本工具下的（用户自己拷进来的）：版本说不清，按需要下载处理
+            return AssetState::Outdated;
+        };
+        // 大小和下载记录对不上 = 被改过，或者当初没下完
+        let size = std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0);
+        if rec.bytes > 0 && size != rec.bytes {
+            return AssetState::Outdated;
+        }
+        match &row.remote_etag {
+            Some(remote) if !rec.etag.is_empty() && rec.etag.eq_ignore_ascii_case(remote) => {
                 AssetState::Ready
             }
-            (Some(_), Some(_)) => AssetState::Outdated,
-            _ => AssetState::Missing,
+            Some(_) => AssetState::Outdated,
+            // 远端指纹没拿到（网络问题）时不要乱报「有更新」
+            None => AssetState::Ready,
         }
     }
 
@@ -1653,6 +1776,10 @@ impl eframe::App for App {
             self.autoscan_done = true;
             self.start_scan();
         }
+        if !self.autocheck_done && std::env::var_os("DLSSG_AUTOCHECK").is_some() {
+            self.autocheck_done = true;
+            self.start_update_check();
+        }
 
         // ---------------- 顶栏
         egui::Panel::top("header")
@@ -2021,6 +2148,8 @@ impl eframe::App for App {
 
                     // 资产清单：按「核心 Mod / DLSS 运行库」分组显示
                     if let Some(s) = self.update_summary.clone() {
+                        // 资产目录只解析一次，别在每一行里重复读配置文件
+                        let assets = util::assets_dir().ok();
                         ui.add_space(2.0);
                         if let Some(v) = &s.version {
                             ui.label(theme::hint(format!("上游版本 {v}")));
@@ -2043,7 +2172,7 @@ impl eframe::App for App {
                                     .strong(),
                             );
                             for row in group_rows {
-                                let st = self.asset_state(&row);
+                                let st = self.asset_state(assets.as_deref(), &row);
                                 ui.horizontal(|ui| {
                                     theme::badge(ui, st.label(), st.color());
                                     ui.label(theme::hint(format!(

@@ -6,6 +6,7 @@
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use crate::util;
@@ -237,8 +238,36 @@ pub fn deploy(target_dir: &Path, proxy: &str, files: &[DeployFile]) -> Result<St
     std::fs::create_dir_all(&files_dir)?;
 
     // 4. 备份
+    //
+    // 重部署（上游更新后再点一次「部署」）时必须沿用**第一次**的备份。
+    // 否则会把「我们上次部署进去的文件」当成游戏原文件重新备份一遍，
+    // 把真正的原件覆盖掉 —— 之后「还原」只能还原出我们自己部署的版本。
+    let prev: BTreeMap<String, BackupEntry> = existing_manifest
+        .as_ref()
+        .map(|m| m.files.iter().map(|e| (e.rel_path.clone(), e.clone())).collect())
+        .unwrap_or_default();
+
     let mut entries = Vec::new();
     for (name, _bytes, sha) in &payload {
+        // 之前部署过，而且它的原始备份还在 -> 直接沿用，不重新备份
+        if let Some(p) = prev.get(name) {
+            let backup_intact = match &p.backup_name {
+                Some(bn) => files_dir.join(bn).is_file(),
+                // 当时本来就没有原文件，那也不需要备份
+                None => !p.existed_before,
+            };
+            if backup_intact {
+                entries.push(BackupEntry {
+                    rel_path: name.clone(),
+                    existed_before: p.existed_before,
+                    backup_name: p.backup_name.clone(),
+                    original_sha256: p.original_sha256.clone(),
+                    deployed_sha256: sha.clone(),
+                });
+                continue;
+            }
+        }
+
         let dst = target_dir.join(name);
         let existed = dst.is_file();
         let mut backup_name = None;
@@ -288,6 +317,40 @@ pub fn deploy(target_dir: &Path, proxy: &str, files: &[DeployFile]) -> Result<St
             let _ = restore(target_dir);
             bail!("{} 部署后校验失败，已自动回滚。", name);
         }
+    }
+
+    // 8. 清掉上次部署、这次不再使用的代理入口
+    //
+    // 用户手动换代理入口再部署时，旧的那个会留在游戏目录里，而且新 manifest
+    // 里没有它 —— 变成一个「还原也管不到」的孤儿，游戏加载哪个全看运气。
+    // 判定条件很保守：必须是旧 manifest 记过账、当时没有原文件、而且现在这个
+    // 文件的内容还等于我们当初写进去的那份（没被用户换过），才删。
+    let mut removed: Vec<String> = Vec::new();
+    if let Some(old) = &existing_manifest {
+        for e in &old.files {
+            if !PROXY_ENTRIES.contains(&e.rel_path.as_str()) || e.existed_before {
+                continue;
+            }
+            if payload.iter().any(|(n, _, _)| *n == e.rel_path) {
+                continue;
+            }
+            let p = target_dir.join(&e.rel_path);
+            if !p.is_file() {
+                continue;
+            }
+            let still_ours = util::sha256_file(&p)
+                .map(|h| h == e.deployed_sha256)
+                .unwrap_or(false);
+            if still_ours && std::fs::remove_file(&p).is_ok() {
+                removed.push(e.rel_path.clone());
+            }
+        }
+    }
+    if !removed.is_empty() {
+        notes.push(format!(
+            "已移除上次部署、这次不用的代理入口：{}（避免同时存在两个代理）",
+            removed.join("、")
+        ));
     }
 
     let names: Vec<&str> = payload.iter().map(|(n, _, _)| n.as_str()).collect();
