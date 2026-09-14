@@ -493,6 +493,8 @@ pub fn download_auto(
             // 所有源都低于阈值时不能就这么失败：退回「不看速率」再试一遍。
             // 慢一点也总比下不下来强，用户至少还有取消按钮。
             if min_kbps > 0 && too_slow.load(Ordering::Relaxed) {
+                // 一个达标的源都没有 —— 那就别挑速度了，用手上最快的那个继续
+                progress(0, 0, "几个源都不够快，用最快的那个继续");
                 download_pass(
                     client, repo_path, dest, expect_etag, cancel, &official, &ms, prefer_mirror, 0,
                     verify, &too_slow, progress,
@@ -599,6 +601,9 @@ pub fn download(
     // 慢源以前没有任何机制，用户只能眼睁睁看 30 MB 一点点爬完。
     let t0 = Instant::now();
     let watch = min_kbps > 0 && (total == 0 || total >= WATCHDOG_MIN_BYTES);
+    // 进度回调里那第三段文字在这里算一次 —— 别每 64 KB 都新分配一个 String
+    let tag = format!("经 {}", source_label(source));
+    let tag_slow = format!("经 {} 速度不达标，换下一个", source_label(source));
     loop {
         if cancel.load(Ordering::Relaxed) {
             let _ = std::fs::remove_file(&tmp);
@@ -612,13 +617,16 @@ pub fn download(
         }
         buf.extend_from_slice(&chunk[..n]);
         got += n as u64;
-        progress(got, total, source);
+        progress(got, total, &tag);
         if watch {
             let el = t0.elapsed().as_secs_f64();
             if el >= WATCHDOG_GRACE_SECS {
                 let kbps = got as f64 / el / 1024.0;
                 if kbps < min_kbps as f64 {
                     let _ = std::fs::remove_file(&tmp);
+                    // 让界面说清这次是「太慢」而不是「坏了」：
+                    // 用户看到的是「速度不达标，换下一个」，比字节数卡着不动好懂得多。
+                    progress(got, total, &tag_slow);
                     bail!("{TOO_SLOW_PREFIX}（实测 {kbps:.0} KB/s，低于 {min_kbps} KB/s）");
                 }
             }
@@ -1074,6 +1082,9 @@ pub fn download_raw(
     let mut got: u64 = 0;
     let t0 = Instant::now();
     let watch = min_kbps > 0 && (total == 0 || total >= WATCHDOG_MIN_BYTES);
+    // 进度回调里那第三段文字在这里算一次 —— 别每 64 KB 都新分配一个 String
+    let tag = format!("经 {}", source_label(source));
+    let tag_slow = format!("经 {} 速度不达标，换下一个", source_label(source));
     loop {
         if cancel.load(Ordering::Relaxed) {
             let _ = std::fs::remove_file(&tmp);
@@ -1087,13 +1098,16 @@ pub fn download_raw(
         }
         buf.extend_from_slice(&chunk[..n]);
         got += n as u64;
-        progress(got, total, source);
+        progress(got, total, &tag);
         if watch {
             let el = t0.elapsed().as_secs_f64();
             if el >= WATCHDOG_GRACE_SECS {
                 let kbps = got as f64 / el / 1024.0;
                 if kbps < min_kbps as f64 {
                     let _ = std::fs::remove_file(&tmp);
+                    // 让界面说清这次是「太慢」而不是「坏了」：
+                    // 用户看到的是「速度不达标，换下一个」，比字节数卡着不动好懂得多。
+                    progress(got, total, &tag_slow);
                     bail!("{TOO_SLOW_PREFIX}（实测 {kbps:.0} KB/s，低于 {min_kbps} KB/s）");
                 }
             }
@@ -1167,6 +1181,7 @@ fn download_with_mirror(
         Err(e) => {
             // 同 download_auto：所有源都太慢时就放宽速度要求再走一遍
             if min_kbps > 0 && too_slow.load(Ordering::Relaxed) {
+                progress(0, 0, "几个源都不够快，用最快的那个继续");
                 run(0, &too_slow, progress)
                     .map_err(|e2| anyhow::anyhow!("{e2}（放宽速度要求后重试仍失败；先前：{e}）"))
             } else {
@@ -1478,11 +1493,11 @@ pub fn ensure_dlss_runtime(
                 let t = if len > 0 { len } else { step.size };
                 progress(
                     format!(
-                        "第 {step_no}/{} 步 · 下载 {label} {} / {} · 经 {}",
+                        "第 {step_no}/{} 步 · 下载 {label} {} / {} · {}",
                         ctx.total_steps,
                         util::format_bytes(got),
                         util::format_bytes(t),
-                        source_label(src)
+                        src
                     ),
                     frac(done + got),
                 );
@@ -1508,11 +1523,11 @@ pub fn ensure_dlss_runtime(
                     let t = if len > 0 { len } else { asset.size };
                     progress(
                         format!(
-                            "第 {step_no}/{} 步 · 下载 {label} {} / {} · 经 {}",
+                            "第 {step_no}/{} 步 · 下载 {label} {} / {} · {}",
                             ctx.total_steps,
                             util::format_bytes(got),
                             util::format_bytes(t),
-                            source_label(src)
+                            src
                         ),
                         frac(done + got),
                     );

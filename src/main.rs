@@ -693,7 +693,16 @@ fn sourcetest() {
     let u1 = format!("http://127.0.0.1:{slow_port}/slow");
     println!("-- 看门狗：慢源（约 160 KB/s，阈值 300 KB/s）--");
     let t0 = std::time::Instant::now();
-    let r1 = update::download(&c, "watchdog-test", &d1, &u1, None, &cancel, "本地慢源", 300, &mut |_, _, _| {});
+    // 顺手记下进度回调里报给界面的那几段文字 —— 用户能不能看懂就靠它
+    let mut notes: Vec<String> = Vec::new();
+    let r1 = update::download(
+        &c, "watchdog-test", &d1, &u1, None, &cancel, "本地慢源", 300,
+        &mut |_, _, note| {
+            if notes.last().map(|n| n != note).unwrap_or(true) {
+                notes.push(note.to_owned());
+            }
+        },
+    );
     let el = t0.elapsed().as_secs_f64();
     let msg1 = match &r1 {
         Ok(_) => "居然成功了".to_owned(),
@@ -706,6 +715,17 @@ fn sourcetest() {
     );
     ck(&mut fails, el < 10.0, &format!("拦得够快（{el:.1} 秒，不是等整个文件）"));
     ck(&mut fails, !d1.exists(), "被拦下后没留下文件");
+    println!("  进度里报出来的文字：{notes:?}");
+    ck(
+        &mut fails,
+        notes.first().map(|n| n.starts_with("经 ")).unwrap_or(false),
+        "正常进度里会说清楚用的是哪个源（经 xxx）",
+    );
+    ck(
+        &mut fails,
+        notes.iter().any(|n| n.contains("速度不达标")),
+        "换源前会说明原因：速度不达标，换下一个",
+    );
 
     // 小文件豁免：512 KB 的响应，看门狗不该管
     let (small_port, small_stop) = spawn_http_server(512 * 1024, 64 * 1024, 0);
@@ -2280,10 +2300,10 @@ impl App {
                             };
                             let _ = tx2.send(Msg::Progress(
                                 format!(
-                                    "{step_text} 下载 {label} {} / {} · 经 {}",
+                                    "{step_text} 下载 {label} {} / {} · {}",
                                     util::format_bytes(got),
                                     util::format_bytes(denom),
-                                    update::source_label(src)
+                                    src
                                 ),
                                 f,
                                 total,
