@@ -773,7 +773,7 @@ dependencies = [
 
 [[package]]
 name = "framegen-manager"
-version = "0.9.3"
+version = "0.9.4"
 dependencies = [
  "anyhow",
  "directories",

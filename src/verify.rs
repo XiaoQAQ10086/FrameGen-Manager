@@ -32,8 +32,9 @@ use windows_sys::Win32::Security::WinTrust::{
 pub const AUTHOR_CERT_PROXY: &str = "85BA66762F851E49148D706915D09026281418E6";
 
 /// 作者自签证书的 SHA-1 指纹（0.2.4 native 包，"DLSSG Native Project"）。
-/// 那份文件现在只在归档包里，等取到指纹后填进来（列表为空时：那种文件会走「可疑，让用户确认」）。
-pub const AUTHOR_CERT_NATIVE: &str = "";
+/// 实测取自 archive/0.2.4/version.dll —— 上游换过一次证书，两张都得认：
+/// 否则导入上游源码 zip 时，里面 archive/0.2.4/ 那一堆文件会被误判成「签名者不认识」。
+pub const AUTHOR_CERT_NATIVE: &str = "A994735E6A7E9AA31FA926B3023B7C487DAB4850";
 
 /// NVIDIA 的签名证书（310.9.1 那批）SHA-1 指纹。
 /// 只是兜底：NVIDIA 走的是公开 CA，正常情况下 Windows 认可就够，换证书也不影响。

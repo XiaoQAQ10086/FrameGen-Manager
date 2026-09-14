@@ -70,6 +70,39 @@ pub struct Staged {
     pub trusted: bool,
 }
 
+/// 压缩包里的是「哪一版」—— 只看路径就能看出来，上游的布局是固定的：
+///   * archive/0.2.4/…  —— 老的 native 包（0.2.4），归档用
+///   * 310.1/…          —— 给 RTX 20 系用的那一版
+///   * 其它（根目录）    —— 当前最新版（310.9）
+///
+/// 返回 0 = 当前在用的那一版（优先），1 = 另一版，2 = 归档老版。
+/// 它只用来在**同名文件有多个副本**时挑哪个，不拿来拒绝任何文件。
+pub fn build_rank(path: &str, legacy: bool) -> u8 {
+    let p = path.replace('\\', "/").to_lowercase();
+    if p.contains("archive/") {
+        // 上游源码 zip 里同时有根目录、310.1/ 和 archive/0.2.4/ 三套同名文件，
+        // 归档那套一定是最差的（那张证书是老的，别让它顶掉新文件）
+        return 2;
+    }
+    if p.contains("310.1/") == legacy {
+        0
+    } else {
+        1
+    }
+}
+
+/// 给人看的版本名
+pub fn build_label(path: &str) -> &'static str {
+    let p = path.replace('\\', "/").to_lowercase();
+    if p.contains("archive/") {
+        "归档的老版 native 包（0.2.4）"
+    } else if p.contains("310.1/") {
+        "310.1 版（给 RTX 20 系）"
+    } else {
+        "当前最新版（310.9）"
+    }
+}
+
 fn basename_lower(name: &str) -> String {
     name.rsplit(['/', '\\'])
         .next()
@@ -87,16 +120,6 @@ fn kind_of(base: &str) -> Option<Kind> {
         Some(Kind::Runtime)
     } else {
         None
-    }
-}
-
-/// 把一个条目收进结果里；同名的后来者覆盖先前的（用户按顺序选包，通常最后那个是他想用的）
-fn upsert(out: &mut Vec<Staged>, st: Staged) {
-    if let Some(old) = out.iter_mut().find(|o| o.name == st.name) {
-        let _ = std::fs::remove_file(&old.tmp);
-        *old = st;
-    } else {
-        out.push(st);
     }
 }
 
@@ -197,15 +220,24 @@ fn walk_files(dir: &Path) -> Vec<PathBuf> {
 /// 从一批路径里找出所有认得的文件，解到 work_dir 并逐个校验。
 ///
 /// paths 里可以混着 .zip 和文件夹（有人习惯先解压）。
+/// legacy = 当前在用的是不是 310.1 版；上游源码 zip 里同时有根目录、310.1/ 和 archive/
+/// 三套同名文件，靠它决定优先取哪一套。
 pub fn stage(
     paths: &[PathBuf],
+    legacy: bool,
     work_dir: &Path,
     cancel: &AtomicBool,
     mut progress: impl FnMut(String),
 ) -> Result<Vec<Staged>> {
     std::fs::create_dir_all(work_dir)?;
-    let mut out: Vec<Staged> = Vec::new();
-    for p in paths {
+    // 每个解出来的候选带着「它属于哪一版」的排名，等同名的都收齐了再挑赢家
+    let mut cands: Vec<(u8, String, Staged)> = Vec::new();
+    // 临时文件名必须**全局唯一**：上游源码 zip 里根目录和 310.1/ 都叫 version.dll，
+    // 早先按「文件名.part」解压，第二个会把第一个覆盖掉，然后合并时又把文件删了 ——
+    // 结果就是用户点了「继续导入」之后报「导入失败」。所以这里带来源序号 + 条目序号。
+    let mut uniq = 0usize;
+
+    for (si, p) in paths.iter().enumerate() {
         if cancel.load(Ordering::Relaxed) {
             anyhow::bail!("{}", update::CANCELLED_MSG);
         }
@@ -222,11 +254,21 @@ pub fn stage(
                     .map(|s| s.to_string_lossy().to_lowercase())
                     .unwrap_or_default();
                 let Some(kind) = kind_of(&base) else { continue };
-                let tmp = work_dir.join(&base);
+                let rel = f
+                    .strip_prefix(p)
+                    .map(|r| r.to_string_lossy().to_string())
+                    .unwrap_or_else(|_| f.display().to_string());
+                let tmp = work_dir.join(format!("s{si}-{uniq}-{base}"));
+                uniq += 1;
                 std::fs::copy(&f, &tmp)
                     .with_context(|| format!("复制 {} 失败", f.display()))?;
-                let st = classify(kind, base, tmp, p.display().to_string())?;
-                upsert(&mut out, st);
+                match classify(kind, base, tmp.clone(), p.display().to_string()) {
+                    Ok(st) => cands.push((build_rank(&rel, legacy), rel, st)),
+                    Err(e) => {
+                        let _ = std::fs::remove_file(&tmp);
+                        progress(format!("{} 处理失败，已跳过：{e}", f.display()));
+                    }
+                }
             }
             continue;
         }
@@ -254,14 +296,15 @@ pub fn stage(
             }
             let base = basename_lower(&meta.name);
             let Some(kind) = kind_of(&base) else { continue };
-            let tmp = work_dir.join(format!("{base}.part"));
+            let tmp = work_dir.join(format!("s{si}-{uniq}-{base}"));
+            uniq += 1;
             let n = update::zip_extract_to(p, meta, &tmp)?;
             if n == 0 {
                 let _ = std::fs::remove_file(&tmp);
                 continue;
             }
             match classify(kind, base, tmp.clone(), pack.clone()) {
-                Ok(st) => upsert(&mut out, st),
+                Ok(st) => cands.push((build_rank(&meta.name, legacy), meta.name.clone(), st)),
                 Err(e) => {
                     let _ = std::fs::remove_file(&tmp);
                     progress(format!("{} 处理失败，已跳过：{e}", meta.name));
@@ -269,13 +312,54 @@ pub fn stage(
             }
         }
     }
+
+    // 同名挑赢家：当前在用的那一版优先（0 最好）。输掉的那些直接删掉临时文件。
+    let mut winners: Vec<(u8, String, Staged)> = Vec::new();
+    for (rank, path, st) in cands {
+        match winners.iter_mut().find(|(_, _, w)| w.name == st.name) {
+            None => winners.push((rank, path, st)),
+            Some(slot) => {
+                if rank < slot.0 {
+                    // 新的更优先：丢掉旧的
+                    let _ = std::fs::remove_file(&slot.2.tmp);
+                    *slot = (rank, path, st);
+                } else {
+                    let _ = std::fs::remove_file(&st.tmp);
+                }
+            }
+        }
+    }
+
+    let mut out: Vec<Staged> = Vec::new();
+    let mut ignored_other = 0usize;
+    for (rank, path, mut st) in winners {
+        ignored_other += 0; // 占位：同名被丢掉的数量上面已经处理
+        if rank > 0 && st.trusted {
+            // 签名没问题，但这是「另一版」的文件：静默装下去会悄悄换掉资产里的版本，
+            // 所以降级成「让用户确认一句」，并把原因说清楚
+            st.trusted = false;
+            st.note = format!(
+                "{}。注意：这个文件来自{}，而你当前用的是{} —— 继续导入会用它覆盖资产里的同名文件",
+                st.note,
+                build_label(&path),
+                if legacy { "310.1 版" } else { "当前最新版（310.9）" }
+            );
+        }
+        out.push(st);
+    }
+    let _ = ignored_other;
     Ok(out)
 }
 
 /// 把校验过的文件搬进资产目录，并记进状态（界面就会显示「已就绪」）。
 /// 返回成功的文件名列表。
 pub fn install(items: &[Staged]) -> Result<Vec<String>> {
-    let dir = util::assets_dir()?;
+    install_to(&util::assets_dir()?, items)
+}
+
+/// 把文件写进指定目录（自测用：不碰真实资产目录，也不写状态）。
+pub fn install_to(dir: &Path, items: &[Staged]) -> Result<Vec<String>> {
+    std::fs::create_dir_all(dir)?;
     let mut state = update::load_state();
     let mut done = Vec::new();
     for it in items {
@@ -298,7 +382,9 @@ pub fn install(items: &[Staged]) -> Result<Vec<String>> {
         );
         done.push(it.name.clone());
     }
-    update::save_state(&state)?;
+    if dir == util::assets_dir().unwrap_or_default() {
+        update::save_state(&state)?;
+    }
     Ok(done)
 }
 

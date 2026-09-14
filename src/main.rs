@@ -200,7 +200,12 @@ fn main() -> eframe::Result<()> {
         let work = std::env::temp_dir().join("fgm-import-selftest");
         let _ = std::fs::remove_dir_all(&work);
         let cancel = AtomicBool::new(false);
-        match importer::stage(&paths, &work, &cancel, |m| println!("  {m}")) {
+        let legacy = util::load_config().legacy_3101;
+        println!(
+            "  当前在用的版本 = {}",
+            if legacy { "310.1 版（RTX 20 系）" } else { "最新版（310.9）" }
+        );
+        match importer::stage(&paths, legacy, &work, &cancel, |m| println!("  {m}")) {
             Ok(items) => {
                 println!("  认出来 {} 个文件：", items.len());
                 for it in &items {
@@ -215,6 +220,21 @@ fn main() -> eframe::Result<()> {
                     println!("        {}", it.note);
                     println!("        sha256 {}", it.sha256);
                 }
+                // 真写一遍到临时目录：验证「点了继续导入之后」那条路不会再失败
+                let dest = std::env::temp_dir().join("fgm-import-install-test");
+                let _ = std::fs::remove_dir_all(&dest);
+                match importer::install_to(&dest, &items) {
+                    Ok(done) => {
+                        println!("  写盘测试：{} 个文件已落位", done.len());
+                        for d in &done {
+                            let p = dest.join(d);
+                            let sz = std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0);
+                            println!("    {}  {} 字节", d, sz);
+                        }
+                    }
+                    Err(e) => println!("  [FAIL] 写盘测试失败：{e}"),
+                }
+                let _ = std::fs::remove_dir_all(&dest);
                 importer::cleanup(&items);
             }
             Err(e) => println!("  [FAIL] {e}"),
@@ -1410,6 +1430,27 @@ fn selftest() {
             &mut fails,
             update::split_custom_sources("随便写点什么").is_empty(),
             "不像网址的行会被忽略",
+        );
+        // 上游源码 zip 里同时有根目录、310.1/、archive/0.2.4/ 三套同名文件：
+        // 同名时只留当前在用的那一版（0 最好），否则用户会被三份一样的东西搞晕，
+        // 而且老版文件会顶掉新版（这正是用户遇到的「官方文件被提示非法」）。
+        ck(
+            &mut fails,
+            importer::build_rank("dlssg_sm86.ini", false) == 0
+                && importer::build_rank("310.1/version.dll", false) == 1
+                && importer::build_rank("archive/0.2.4/version.dll", false) == 2,
+            "最新版模式：根目录优先 > 310.1/ > 归档老版",
+        );
+        ck(
+            &mut fails,
+            importer::build_rank("310.1/version.dll", true) == 0
+                && importer::build_rank("version.dll", true) == 1,
+            "310.1 模式：310.1/ 里的优先",
+        );
+        ck(
+            &mut fails,
+            verify::AUTHOR_CERT_NATIVE.len() == 40 && verify::AUTHOR_CERT_PROXY.len() == 40,
+            "作者两张证书的指纹都在名单里（换过证书，两张都得认）",
         );
     }
 
@@ -3255,9 +3296,10 @@ impl App {
         self.import_busy = true;
         self.status = "正在读取压缩包并校验（大包要几秒）...".to_owned();
         self.note(format!("开始手动导入：{} 个来源", paths.len()));
+        let legacy = self.legacy_3101;
         self.spawn(move |tx, ctx| {
             let ptx = tx.clone();
-            let r = importer::stage(&paths, &work, &cancel, move |m| {
+            let r = importer::stage(&paths, legacy, &work, &cancel, move |m| {
                 let _ = ptx.send(Msg::Progress(m, 0.0, 0));
             });
             let _ = tx.send(match r {
