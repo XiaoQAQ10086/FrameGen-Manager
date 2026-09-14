@@ -12,6 +12,8 @@ pub enum Launcher {
     Epic,
     /// 腾讯 WeGame。扫描判定很保守，见 scan_wegame() 的注释。
     WeGame,
+    /// 用户自己「存到游戏库」的目录，不来自任何平台扫描
+    Manual,
 }
 
 impl Launcher {
@@ -20,6 +22,7 @@ impl Launcher {
             Launcher::Steam => "Steam",
             Launcher::Epic => "Epic",
             Launcher::WeGame => "WeGame",
+            Launcher::Manual => "手动",
         }
     }
 }
@@ -30,6 +33,86 @@ pub struct GameEntry {
     pub app_id: String,
     pub name: String,
     pub install_dir: PathBuf,
+}
+
+// ---------------------------------------------------------------- 游戏库缓存
+
+/// 缓存里的一行：条目本身 + 扫描时算出来的结果。
+///
+/// 为什么要缓存：找渲染 EXE 要遍历游戏目录、反作弊要扫一遍目录，都很花时间。
+/// 启动时拿这份缓存直接显示列表，不用用户再点一次「扫描」。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CachedRow {
+    pub entry: GameEntry,
+    /// 上次找到的渲染 EXE。找到过就记住，免得每次启动重新遍历游戏目录。
+    #[serde(default)]
+    pub render_exe: Option<PathBuf>,
+    /// 上次判定的反作弊等级
+    #[serde(default = "tier_none")]
+    pub ac: crate::anticheat::AcTier,
+}
+
+fn tier_none() -> crate::anticheat::AcTier {
+    crate::anticheat::AcTier::None
+}
+
+/// 整个游戏库：扫出来的 + 用户手动存的。
+///
+/// 两者分开存，是为了「重新扫描」不会把用户手动加的条目冲掉。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct LibraryCache {
+    /// 上次扫描完成的时间（UTC，空表示没扫过）
+    #[serde(default)]
+    pub scanned_at: String,
+    #[serde(default)]
+    pub scanned: Vec<CachedRow>,
+    #[serde(default)]
+    pub manual: Vec<CachedRow>,
+}
+
+const LIBRARY_NAME: &str = "game_library.json";
+
+/// 缓存文件位置：和配置文件放在一起（便携版就在 exe 旁边）。
+pub fn library_path() -> PathBuf {
+    crate::util::config_path().with_file_name(LIBRARY_NAME)
+}
+
+pub fn load_library() -> LibraryCache {
+    load_library_from(&library_path())
+}
+
+pub fn save_library(c: &LibraryCache) -> anyhow::Result<()> {
+    save_library_from(&library_path(), c)
+}
+
+/// 指定路径的版本，自测用（不去碰用户真正的游戏库文件）。
+pub fn load_library_from(p: &Path) -> LibraryCache {
+    std::fs::read_to_string(p)
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default()
+}
+
+pub fn save_library_from(p: &Path, c: &LibraryCache) -> anyhow::Result<()> {
+    let t = serde_json::to_string_pretty(c)?;
+    std::fs::write(p, t)?;
+    Ok(())
+}
+
+/// 手动条目：用户把当前目录存进游戏库时构造。
+/// 名字取目录名，装的就是用户选的那个目录本身（不去猜渲染 EXE 在哪一级）。
+pub fn manual_entry(dir: &Path) -> GameEntry {
+    let name = dir
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| dir.display().to_string());
+    GameEntry {
+        source: Launcher::Manual,
+        app_id: String::new(),
+        name,
+        install_dir: dir.to_path_buf(),
+    }
 }
 
 // ---------------------------------------------------------------- 最小 VDF 解析

@@ -1237,6 +1237,106 @@ fn selftest() {
         "INI 里没有 Router 项时，SM75 部署不再失败（原样部署）",
     );
 
+    println!("\n--- 游戏库缓存（下次打开不用再扫一遍）---");
+    {
+        let dir = std::env::temp_dir().join("fgm-lib-selftest");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+        let dead = dir.join("这个游戏已经卸载了");
+        let cache = scan::LibraryCache {
+            scanned_at: "2026-01-01 00:00 UTC".to_owned(),
+            scanned: vec![
+                scan::CachedRow {
+                    entry: GameEntry {
+                        source: scan::Launcher::Steam,
+                        app_id: "1".to_owned(),
+                        name: "还在的游戏".to_owned(),
+                        install_dir: dir.clone(),
+                    },
+                    render_exe: None,
+                    ac: AcTier::UserMode,
+                },
+                scan::CachedRow {
+                    entry: GameEntry {
+                        source: scan::Launcher::Epic,
+                        app_id: "2".to_owned(),
+                        name: "卸载了的游戏".to_owned(),
+                        install_dir: dead.clone(),
+                    },
+                    render_exe: None,
+                    ac: AcTier::None,
+                },
+            ],
+            manual: vec![scan::CachedRow {
+                entry: scan::manual_entry(&dead),
+                render_exe: None,
+                ac: AcTier::None,
+            }],
+        };
+        let p = dir.join("game_library.json");
+        let wrote = scan::save_library_from(&p, &cache).is_ok();
+        let back = scan::load_library_from(&p);
+        ck(&mut fails, wrote && p.is_file(), "游戏库缓存能写进文件");
+        ck(
+            &mut fails,
+            back.scanned.len() == 2 && back.manual.len() == 1,
+            "缓存读回来条目数量一致",
+        );
+        ck(
+            &mut fails,
+            back.scanned[0].ac == AcTier::UserMode
+                && back.scanned[1].entry.name == "卸载了的游戏",
+            "反作弊等级和名字都留下来了",
+        );
+        ck(
+            &mut fails,
+            back.scanned_at == "2026-01-01 00:00 UTC",
+            "上次扫描的时间留下来了",
+        );
+        ck(
+            &mut fails,
+            App::build_cached_row(&back.scanned[1], false).is_none(),
+            "扫出来的条目：目录没了就丢掉（游戏卸载了）",
+        );
+        ck(
+            &mut fails,
+            App::build_cached_row(&back.manual[0], true).is_some(),
+            "手动条目：目录没了也留着，让用户自己决定要不要移除",
+        );
+        if let Some(row) = App::build_cached_row(&back.manual[0], true) {
+            ck(
+                &mut fails,
+                row.target == dead && row.manual,
+                "手动条目的部署目标 = 用户存的目录本身",
+            );
+        }
+        ck(
+            &mut fails,
+            scan::manual_entry(Path::new("D:\\Games\\My Game")).name == "My Game",
+            "手动条目的名字取目录名",
+        );
+
+        // 飞行动画的插值：端点必须落在起止矩形上（自测不开窗口也能验）
+        let f = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(100.0, 50.0));
+        let t = egui::Rect::from_min_max(egui::pos2(200.0, 100.0), egui::pos2(300.0, 200.0));
+        let near = |a: egui::Rect, b: egui::Rect| {
+            (a.min.x - b.min.x).abs() < 0.01
+                && (a.min.y - b.min.y).abs() < 0.01
+                && (a.max.x - b.max.x).abs() < 0.01
+                && (a.max.y - b.max.y).abs() < 0.01
+        };
+        ck(&mut fails, near(fly_lerp(f, t, 0.0), f), "飞行动画：起点对得上");
+        ck(&mut fails, near(fly_lerp(f, t, 1.0), t), "飞行动画：终点对得上");
+        let mid = fly_lerp(f, t, 0.5).center();
+        ck(
+            &mut fails,
+            (mid.x - 150.0).abs() < 0.01 && (mid.y - 87.5).abs() < 0.01,
+            "飞行动画：中点确实在中途",
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     if !fails.is_empty() {
         println!("\n  ★ 有 {} 项断言失败", fails.len());
         for f in &fails {
@@ -1871,6 +1971,51 @@ struct GameRow {
     deployed: deploy::DeployState,
     /// 从渲染 EXE 提取出来的图标（RGBA）
     icon: Option<icon::IconImage>,
+    /// 点「用作部署目录」时真正要用的目录。
+    /// 扫出来的游戏 = 渲染 EXE 所在目录；手动加的 = 用户当时选的那个目录本身。
+    target: PathBuf,
+    /// 用户自己「存到游戏库」的条目（可以移除）
+    manual: bool,
+}
+
+/// 选中游戏后「飞向目标目录」的那张小卡片。
+///
+/// 只在动画的这 0.45 秒里请求重绘，动画结束就停止 —— 不做常驻动画。
+struct FlyAnim {
+    from: egui::Rect,
+    to: egui::Rect,
+    label: String,
+    color: egui::Color32,
+    t0: std::time::Instant,
+}
+
+/// 飞行动画时长（秒）
+const FLY_SECS: f32 = 0.45;
+/// 落地后目标卡片高亮多久（秒）
+const FLASH_SECS: f32 = 0.8;
+
+/// 飞行动画的插值：e=0 在起点，e=1 到终点。
+///
+/// 中途把尺寸缩到 38% 再放大 —— 看起来像「这张卡片被拎起来飞过去」，
+/// 而不是一块和两边一样大的色块横穿界面。位置仍然是中心的线性插值，
+/// 所以 e=0 正好是起点矩形、e=1 正好是终点矩形（自测就验这两个端点）。
+fn fly_lerp(from: egui::Rect, to: egui::Rect, e: f32) -> egui::Rect {
+    let lerp = |a: f32, b: f32| a + (b - a) * e;
+    let cx = lerp(from.center().x, to.center().x);
+    let cy = lerp(from.center().y, to.center().y);
+    let shrink = 1.0 - 0.62 * (4.0 * e * (1.0 - e));
+    let w = lerp(from.width(), to.width()) * shrink;
+    let h = lerp(from.height(), to.height()) * shrink;
+    egui::Rect::from_center_size(egui::pos2(cx, cy), egui::vec2(w, h))
+}
+
+/// 界面行 -> 缓存里的一行（存盘用）
+fn row_to_cached(r: &GameRow) -> scan::CachedRow {
+    scan::CachedRow {
+        entry: r.entry.clone(),
+        render_exe: r.render_exe.clone(),
+        ac: r.ac,
+    }
 }
 
 /// 资产清单里一行的状态
@@ -1923,7 +2068,12 @@ struct UpdateSummary {
 }
 
 enum Msg {
+    /// 扫描完成
     Scanned(Vec<GameRow>),
+    /// 启动时从缓存里恢复出来的游戏库（行 / 扫描时间 / 丢掉了几个失效条目）
+    LibraryLoaded(Vec<GameRow>, String, usize),
+    /// 后台跑完的深度反作弊扫描（带着目录，用来丢弃过期的结果）
+    AcScanned(PathBuf, AcReport),
     UpdateChecked(UpdateSummary),
     /// 文案 / 总进度 / 总字节数（0 表示还没算出来）
     Progress(String, f32, u64),
@@ -1953,9 +2103,22 @@ struct App {
 
     games: Vec<GameRow>,
     scanned: bool,
+    /// 上次扫描完成的时间（显示用）
+    scanned_at: String,
+    /// 用户手动存进游戏库的条目。单独存一份，重新扫描不会冲掉它们。
+    manual: Vec<scan::CachedRow>,
 
     ac_target: Option<AcReport>,
+    /// 反作弊深度扫描正在后台跑（徽章先显示「分析中」）
+    ac_scanning: bool,
     ac_system: AcReport,
+
+    /// 正在飞的选中动画
+    fly: Option<FlyAnim>,
+    /// 「目标目录」卡片这一帧的矩形（动画要飞过去）
+    target_card_rect: Option<egui::Rect>,
+    /// 目标卡片高亮到什么时候（飞行动画落地后闪一下）
+    flash_until: Option<std::time::Instant>,
 
     deploy_state: deploy::DeployState,
     update_state: update::UpdateState,
@@ -2070,7 +2233,7 @@ impl App {
             format!("就绪（{}）", boot_notes.join("；"))
         };
 
-        Self {
+        let mut app = Self {
             ctx: cc.egui_ctx.clone(),
             tx,
             rx,
@@ -2079,9 +2242,15 @@ impl App {
             proxy: scan::PROXY_PRIORITY[0].to_owned(),
             games: Vec::new(),
             scanned: false,
+            scanned_at: String::new(),
+            manual: Vec::new(),
             ac_target: None,
+            ac_scanning: false,
             // 枚举注册表很快，同步做完即可
             ac_system: anticheat::scan_system(),
+            fly: None,
+            target_card_rect: None,
+            flash_until: None,
             deploy_state: deploy::DeployState::NotDeployed,
             update_state: update::load_state(),
             update_summary: None,
@@ -2143,7 +2312,181 @@ impl App {
             dl_done: 0,
             ini_changes: Vec::new(),
             icon_textures: HashMap::new(),
+        };
+        // 上次扫过的游戏库直接摆出来，不用用户再点一次「扫描」
+        app.load_cached_library();
+        app
+    }
+
+    /// 一个游戏条目 -> 界面行：找渲染 EXE、判反作弊、看部署状态、取图标。
+    /// known_exe 是缓存里记着的渲染 EXE —— 还在就直接用，省掉遍历游戏目录。
+    fn build_row_with(entry: GameEntry, manual: bool, known_exe: Option<PathBuf>) -> GameRow {
+        let render_exe = match known_exe {
+            Some(p) if p.is_file() => Some(p),
+            _ => scan::find_render_exe(&entry.install_dir),
+        };
+        // 除了游戏根目录，还要看渲染 EXE 所在目录：
+        // BattlEye 经常埋在 ...\Binaries\Win64\BattlEye，只看根目录会漏
+        let mut rep = anticheat::scan_game_dir(&entry.install_dir);
+        if let Some(dir) = render_exe.as_ref().and_then(|p| p.parent()) {
+            rep.merge(anticheat::scan_game_dir(dir));
         }
+        let ac = rep.verdict();
+        // 关键：mod 文件在渲染 EXE 目录，不是游戏根目录。
+        // 手动加的条目例外 —— 用户选的那个目录就是部署目标，不去猜是哪一级。
+        let target = if manual {
+            entry.install_dir.clone()
+        } else {
+            render_exe
+                .as_ref()
+                .and_then(|p| p.parent())
+                .map(|d| d.to_path_buf())
+                .unwrap_or_else(|| entry.install_dir.clone())
+        };
+        let deployed = deploy::state_of(&target);
+        let icon_img = render_exe.as_deref().and_then(icon::icon_of);
+        GameRow {
+            entry,
+            ac,
+            render_exe,
+            deployed,
+            icon: icon_img,
+            target,
+            manual,
+        }
+    }
+
+    fn build_row(entry: GameEntry, manual: bool) -> GameRow {
+        Self::build_row_with(entry, manual, None)
+    }
+
+    /// 缓存条目 -> 界面行。安装目录已经不在的（游戏卸载了）扫出来的条目直接丢掉；
+    /// 手动加的条目留着，让用户自己决定要不要移除（可能是移动硬盘没插上）。
+    fn build_cached_row(c: &scan::CachedRow, manual: bool) -> Option<GameRow> {
+        if !c.entry.install_dir.is_dir() && !manual {
+            return None;
+        }
+        Some(Self::build_row_with(
+            c.entry.clone(),
+            manual,
+            c.render_exe.clone(),
+        ))
+    }
+
+    /// 启动时把上次的扫描结果读出来显示。只读本地缓存：不联网、不在后台反复轮询，
+    /// 想刷新还是得点「扫描」。
+    fn load_cached_library(&mut self) {
+        let cache = scan::load_library();
+        if cache.scanned.is_empty() && cache.manual.is_empty() {
+            return;
+        }
+        self.manual = cache.manual.clone();
+        self.scanned_at = cache.scanned_at.clone();
+        self.scanned = true;
+        self.status = "已载入上次的扫描结果（要刷新请点「扫描」）".to_owned();
+        let (scanned, manual, at) = (cache.scanned, cache.manual, cache.scanned_at);
+        self.spawn(move |tx, ctx| {
+            let mut dropped = 0usize;
+            let mut rows: Vec<GameRow> = Vec::new();
+            for c in &scanned {
+                match App::build_cached_row(c, false) {
+                    Some(r) => rows.push(r),
+                    None => dropped += 1,
+                }
+            }
+            for c in &manual {
+                if let Some(r) = App::build_cached_row(c, true) {
+                    rows.push(r);
+                }
+            }
+            let _ = tx.send(Msg::LibraryLoaded(rows, at, dropped));
+            ctx.request_repaint();
+        });
+    }
+
+    /// 把当前游戏库写进缓存：扫出来的条目现写，手动条目原样保留。
+    fn persist_library(&mut self) {
+        let scanned: Vec<scan::CachedRow> = self
+            .games
+            .iter()
+            .filter(|r| !r.manual)
+            .map(row_to_cached)
+            .collect();
+        let cache = scan::LibraryCache {
+            scanned_at: self.scanned_at.clone(),
+            scanned,
+            manual: self.manual.clone(),
+        };
+        if let Err(e) = scan::save_library(&cache) {
+            self.note(format!("保存游戏库缓存失败（下次打开不会自动显示）: {e}"));
+        }
+    }
+
+    /// 把当前目录存进游戏库（手动条目）。
+    fn add_to_library(&mut self) {
+        let Some(dir) = self.game_dir.clone() else {
+            self.status = "先选一个目录，再存进游戏库".to_owned();
+            return;
+        };
+        if self
+            .games
+            .iter()
+            .any(|r| r.entry.install_dir == dir || r.target == dir)
+        {
+            self.status = "这个目录已经在游戏库里了".to_owned();
+            return;
+        }
+        let entry = scan::manual_entry(&dir);
+        let name = entry.name.clone();
+        let cached = scan::CachedRow {
+            entry,
+            render_exe: scan::find_render_exe(&dir),
+            ac: self
+                .ac_target
+                .as_ref()
+                .map(|r| r.verdict())
+                .unwrap_or(AcTier::None),
+        };
+        if let Some(row) = Self::build_cached_row(&cached, true) {
+            self.games.push(row);
+        }
+        self.manual.push(cached);
+        self.scanned = true;
+        self.status = format!("已把「{name}」存进游戏库");
+        self.note(format!("存进游戏库：{}", dir.display()));
+        self.persist_library();
+    }
+
+    fn remove_from_library(&mut self, dir: &Path) {
+        self.manual.retain(|c| c.entry.install_dir != dir);
+        self.games.retain(|r| !(r.manual && r.entry.install_dir == dir));
+        self.status = "已从游戏库移除（游戏目录里的文件没动）".to_owned();
+        self.note(format!("从游戏库移除：{}", dir.display()));
+        self.persist_library();
+    }
+
+    /// 让被选中的那张卡片飞向「目标目录」卡片。
+    /// 目标卡片这一帧已经画过了（右侧面板先于中央列表绘制），所以矩形是新鲜的。
+    fn start_fly(&mut self, from: egui::Rect, label: String, color: egui::Color32) {
+        let Some(to) = self.target_card_rect else {
+            return;
+        };
+        let now = std::time::Instant::now();
+        // 目标卡片被滚出可视区时不做飞行（画到屏幕外反而更让人迷惑），只闪一下
+        if !self.ctx.input(|i| i.viewport_rect()).intersects(to) {
+            self.flash_until = Some(now + std::time::Duration::from_secs_f32(FLASH_SECS));
+            return;
+        }
+        self.fly = Some(FlyAnim {
+            from,
+            to,
+            label,
+            color,
+            t0: now,
+        });
+        self.flash_until =
+            Some(now + std::time::Duration::from_secs_f32(FLY_SECS + FLASH_SECS));
+        self.ctx.request_repaint();
     }
 
     fn spawn<F>(&self, f: F)
@@ -2170,19 +2513,25 @@ impl App {
     }
 
     fn set_game_dir(&mut self, dir: PathBuf) {
-        // 这是真正要写入的目录，用深度扫描
-        self.ac_target = Some(anticheat::scan_deep(&dir));
+        // 先做便宜的事：部署状态、入口推断 —— 点下去立刻就有反应。
+        // 反作弊深度扫描要遍历整个目录，放后台（徽章先显示「分析中」）。
         self.deploy_state = deploy::state_of(&dir);
         self.manual_path = dir.display().to_string();
-        self.game_dir = Some(dir);
+        self.game_dir = Some(dir.clone());
         self.redetect();
-        self.status = format!(
-            "已选择 {}",
-            self.game_dir
-                .as_ref()
-                .map(|p| p.display().to_string())
-                .unwrap_or_default()
-        );
+        self.status = format!("已选择 {}", dir.display());
+        self.ac_target = None;
+        self.start_ac_scan(dir);
+    }
+
+    /// 后台跑一次深度反作弊扫描，结果回来再更新徽章。
+    fn start_ac_scan(&mut self, dir: PathBuf) {
+        self.ac_scanning = true;
+        self.spawn(move |tx, ctx| {
+            let rep = anticheat::scan_deep(&dir);
+            let _ = tx.send(Msg::AcScanned(dir, rep));
+            ctx.request_repaint();
+        });
     }
 
     /// 资产当前状态。**只看本地文件 + 下载记录，不查网络。**
@@ -2318,17 +2667,47 @@ impl App {
         self.update_state = update::load_state();
         if let Some(d) = self.game_dir.clone() {
             self.deploy_state = deploy::state_of(&d);
-            self.ac_target = Some(anticheat::scan_deep(&d));
+            self.ac_target = None;
+            self.start_ac_scan(d);
         }
     }
 
     fn handle(&mut self, msg: Msg) {
         match msg {
             Msg::Scanned(rows) => {
-                self.status = format!("扫描完成，共 {} 个游戏", rows.len());
+                // 手动条目接在扫描结果后面 —— 重新扫描绝不能把它们冲掉
+                let manual_rows: Vec<GameRow> = self
+                    .manual
+                    .iter()
+                    .filter_map(|c| App::build_cached_row(c, true))
+                    .collect();
+                let n = rows.len();
                 self.games = rows;
+                self.games.extend(manual_rows);
                 self.scanned = true;
                 self.busy = false;
+                self.scanned_at = util::now_utc();
+                self.status = format!("扫描完成，共 {n} 个游戏");
+                // 顺手把这次的结果留给下一次启动用
+                self.persist_library();
+            }
+            Msg::LibraryLoaded(rows, at, dropped) => {
+                let n = rows.len();
+                self.games = rows;
+                self.scanned = true;
+                self.scanned_at = at;
+                self.status = if dropped > 0 {
+                    format!("已载入上次的扫描结果：{n} 个游戏（{dropped} 个目录已不存在，已跳过）")
+                } else {
+                    format!("已载入上次的扫描结果：{n} 个游戏（要刷新请点「扫描」）")
+                };
+            }
+            Msg::AcScanned(dir, rep) => {
+                self.ac_scanning = false;
+                // 用户可能已经换了目录，过期的结果丢掉
+                if self.game_dir.as_deref() == Some(dir.as_path()) {
+                    self.ac_target = Some(rep);
+                }
             }
             Msg::UpdateChecked(s) => {
                 self.status = "更新检查完成".to_owned();
@@ -2571,32 +2950,7 @@ impl App {
         self.spawn(|tx, ctx| {
             let rows: Vec<GameRow> = scan::scan_all()
                 .into_iter()
-                .map(|entry| {
-                    let render_exe = scan::find_render_exe(&entry.install_dir);
-                    // 除了游戏根目录，还要看渲染 EXE 所在目录：
-                    // BattlEye 经常埋在 ...\Binaries\Win64\BattlEye，只看根目录会漏
-                    let mut rep = anticheat::scan_game_dir(&entry.install_dir);
-                    if let Some(dir) = render_exe.as_ref().and_then(|p| p.parent()) {
-                        rep.merge(anticheat::scan_game_dir(dir));
-                    }
-                    let ac = rep.verdict();
-                    // 关键：mod 文件在渲染 EXE 目录，不是游戏根目录，
-                    // 用根目录判断会一律显示「未部署」
-                    let target = render_exe
-                        .as_ref()
-                        .and_then(|p| p.parent())
-                        .map(|d| d.to_path_buf())
-                        .unwrap_or_else(|| entry.install_dir.clone());
-                    let deployed = deploy::state_of(&target);
-                    let icon_img = render_exe.as_deref().and_then(icon::icon_of);
-                    GameRow {
-                        entry,
-                        ac,
-                        render_exe,
-                        deployed,
-                        icon: icon_img,
-                    }
-                })
+                .map(|entry| App::build_row(entry, false))
                 .collect();
             let _ = tx.send(Msg::Scanned(rows));
             ctx.request_repaint();
@@ -3254,7 +3608,7 @@ impl eframe::App for App {
                 ui.spacing_mut().item_spacing = egui::vec2(8.0, 10.0);
 
                 // --- 目标目录
-                theme::card(ui, |ui| {
+                let (_, target_rect) = theme::card_rect(ui, |ui| {
                     theme::card_title(ui, "目标目录");
                     let path = self.game_dir.clone();
                     ui.label(match &path {
@@ -3277,6 +3631,17 @@ impl eframe::App for App {
                                 open_in_explorer(p);
                             }
                         }
+                        // 存进游戏库：下次打开直接能在列表里点它，重新扫描也不会丢
+                        if theme::ghost_button(
+                            ui,
+                            "存到游戏库",
+                            !self.busy && self.game_dir.is_some(),
+                        )
+                        .on_hover_text("把这个目录记进游戏库，以后直接从列表里选；重新扫描也不会丢")
+                        .clicked()
+                        {
+                            self.add_to_library();
+                        }
                     });
                     ui.horizontal(|ui| {
                         ui.add(
@@ -3294,6 +3659,8 @@ impl eframe::App for App {
                         }
                     });
                 });
+                // 飞行动画的落点就是这个卡片（下一帧的选中动画要用）
+                self.target_card_rect = Some(target_rect);
 
                 // --- 上游资产（放在部署上方，因为必须先把资产下下来）
                 theme::card(ui, |ui| {
@@ -3892,7 +4259,11 @@ impl eframe::App for App {
                     theme::card_title(ui, "反作弊检查");
                     match &self.ac_target {
                         None => {
-                            ui.label(theme::hint("选择目录后自动检测。"));
+                            ui.label(theme::hint(if self.ac_scanning {
+                                "正在后台分析反作弊（不影响你继续操作）..."
+                            } else {
+                                "选择目录后自动检测。"
+                            }));
                         }
                         Some(r) => {
                             let t = r.verdict();
@@ -4196,6 +4567,9 @@ impl eframe::App for App {
                 if self.scanned {
                     theme::badge(ui, &format!("{} 个", self.games.len()), theme::NEUTRAL);
                 }
+                if self.scanned && !self.scanned_at.is_empty() {
+                    ui.label(theme::hint(format!("上次扫描 {}", self.scanned_at)));
+                }
             });
             ui.add_space(10.0);
 
@@ -4206,13 +4580,19 @@ impl eframe::App for App {
                 return;
             }
 
-            let mut pick: Option<PathBuf> = None;
+            // 选中的那个游戏要飞向「目标目录」卡片，所以把名字和颜色一起记下来。
+            // 起飞矩形要等卡片画完才有（card_rect 的返回值），所以单独存一个。
+            let mut pick: Option<(PathBuf, String, egui::Color32)> = None;
+            let mut pick_rect: Option<egui::Rect> = None;
             let mut open: Option<PathBuf> = None;
+            let mut remove: Option<PathBuf> = None;
 
             egui::ScrollArea::vertical().show(ui, |ui| {
                 for row in &self.games {
                     let color = theme::tier_color(row.ac);
                     let icon_key = row.entry.install_dir.display().to_string();
+                    // 当前部署目标就是这个游戏 —— 列表里要一直看得出来
+                    let selected = self.game_dir.as_deref() == Some(row.target.as_path());
                     let (_, rect) = theme::card_rect(ui, |ui| {
                         ui.horizontal(|ui| {
                             // 游戏图标（从渲染 EXE 提取）
@@ -4236,6 +4616,9 @@ impl eframe::App for App {
                                     .strong(),
                             );
                             theme::badge(ui, row.entry.source.label(), theme::NEUTRAL);
+                            if selected {
+                                theme::badge(ui, "已选中", theme::ACCENT);
+                            }
                             theme::badge(
                                 ui,
                                 &row.deployed.label(),
@@ -4248,37 +4631,51 @@ impl eframe::App for App {
                                 ));
                             });
                         });
-                        ui.label(match &row.render_exe {
-                            Some(p) => theme::path_text(format!("渲染 EXE   {}", p.display())),
-                            None => theme::hint("渲染 EXE   未找到（可手动选择其所在目录）"),
-                        });
+                        if row.manual {
+                            // 手动条目存的就是这个目录本身，没有「渲染 EXE 是哪一级」的推断
+                            ui.label(theme::hint(format!("手动添加   部署目标 {}", row.target.display())));
+                        } else {
+                            ui.label(match &row.render_exe {
+                                Some(p) => theme::path_text(format!("渲染 EXE   {}", p.display())),
+                                None => theme::hint("渲染 EXE   未找到（可手动选择其所在目录）"),
+                            });
+                        }
                         ui.add_space(2.0);
                         ui.horizontal(|ui| {
                             // 关键：部署目标必须是「渲染 EXE 所在目录」，不是游戏根目录。
                             // mod 文件放错地方游戏根本不会加载；早先这里传的是根目录，
                             // 导致选中后部署卡片去根目录找文件，一律显示「未部署」。
-                            let target_dir = row
-                                .render_exe
-                                .as_ref()
-                                .and_then(|p| p.parent())
-                                .map(|d| d.to_path_buf())
-                                .unwrap_or_else(|| row.entry.install_dir.clone());
-                            let has_exe = row.render_exe.is_some();
+                            // 部署目标由行构建时算好存进 row.target：
+                            // 扫出来的游戏是渲染 EXE 所在目录，手动条目就是用户存的那个目录。
+                            let target_dir = row.target.clone();
+                            // 手动条目即使找不到渲染 EXE 也能部署 —— 目录是用户自己指的
+                            let has_exe = row.render_exe.is_some() || row.manual;
                             if theme::primary_button(ui, "用作部署目录", !self.busy && has_exe)
-                                .on_hover_text(if has_exe {
+                                .on_hover_text(if row.manual {
+                                    "把 mod 部署到你存进游戏库的这个目录"
+                                } else if has_exe {
                                     "把 mod 部署到渲染 EXE 所在目录"
                                 } else {
                                     "没找到渲染 EXE，请手动选择它所在目录"
                                 })
                                 .clicked()
                             {
-                                pick = Some(target_dir.clone());
+                                pick = Some((target_dir.clone(), row.entry.name.clone(), color));
                             }
                             if theme::ghost_button(ui, "打开文件夹", true).clicked() {
                                 open = Some(target_dir.clone());
                             }
+                            if row.manual
+                                && theme::ghost_button(ui, "移除", !self.busy).clicked()
+                            {
+                                remove = Some(row.entry.install_dir.clone());
+                            }
                         });
                     });
+
+                    if pick.is_some() {
+                        pick_rect = Some(rect);
+                    }
 
                     // 卡片左侧的等级色条，用卡片实际矩形画，高度自动跟随内容
                     ui.painter().rect_filled(
@@ -4295,15 +4692,32 @@ impl eframe::App for App {
                         color,
                     );
 
+                    // 选中的那一行描一圈主题色边 —— 这是长期可见的「就是这个游戏」提示
+                    if selected {
+                        ui.painter().rect_stroke(
+                            rect,
+                            egui::CornerRadius::same(theme::R_CARD),
+                            egui::Stroke::new(1.5, theme::ACCENT),
+                            egui::StrokeKind::Inside,
+                        );
+                    }
+
                     ui.add_space(10.0);
                 }
             });
 
-            if let Some(p) = pick {
+            if let Some((p, name, color)) = pick {
+                // 先切换目标目录（点下去立刻生效），再放动画
                 self.set_game_dir(p);
+                if let Some(r) = pick_rect {
+                    self.start_fly(r, name, color);
+                }
             }
             if let Some(p) = open {
                 open_in_explorer(&p);
+            }
+            if let Some(p) = remove {
+                self.remove_from_library(&p);
             }
         });
 
@@ -4584,6 +4998,75 @@ impl eframe::App for App {
                 }
             } else if ok {
                 self.hags_prompt = false;
+            }
+        }
+
+        // ---------------- 选中动画：卡片从游戏库飞向「目标目录」
+        self.draw_fly_and_flash();
+    }
+}
+
+impl App {
+    /// 画飞行动画和落地高亮。只在动画期间请求重绘，动画结束立刻停 —— 不做常驻动画，
+    /// 空闲时一帧都不多画（这个程序的卖点之一是轻量）。
+    fn draw_fly_and_flash(&mut self) {
+        if let Some(f) = &self.fly {
+            let t = (f.t0.elapsed().as_secs_f32() / FLY_SECS).clamp(0.0, 1.0);
+            if t >= 1.0 {
+                self.fly = None;
+            } else {
+                // smoothstep：起步慢、中间快、落地缓
+                let e = t * t * (3.0 - 2.0 * t);
+                let pos = fly_lerp(f.from, f.to, e);
+                let alpha = ((1.0 - 0.25 * e) * 235.0) as u8;
+                let fill = egui::Color32::from_rgba_unmultiplied(
+                    f.color.r(),
+                    f.color.g(),
+                    f.color.b(),
+                    alpha,
+                );
+                let painter = self.ctx.layer_painter(egui::LayerId::new(
+                    egui::Order::Foreground,
+                    egui::Id::new("fgm-fly"),
+                ));
+                painter.rect_filled(pos, egui::CornerRadius::same(theme::R_CARD), fill);
+                painter.rect_stroke(
+                    pos,
+                    egui::CornerRadius::same(theme::R_CARD),
+                    egui::Stroke::new(1.5, f.color),
+                    egui::StrokeKind::Inside,
+                );
+                // 方块太小的时候不写字，免得挤成一团
+                if pos.height() >= 20.0 {
+                    painter.text(
+                        pos.center(),
+                        egui::Align2::CENTER_CENTER,
+                        &f.label,
+                        egui::FontId::proportional(12.0),
+                        egui::Color32::WHITE,
+                    );
+                }
+                self.ctx.request_repaint();
+            }
+        }
+
+        if let Some(until) = self.flash_until {
+            if std::time::Instant::now() < until {
+                if let Some(r) = self.target_card_rect {
+                    let painter = self.ctx.layer_painter(egui::LayerId::new(
+                        egui::Order::Foreground,
+                        egui::Id::new("fgm-flash"),
+                    ));
+                    painter.rect_stroke(
+                        r,
+                        egui::CornerRadius::same(theme::R_CARD),
+                        egui::Stroke::new(2.0, theme::ACCENT),
+                        egui::StrokeKind::Inside,
+                    );
+                }
+                self.ctx.request_repaint();
+            } else {
+                self.flash_until = None;
             }
         }
     }
