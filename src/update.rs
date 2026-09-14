@@ -32,16 +32,44 @@ pub const REPO: &str = "sdli1995/dlssg_for_sm86";
 pub const BRANCH: &str = "main";
 pub const INI_REPO_PATH: &str = "dlssg_sm86.ini";
 
+/// 老版 native 包在仓库里的位置。
+/// 上游 0.3.0 把模式从 native 改回代理，native 版被挪到 archive/0.2.4/；
+/// 新版只面向 RTX 30 系（SM86），RTX 20 / GTX 16 系仍然要用 native 版。
+pub const LEGACY_PREFIX: &str = "archive/0.2.4/";
+
 /// 代理入口 -> 仓库里的路径。
-/// 关键：altnative/ 下的四个不是 version.dll 改个名，而是导出名不同的独立二进制
+///
+/// 关键：备用入口不是 version.dll 改个名，而是导出名不同的独立二进制
 /// （体积都不一样），所以必须下载对应那一个，不能拿 version.dll 重命名。
-pub fn proxy_repo_path(proxy: &str) -> &'static str {
+///
+/// 上游 0.3.0 把它们放在 alternatives/，去掉了 winhttp、新增 dbghelp 与 d3d12；
+/// 老版 native 包放在 archive/0.2.4/altnative/。
+pub fn proxy_repo_path(proxy: &str, legacy: bool) -> &'static str {
+    if legacy {
+        return match proxy {
+            "winmm.dll" => "archive/0.2.4/altnative/winmm.dll",
+            "dinput8.dll" => "archive/0.2.4/altnative/dinput8.dll",
+            "winhttp.dll" => "archive/0.2.4/altnative/winhttp.dll",
+            "dxgi.dll" => "archive/0.2.4/altnative/dxgi.dll",
+            _ => "archive/0.2.4/version.dll",
+        };
+    }
     match proxy {
-        "winmm.dll" => "altnative/winmm.dll",
-        "dinput8.dll" => "altnative/dinput8.dll",
-        "winhttp.dll" => "altnative/winhttp.dll",
-        "dxgi.dll" => "altnative/dxgi.dll",
+        "winmm.dll" => "alternatives/winmm.dll",
+        "dbghelp.dll" => "alternatives/dbghelp.dll",
+        "dinput8.dll" => "alternatives/dinput8.dll",
+        "dxgi.dll" => "alternatives/dxgi.dll",
+        "d3d12.dll" => "alternatives/d3d12.dll",
         _ => "version.dll",
+    }
+}
+
+/// INI 在仓库里的路径（老版 native 包的在 archive/0.2.4/ 下）。
+pub fn ini_repo_path(legacy: bool) -> &'static str {
+    if legacy {
+        "archive/0.2.4/dlssg_sm86.ini"
+    } else {
+        INI_REPO_PATH
     }
 }
 
@@ -62,6 +90,13 @@ pub struct RemoteFile {
     pub size: u64,
     /// 内容的 SHA-256（64 位小写十六进制）。来自响应头的 ETag。
     pub etag: String,
+    /// 这个指纹**是不是官方源给的**。
+    ///
+    /// 镜像给的指纹和官方对不上（实测 gh-proxy.com 返回的是弱标签
+    /// `W/"11378bae..."`，内容哈希也完全是另一个值）。拿镜像的指纹去比"内容变没变"，
+    /// 就会出现「同一个文件每次都被判定为需要更新」—— 也就是用户报的
+    /// 「不断重复下载、停不下来」。所以指纹只在可信时参与判定。
+    pub etag_trusted: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -92,21 +127,26 @@ impl UpdateState {
     ///
     /// 老版本的记录里没有 etag 字段，这时按「需要更新」处理，
     /// 重新下载一次就会补上，属于一次性成本。
-    pub fn needs_update(&self, local_name: &str, remote_etag: &str) -> bool {
-        self.files
-            .get(local_name)
-            .map(|l| l.etag.is_empty() || !l.etag.eq_ignore_ascii_case(remote_etag))
-            .unwrap_or(true)
+    pub fn needs_update(&self, local_name: &str, remote: &RemoteFile) -> bool {
+        let Some(l) = self.files.get(local_name) else {
+            return true;
+        };
+        // 同上：指纹不可信时不凭它说「有更新」
+        if !remote.etag_trusted {
+            return false;
+        }
+        l.etag.is_empty() || !l.etag.eq_ignore_ascii_case(&remote.etag)
     }
 }
 
 pub fn client() -> Result<reqwest::blocking::Client> {
     reqwest::blocking::Client::builder()
         .user_agent(USER_AGENT)
-        // 总超时只用来兜底「服务器彻底不响应」。判「慢」交给看门狗
-        // （见 WATCHDOG_* / min_kbps），它在 3 秒内就能把慢源踢掉，
-        // 比让用户干等一个总超时有用得多。
-        // 300 秒是按最坏情况算的：28.9 MB 的运行库压缩包在 300 KB/s 下约 96 秒。
+        // 对下载来说这个值是「单次读取」的上限，不是整段下载的总上限：
+        // reqwest 的阻塞读每调用一次就重新计时，所以只要服务器还在往外吐字节，
+        // 多慢都能慢慢下完 —— 用户线路慢不该被掐断。
+        // （曾经按「平均速度低于 300 KB/s 就换源」，有用户因此下到四分之一就断了。）
+        // 它现在只兜底一件事：源彻底不动了 —— 连续 300 秒一个字节都没有才判它死。
         .timeout(Duration::from_secs(300))
         // 连接超时别设太长：源被墙时每个候选都要空等这么久。
         // 能用的源 1 秒内就连上了，8 秒足够宽容。
@@ -319,7 +359,7 @@ fn content_length_of(resp: &reqwest::blocking::Response) -> u64 {
 pub fn probe_remote(client: &reqwest::blocking::Client, repo_path: &str) -> Result<RemoteFile> {
     let official = official_url(repo_path);
     let ms = mirrors("");
-    try_sources(&official, &ms, false, None, |url, _src| {
+    try_sources(&official, &ms, false, None, |url, prefix| {
         let resp = client
             .head(url)
             // 单个 HEAD 只有 1KB 不到，6 秒足够。raw 现在会间歇性卡十几秒，
@@ -336,28 +376,63 @@ pub fn probe_remote(client: &reqwest::blocking::Client, repo_path: &str) -> Resu
             name: repo_path.to_owned(),
             size,
             etag,
+            // prefix 为空 = 官方源回答的，指纹可信
+            etag_trusted: prefix.is_empty(),
         })
     })
     .map_err(|e| anyhow::anyhow!("拿不到 {repo_path} 的内容指纹（{e}）"))
 }
 
-/// 版本号同时出现在两处，格式略有不同：
+/// 从仓库文件里抠出上游版本号。
+///
+/// 0.2.4（native）两处都写成 "Native 0.2.4"：
 ///   README 首行  "# DLSSG Native 0.2.4"
 ///   INI 首行注释 "; Native 0.2.4. Restart the game after changing this file."
-/// 所以只认 "Native " 这个锚点，两边都能匹配。
+/// 0.3.0（代理）改成了 "DLSSG for SM86（Proxy）- 0.3.0 版本"，锚点没了，
+/// 所以再兜一层：取首行里第一个「带小数点的数字」。
 pub fn extract_version(text: &str) -> Option<String> {
-    let idx = text.find("Native ")?;
-    let rest = &text[idx + "Native ".len()..];
-    let v: String = rest
-        .chars()
-        .take_while(|c| c.is_ascii_digit() || *c == '.')
-        .collect();
-    let v = v.trim_end_matches('.').to_owned();
-    if v.is_empty() {
-        None
-    } else {
-        Some(v)
+    if let Some(idx) = text.find("Native ") {
+        let rest = &text[idx + "Native ".len()..];
+        let v: String = rest
+            .chars()
+            .take_while(|c| c.is_ascii_digit() || *c == '.')
+            .collect();
+        let v = v.trim_end_matches('.').to_owned();
+        if !v.is_empty() {
+            return Some(v);
+        }
     }
+    let first = text.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
+    version_in_line(first)
+}
+
+/// 取一行里第一个「数字.数字」形状的版本号。
+/// 手写而不是用正则：只为这一处不值得引入 regex 依赖。
+fn version_in_line(line: &str) -> Option<String> {
+    let cs: Vec<char> = line.chars().collect();
+    let mut i = 0;
+    while i < cs.len() {
+        if !cs[i].is_ascii_digit() {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        let mut dotted = false;
+        while i < cs.len() && (cs[i].is_ascii_digit() || cs[i] == '.') {
+            if cs[i] == '.' {
+                dotted = true;
+            }
+            i += 1;
+        }
+        if dotted {
+            let v: String = cs[start..i].iter().collect();
+            let v = v.trim_end_matches('.').to_owned();
+            if !v.is_empty() {
+                return Some(v);
+            }
+        }
+    }
+    None
 }
 
 pub fn fetch_version(client: &reqwest::blocking::Client) -> Option<String> {
@@ -443,12 +518,15 @@ pub fn local_is_current(
     state: &UpdateState,
     local_name: &str,
     dest: &Path,
-    remote_etag: &str,
+    remote: &RemoteFile,
 ) -> bool {
     let Some(r) = state.files.get(local_name) else {
         return false;
     };
-    if r.etag.is_empty() || !r.etag.eq_ignore_ascii_case(remote_etag) {
+    // 指纹**只在可信时**才拿来判定。探测落到镜像时指纹和官方对不上，
+    // 用它比对会导致「文件明明在、每次都被判为需要更新」—— 用户看到的就是
+    // 「不断重复下载」。指纹不可信时退化成「记录在 + 文件在且大小对得上」。
+    if remote.etag_trusted && (r.etag.is_empty() || !r.etag.eq_ignore_ascii_case(&remote.etag)) {
         return false;
     }
     // metadata 拿不到（文件不存在）就是 false
@@ -476,39 +554,19 @@ pub fn download_auto(
     cancel: &AtomicBool,
     custom_prefix: &str,
     prefer_mirror: bool,
-    min_kbps: u64,
     verify: &dyn Fn(&Path) -> Result<()>,
     progress: &mut dyn FnMut(u64, u64, &str),
 ) -> Result<Downloaded> {
     let official = official_url(repo_path);
     let ms = mirrors(custom_prefix);
-    let too_slow = AtomicBool::new(false);
-
-    match download_pass(
-        client, repo_path, dest, expect_etag, cancel, &official, &ms, prefer_mirror, min_kbps,
-        verify, &too_slow, progress,
-    ) {
-        Ok(v) => Ok(v),
-        Err(e) => {
-            // 所有源都低于阈值时不能就这么失败：退回「不看速率」再试一遍。
-            // 慢一点也总比下不下来强，用户至少还有取消按钮。
-            if min_kbps > 0 && too_slow.load(Ordering::Relaxed) {
-                // 一个达标的源都没有 —— 那就别挑速度了，用手上最快的那个继续
-                progress(0, 0, "几个源都不够快，用最快的那个继续");
-                download_pass(
-                    client, repo_path, dest, expect_etag, cancel, &official, &ms, prefer_mirror, 0,
-                    verify, &too_slow, progress,
-                )
-                .map_err(|e2| anyhow::anyhow!("{e2}（放宽速度要求后重试仍失败；先前：{e}）"))
-            } else {
-                Err(e)
-            }
-        }
-    }
+    // 换源只看「这个源能不能把文件给全」，不看速度：慢源照样让它慢慢下完。
+    download_pass(
+        client, repo_path, dest, expect_etag, cancel, &official, &ms, prefer_mirror, verify,
+        progress,
+    )
 }
 
-/// 按候选顺序走一遍。抽成函数是因为「太慢」时要能整体再走一遍，
-/// 写成一个闭包会和 progress 的可变借用打架。
+/// 按候选顺序走一遍：一个源下不下来就换下一个。
 #[allow(clippy::too_many_arguments)]
 pub fn download_pass(
     client: &reqwest::blocking::Client,
@@ -519,23 +577,34 @@ pub fn download_pass(
     official: &str,
     ms: &[String],
     prefer_mirror: bool,
-    min_kbps: u64,
     verify: &dyn Fn(&Path) -> Result<()>,
-    too_slow: &AtomicBool,
     progress: &mut dyn FnMut(u64, u64, &str),
 ) -> Result<Downloaded> {
     try_sources(official, ms, prefer_mirror, Some(cancel), |url, src| {
-        match download(
-            client, repo_path, dest, url, expect_etag, cancel, src, min_kbps, progress,
-        ) {
+        let t0 = Instant::now();
+        let r = download(client, repo_path, dest, url, expect_etag, cancel, src, progress);
+        let secs = t0.elapsed().as_secs_f64();
+        match r {
             Ok(dl) => {
-                verify(dest)?;
+                crate::log::line(&format!(
+                    "下载成功 {repo_path} <- {}  {} 字节  {secs:.1}s",
+                    source_label(src),
+                    dl.bytes
+                ));
+                if let Err(e) = verify(dest) {
+                    crate::log::line(&format!(
+                        "校验失败 {repo_path} <- {}：{e}",
+                        source_label(src)
+                    ));
+                    return Err(e);
+                }
                 Ok(dl)
             }
             Err(e) => {
-                if e.to_string().starts_with(TOO_SLOW_PREFIX) {
-                    too_slow.store(true, Ordering::Relaxed);
-                }
+                crate::log::line(&format!(
+                    "下载失败 {repo_path} <- {}  {secs:.1}s：{e}",
+                    source_label(src)
+                ));
                 Err(e)
             }
         }
@@ -575,8 +644,6 @@ pub fn download(
     cancel: &AtomicBool,
     // 正在用的是哪个源（空串 = 官方源），跟着进度一起报给界面
     source: &str,
-    // 低于这个速率（KB/s）就中止并换源。0 = 不看速率（兜底那一遍用）
-    min_kbps: u64,
     progress: &mut dyn FnMut(u64, u64, &str),
 ) -> Result<Downloaded> {
     let tmp = part_path(dest);
@@ -596,14 +663,10 @@ pub fn download(
     let mut buf: Vec<u8> = Vec::with_capacity(total as usize);
     let mut chunk = vec![0u8; 64 * 1024];
     let mut got: u64 = 0;
-    // 看门狗：前 3 秒不判（TLS 握手 + 慢启动），之后一旦实测速率低于阈值就
-    // 立刻放弃这个源。这是「慢」和「坏」的分界 —— 坏源有连接超时兜着，
-    // 慢源以前没有任何机制，用户只能眼睁睁看 30 MB 一点点爬完。
+    // 只记总耗时，供下完后记录实测速率用 —— 不再按速度拦任何东西。
     let t0 = Instant::now();
-    let watch = min_kbps > 0 && (total == 0 || total >= WATCHDOG_MIN_BYTES);
     // 进度回调里那第三段文字在这里算一次 —— 别每 64 KB 都新分配一个 String
     let tag = format!("经 {}", source_label(source));
-    let tag_slow = format!("经 {} 速度不达标，换下一个", source_label(source));
     loop {
         if cancel.load(Ordering::Relaxed) {
             let _ = std::fs::remove_file(&tmp);
@@ -618,19 +681,6 @@ pub fn download(
         buf.extend_from_slice(&chunk[..n]);
         got += n as u64;
         progress(got, total, &tag);
-        if watch {
-            let el = t0.elapsed().as_secs_f64();
-            if el >= WATCHDOG_GRACE_SECS {
-                let kbps = got as f64 / el / 1024.0;
-                if kbps < min_kbps as f64 {
-                    let _ = std::fs::remove_file(&tmp);
-                    // 让界面说清这次是「太慢」而不是「坏了」：
-                    // 用户看到的是「速度不达标，换下一个」，比字节数卡着不动好懂得多。
-                    progress(got, total, &tag_slow);
-                    bail!("{TOO_SLOW_PREFIX}（实测 {kbps:.0} KB/s，低于 {min_kbps} KB/s）");
-                }
-            }
-        }
     }
 
     // 指纹比对：下载响应说的必须是同一份内容
@@ -750,7 +800,7 @@ pub struct IniPlan {
 }
 
 /// 按显卡路由准备要部署的 INI。
-/// RTX 30 系保持上游默认；RTX 20 / GTX 16 系必须把 Router 改成 SM75，否则完全无效。
+/// RTX 30 系保持上游默认；RTX 20 / GTX 16 系要把 Router 改成 SM75（老版 native 包里才有这一项）。
 /// 改写后写到单独的文件，上游原文件保持不动（用于比对哈希）。
 pub fn prepare_deploy_ini(route: GpuRoute, gpu_name: Option<&str>) -> Result<IniPlan> {
     let upstream = util::assets_dir()?.join(INI_REPO_PATH);
@@ -761,16 +811,31 @@ pub fn prepare_deploy_ini(route: GpuRoute, gpu_name: Option<&str>) -> Result<Ini
 
     let mut changes = Vec::new();
     let out_text = if route == GpuRoute::Sm75 {
-        let before = ini_get(&text, "Router").unwrap_or_default();
-        let patched = ini_set(&text, "Router", "SM75").context("INI 里找不到 Router 项，无法改写")?;
-        if before != "SM75" {
-            changes.push(format!(
-                "Router：上游默认 {} → 改为 SM75。原因：本机显卡是 {}，属于 Turing / SM75 架构，走 SM86 路由不会生效。",
-                if before.is_empty() { "未读到".to_owned() } else { before },
-                gpu_name.unwrap_or("RTX 20 / GTX 16 系")
-            ));
+        match ini_set(&text, "Router", "SM75") {
+            Some(patched) => {
+                let before = ini_get(&text, "Router").unwrap_or_default();
+                if before != "SM75" {
+                    changes.push(format!(
+                        "Router：上游默认 {} → 改为 SM75。原因：本机显卡是 {}，属于 Turing / SM75 架构，走 SM86 路由不会生效。",
+                        if before.is_empty() { "未读到".to_owned() } else { before },
+                        gpu_name.unwrap_or("RTX 20 / GTX 16 系")
+                    ));
+                }
+                patched
+            }
+            None => {
+                // 上游 0.3.0 的代理版把 INI 精简了，里面已经没有 Router 项
+                // （路由改由 DLL 自己判断）。这里必须原样部署而不是报错 ——
+                // 以前直接失败，等于把 RTX 20 用户挡在部署按钮外面。
+                changes.push(format!(
+                    "这份 INI 里没有 Router 项（上游 0.3.0 精简掉了），本次原样部署。\
+                     你的显卡是 {}：新版上游只面向 RTX 30 系，帧生成可能不生效，\
+                     可以改用老版 native 包（仍支持 SM75）。",
+                    gpu_name.unwrap_or("RTX 20 / GTX 16 系")
+                ));
+                text
+            }
         }
-        patched
     } else {
         text
     };
@@ -847,8 +912,9 @@ pub struct SourceSpeeds {
     pub entries: BTreeMap<String, SpeedSample>,
 }
 
-/// 低于这个速率（KB/s）就认为这个源慢得没法用：既用来触发换源，也用来排序。
-pub const DEFAULT_MIN_SPEED_KBPS: u64 = 300;
+/// 排序用的分界线：实测速率达到这个数（KB/s）的源算「快」，排在没测过的前面。
+/// 注意它**只影响先试哪个源**，不会因为慢就中断下载 —— 慢源也让它下完。
+pub const GOOD_SPEED_KBPS: u64 = 300;
 
 /// 超过这段时间没再测过的记录就不算数 —— 镜像速率是按小时变的。
 const SPEED_TTL_SECS: i64 = 6 * 3600;
@@ -910,7 +976,7 @@ pub fn rank_by_scores(items: &[(String, Option<u64>)]) -> Vec<String> {
     let (mut good, mut unknown, mut slow) = (Vec::new(), Vec::new(), Vec::new());
     for (m, score) in items {
         match score {
-            Some(k) if *k >= DEFAULT_MIN_SPEED_KBPS => good.push((*k, m.clone())),
+            Some(k) if *k >= GOOD_SPEED_KBPS => good.push((*k, m.clone())),
             Some(k) => slow.push((*k, m.clone())),
             None => unknown.push(m.clone()),
         }
@@ -934,18 +1000,6 @@ pub fn source_label(prefix: &str) -> String {
         .trim_end_matches('/')
         .to_owned()
 }
-
-// ------------------------------------------------------------------ 看门狗
-
-/// 换源文案。上层靠这个前缀区分「这个源太慢」和「这个源坏了」，
-/// 因为「所有源都太慢」时要放宽速度要求再试一遍，不能让用户下不了。
-pub const TOO_SLOW_PREFIX: &str = "这个源太慢";
-
-/// 只对大文件开看门狗。581 字节的 ini 秒下完，判速没意义。
-const WATCHDOG_MIN_BYTES: u64 = 4 * 1024 * 1024;
-
-/// 宽限期：TLS 握手 + TCP 慢启动都要时间，太早判会误杀好源。
-const WATCHDOG_GRACE_SECS: f64 = 3.0;
 
 /// 下载中至少攒够这么多字节才值得记速率（小文件测出来的数没意义）。
 const SPEED_RECORD_MIN_BYTES: u64 = 512 * 1024;
@@ -1059,9 +1113,8 @@ pub fn download_raw(
     url: &str,
     dest: &Path,
     cancel: &AtomicBool,
-    // 同 download()：哪个源、速率低于多少就换源
+    // 同 download()：正在用的是哪个源，跟着进度一起报给界面
     source: &str,
-    min_kbps: u64,
     progress: &mut dyn FnMut(u64, u64, &str),
 ) -> Result<u64> {
     let tmp = part_path(dest);
@@ -1080,11 +1133,10 @@ pub fn download_raw(
     let mut buf: Vec<u8> = Vec::with_capacity(total as usize);
     let mut chunk = vec![0u8; 64 * 1024];
     let mut got: u64 = 0;
+    // 只记总耗时，供下完后记录实测速率用 —— 不再按速度拦任何东西。
     let t0 = Instant::now();
-    let watch = min_kbps > 0 && (total == 0 || total >= WATCHDOG_MIN_BYTES);
     // 进度回调里那第三段文字在这里算一次 —— 别每 64 KB 都新分配一个 String
     let tag = format!("经 {}", source_label(source));
-    let tag_slow = format!("经 {} 速度不达标，换下一个", source_label(source));
     loop {
         if cancel.load(Ordering::Relaxed) {
             let _ = std::fs::remove_file(&tmp);
@@ -1099,19 +1151,6 @@ pub fn download_raw(
         buf.extend_from_slice(&chunk[..n]);
         got += n as u64;
         progress(got, total, &tag);
-        if watch {
-            let el = t0.elapsed().as_secs_f64();
-            if el >= WATCHDOG_GRACE_SECS {
-                let kbps = got as f64 / el / 1024.0;
-                if kbps < min_kbps as f64 {
-                    let _ = std::fs::remove_file(&tmp);
-                    // 让界面说清这次是「太慢」而不是「坏了」：
-                    // 用户看到的是「速度不达标，换下一个」，比字节数卡着不动好懂得多。
-                    progress(got, total, &tag_slow);
-                    bail!("{TOO_SLOW_PREFIX}（实测 {kbps:.0} KB/s，低于 {min_kbps} KB/s）");
-                }
-            }
-        }
     }
 
     if let Some(parent) = dest.parent() {
@@ -1152,43 +1191,36 @@ fn download_with_mirror(
     official: &str,
     dest: &Path,
     cancel: &AtomicBool,
-    min_kbps: u64,
     progress: &mut dyn FnMut(u64, u64, &str),
 ) -> Result<u64> {
     let ms = mirrors("");
-    let too_slow = AtomicBool::new(false);
-
-    let run = |min_kbps: u64,
-                   too_slow: &AtomicBool,
-                   progress: &mut dyn FnMut(u64, u64, &str)|
-     -> Result<u64> {
-        try_sources(official, &ms, true, Some(cancel), |url, src| {
-            progress(0, 0, src);
-            match download_raw(client, url, dest, cancel, src, min_kbps, progress) {
-                Ok(n) => Ok(n),
-                Err(e) => {
-                    if e.to_string().starts_with(TOO_SLOW_PREFIX) {
-                        too_slow.store(true, Ordering::Relaxed);
-                    }
-                    Err(e)
-                }
+    // 依次试每个镜像，最后兜底官方源。只看能不能下完，不看速度 ——
+    // 慢源就让它慢慢下，只有用户点取消或者源彻底不动才算数。
+    try_sources(official, &ms, true, Some(cancel), |url, src| {
+        progress(0, 0, src);
+        let t0 = Instant::now();
+        match download_raw(client, url, dest, cancel, src, progress) {
+            Ok(n) => {
+                crate::log::line(&format!(
+                    "下载成功 {} <- {}  {} 字节  {:.1}s",
+                    dest.display(),
+                    source_label(src),
+                    n,
+                    t0.elapsed().as_secs_f64()
+                ));
+                Ok(n)
             }
-        })
-    };
-
-    match run(min_kbps, &too_slow, progress) {
-        Ok(v) => Ok(v),
-        Err(e) => {
-            // 同 download_auto：所有源都太慢时就放宽速度要求再走一遍
-            if min_kbps > 0 && too_slow.load(Ordering::Relaxed) {
-                progress(0, 0, "几个源都不够快，用最快的那个继续");
-                run(0, &too_slow, progress)
-                    .map_err(|e2| anyhow::anyhow!("{e2}（放宽速度要求后重试仍失败；先前：{e}）"))
-            } else {
+            Err(e) => {
+                crate::log::line(&format!(
+                    "下载失败 {} <- {}  {:.1}s：{e}",
+                    dest.display(),
+                    source_label(src),
+                    t0.elapsed().as_secs_f64()
+                ));
                 Err(e)
             }
         }
-    }
+    })
 }
 
 // ------------------------------------------------------------------ 测速
@@ -1450,7 +1482,6 @@ pub fn ensure_dlss_runtime(
     cancel: &AtomicBool,
     plan: &[RuntimeStep],
     ctx: ProgressCtx,
-    min_kbps: u64,
     mut progress: impl FnMut(String, f32),
 ) -> Result<Vec<PathBuf>> {
     let dir = util::assets_dir()?;
@@ -1502,7 +1533,7 @@ pub fn ensure_dlss_runtime(
                     frac(done + got),
                 );
             };
-            download_with_mirror(client, &step.url, &zip_path, cancel, min_kbps, &mut relay)
+            download_with_mirror(client, &step.url, &zip_path, cancel, &mut relay)
         };
 
         match direct {
@@ -1532,9 +1563,8 @@ pub fn ensure_dlss_runtime(
                         frac(done + got),
                     );
                 };
-                got_bytes = download_with_mirror(
-                    client, &asset.url, &zip_path, cancel, min_kbps, &mut relay,
-                )?;
+                got_bytes =
+                    download_with_mirror(client, &asset.url, &zip_path, cancel, &mut relay)?;
             }
         }
         done += got_bytes;

@@ -12,7 +12,7 @@
 #define AppName "FrameGen Manager"
 ; 版本号可由打包脚本传入：iscc /DAppVersion=1.2.3 installer.iss
 #ifndef AppVersion
-#define AppVersion "0.7.0"
+#define AppVersion "0.8.0"
 #endif
 #define AppExeName "framegen-manager.exe"
 

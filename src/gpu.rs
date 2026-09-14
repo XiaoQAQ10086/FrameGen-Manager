@@ -29,7 +29,7 @@ pub const MIN_FG_DRIVER_TEXT: &str = "591.86";
 pub const DRIVER_URL: &str = "https://www.nvidia.cn/geforce/drivers/";
 
 const DISPLAY_CLASS: &str = "{4d36e968-e325-11ce-bfc1-08002be10318}";
-const CLASS_KEY: &str =
+pub const CLASS_KEY: &str =
     "SYSTEM\\CurrentControlSet\\Control\\Class\\{4d36e968-e325-11ce-bfc1-08002be10318}";
 const ENUM_PCI: &str = "SYSTEM\\CurrentControlSet\\Enum\\PCI";
 const NVIDIA_SERVICE: &str = "nvlddmkm";
@@ -102,6 +102,29 @@ fn nvidia_smi_version() -> Option<String> {
     }
     let s = String::from_utf8_lossy(&out.stdout);
     s.lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .map(str::to_owned)
+}
+
+/// 问 nvidia-smi 要**型号名**。
+///
+/// 这个比读注册表权威得多：注册表里可能同时存在好几条 NVIDIA 名字的条目
+/// （包括旧显卡留下的幽灵条目、或者被别的工具改过的值），而 nvidia-smi 是驱动
+/// 自己在跑的那块卡上直接报的。显卡识别的第一优先级就是它。
+pub fn nvidia_smi_gpu_name() -> Option<String> {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let out = std::process::Command::new("nvidia-smi")
+        .args(["--query-gpu=name", "--format=csv,noheader"])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
         .map(str::trim)
         .find(|l| !l.is_empty())
         .map(str::to_owned)

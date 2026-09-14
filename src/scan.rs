@@ -603,9 +603,13 @@ where
 
 // ---------------------------------------------------------------- 文件身份判定
 //
-// 用来回答「用户是不是已经手动装过本项目」。判据是 Authenticode 证书里的签名者名称：
-// 本项目的 5 个 DLL 全部用 "DLSSG Native Project" 自签证书签名，
+// 用来回答「用户是不是已经手动装过本项目」。判据是 Authenticode 证书里的签名者名称，
 // 这比文件名或体积可靠得多。
+//
+// 两个签名者都是本项目的，取决于上游用的是哪一版：
+//   "DLSSG Native Project" —— 0.2.4 native 包（现在是 archive/0.2.4/）
+//   "DLSSG for SM86"       —— 0.3.0 代理包（仓库根目录，现在对外发布的那一版）
+// 上游 0.3.0 换证书时如果只认旧名字，所有下载都会被自己拒掉。
 //
 // 注意：这里是在证书数据里找已知字符串，不做完整签名链校验。
 // 对本项目够用 —— 自签证书本来就不受 Windows 信任，验链没有意义。
@@ -627,7 +631,7 @@ pub enum FileIdentity {
 impl FileIdentity {
     pub fn label(&self) -> &'static str {
         match self {
-            FileIdentity::ThisProject => "本项目文件（DLSSG Native Project 签名）",
+            FileIdentity::ThisProject => "本项目文件（作者自签证书）",
             FileIdentity::Nvidia => "NVIDIA 官方签名",
             FileIdentity::OtherSigned => "其他签名者",
             FileIdentity::Unsigned => "无签名",
@@ -641,7 +645,10 @@ impl FileIdentity {
     }
 }
 
+/// 0.2.4 native 包的签名者
 const SIGNER_THIS_PROJECT: &str = "DLSSG Native Project";
+/// 0.3.0 代理包的签名者（CN 全名 "DLSSG for SM86 (self-signed)"）
+const SIGNER_THIS_PROJECT_PROXY: &str = "DLSSG for SM86";
 const SIGNER_NVIDIA: &str = "NVIDIA Corporation";
 
 /// 在证书数据里找字符串。DER 里通常是 ASCII，个别字段是 UTF-16LE，两种都找。
@@ -713,7 +720,8 @@ pub fn identify_dll(path: &Path) -> FileIdentity {
             _ => FileIdentity::Unknown,
         };
     }
-    if cert_contains(&blob, SIGNER_THIS_PROJECT) {
+    if cert_contains(&blob, SIGNER_THIS_PROJECT) || cert_contains(&blob, SIGNER_THIS_PROJECT_PROXY)
+    {
         return FileIdentity::ThisProject;
     }
     if cert_contains(&blob, SIGNER_NVIDIA) {
@@ -724,14 +732,41 @@ pub fn identify_dll(path: &Path) -> FileIdentity {
 
 // ---------------------------------------------------------------- 代理入口推断
 
-/// 可用的代理入口，按优先级排列（version.dll 是上游默认，排第一）
-pub const PROXY_PRIORITY: [&str; 5] = [
+/// 当前版（上游 0.3.0 代理模式）支持的代理入口，按上游推荐顺序排列。
+/// version.dll 是上游默认；dbghelp / d3d12 是 0.3.0 新增的，winhttp 已被上游删掉。
+pub const PROXY_PRIORITY: [&str; 6] = [
+    "version.dll",
+    "winmm.dll",
+    "dbghelp.dll",
+    "dinput8.dll",
+    "dxgi.dll",
+    "d3d12.dll",
+];
+
+/// 老版 native 包（archive/0.2.4/）支持的代理入口。
+/// RTX 20 / GTX 16 系（SM75）要用这一版，所以候选名单也得跟着换。
+pub const PROXY_PRIORITY_LEGACY: [&str; 5] = [
     "version.dll",
     "winmm.dll",
     "dinput8.dll",
     "winhttp.dll",
     "dxgi.dll",
 ];
+
+/// 某个文件名是不是代理入口（两个版本的并集）。
+/// 判断「要不要拒绝覆盖」「要不要清理多余代理」都得用它。
+pub fn is_known_proxy(name: &str) -> bool {
+    PROXY_PRIORITY.contains(&name) || PROXY_PRIORITY_LEGACY.contains(&name)
+}
+
+/// 按模式取候选入口名单。
+pub fn proxy_candidates(legacy: bool) -> &'static [&'static str] {
+    if legacy {
+        &PROXY_PRIORITY_LEGACY
+    } else {
+        &PROXY_PRIORITY
+    }
+}
 
 /// 判断入口时最多分析多少个模块，避免在大游戏目录上卡住
 const PROXY_SCAN_MAX: usize = 60;
@@ -764,12 +799,16 @@ pub struct ProxyAdvice {
 /// 导入了 version.dll，把代理放进这个目录就会被加载。判据是**导入表**，不是游戏名字。
 ///
 /// 三级：先排除被占用的 -> 再按导入表匹配 -> 都判不出来就用上游默认并标 undetermined。
-pub fn advise_proxy(target_dir: &Path) -> ProxyAdvice {
+///
+/// 参数 legacy 决定候选名单：新版是 6 个入口（含 dbghelp/d3d12），
+/// 老版 native 包是 5 个（含 winhttp）—— 名单错了就会推荐一个仓库里根本没有的文件。
+pub fn advise_proxy(target_dir: &Path, legacy: bool) -> ProxyAdvice {
+    let cands = proxy_candidates(legacy);
     // 先看目录里已经有哪些入口，并判断它们的来源身份。
     // 这一步同时回答了「用户是不是已经手动装过本项目」。
     let mut occupied: Vec<ExistingEntry> = Vec::new();
     let mut own_existing: Vec<ExistingEntry> = Vec::new();
-    for name in PROXY_PRIORITY {
+    for &name in cands {
         let p = target_dir.join(name);
         if !p.is_file() {
             continue;
@@ -842,7 +881,7 @@ pub fn advise_proxy(target_dir: &Path) -> ProxyAdvice {
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_default();
         let imports = pe_imports(f);
-        for cand in PROXY_PRIORITY {
+        for &cand in cands {
             if imports.iter().any(|i| i == cand) {
                 hits.push((cand.to_owned(), who.clone()));
             }
@@ -850,7 +889,7 @@ pub fn advise_proxy(target_dir: &Path) -> ProxyAdvice {
     }
 
     // 按优先级挑第一个「没被占用且被导入」的
-    for cand in PROXY_PRIORITY {
+    for &cand in cands {
         if is_occupied(cand) {
             continue;
         }
@@ -874,11 +913,11 @@ pub fn advise_proxy(target_dir: &Path) -> ProxyAdvice {
     }
 
     // 判不出来 -> 回退到第一个没被占用的入口，并标记 undetermined
-    let fallback = PROXY_PRIORITY
+    let fallback = cands
         .iter()
         .copied()
         .find(|n| !is_occupied(n))
-        .unwrap_or(PROXY_PRIORITY[0])
+        .unwrap_or(cands[0])
         .to_owned();
     let reason = if files.len() <= 1 {
         "这个目录里几乎没有可执行文件，可能不是渲染 EXE 所在目录".to_owned()
@@ -923,34 +962,46 @@ impl GpuRoute {
     }
 }
 
-/// 从注册表读显卡型号名。显示适配器类下每个实例都有 DriverDesc。
-pub fn detect_gpu() -> Option<String> {
-    let base = RegKey::predef(HKEY_LOCAL_MACHINE)
-        .open_subkey("SYSTEM\\CurrentControlSet\\Control\\Class\\{4d36e968-e325-11ce-bfc1-08002be10318}")
-        .ok()?;
-
-    let mut names = Vec::new();
-    for sub in base.enum_keys().flatten() {
-        // 实例键名是 0000 / 0001 / ...
-        if sub.is_empty() || !sub.chars().all(|c| c.is_ascii_digit()) {
-            continue;
-        }
-        if let Ok(k) = base.open_subkey(&sub) {
-            if let Ok(desc) = k.get_value::<String, _>("DriverDesc") {
-                let d = desc.trim().to_owned();
-                if !d.is_empty() {
-                    names.push(d);
-                }
-            }
-        }
+/// 从「在位的适配器 + nvidia-smi 结果」里挑出最终使用的型号名。
+///
+/// 抽成纯函数是为了能单独测：本机只有一块显卡，多卡、以及"类键里有旧显卡留下的
+/// 幽灵条目"这两种真实情况，在开发机上复现不出来。
+///
+/// 优先级：
+///   1. nvidia-smi 报的型号 —— 驱动自己在跑的那块卡上直接报的，最权威
+///   2. 在位适配器里，能识别成 RTX / GTX 的优先（认不出来的排后面，比如 GT 1030）
+///   3. 同样能识别的，按驱动版本从新到旧
+pub fn pick_gpu_name(
+    adapters: &[crate::gpu::GpuAdapter],
+    smi_name: Option<String>,
+) -> Option<String> {
+    if let Some(n) = smi_name.filter(|s| !s.trim().is_empty()) {
+        return Some(n);
     }
+    let mut list: Vec<&crate::gpu::GpuAdapter> = adapters.iter().collect();
+    list.sort_by(|a, b| {
+        let ua = i32::from(classify_gpu(&a.driver_name) == GpuRoute::Unknown);
+        let ub = i32::from(classify_gpu(&b.driver_name) == GpuRoute::Unknown);
+        ua.cmp(&ub).then_with(|| b.driver_version.cmp(&a.driver_version))
+    });
+    list.first().map(|a| a.driver_name.clone())
+}
 
-    // 优先独显：带 NVIDIA 的那个
-    names
-        .iter()
-        .find(|n| n.to_ascii_uppercase().contains("NVIDIA"))
-        .cloned()
-        .or_else(|| names.into_iter().next())
+/// 读显卡型号名。
+///
+/// **不再自己遍历显示适配器类键。** 以前这里是「取第一个名字带 NVIDIA 的条目」，
+/// 而那个键下面可能有：
+///   * 旧显卡留下的**幽灵条目**（换过卡就会有）；
+///   * 被别的工具改过的值（网上"解锁帧生成"的教程就会改 DriverDesc）。
+/// 于是同一个用户会出现「这次识别成 1030、退出再进又变成 40 系」—— 因为每次谁先被
+/// 枚举到不一定一样。而 40 系的名字会让路由判定变成「不需要本 Mod」，直接禁止部署，
+/// 3050 的用户会莫名其妙被拦。
+///
+/// 现在两处读显卡的标准统一了：
+///   * 先问 nvidia-smi（驱动自己在跑的卡）
+///   * 回退时只用 gpu::enumerate() 的结果 —— 它反查了设备树，幽灵条目不参与
+pub fn detect_gpu() -> Option<String> {
+    pick_gpu_name(&crate::gpu::enumerate(), crate::gpu::nvidia_smi_gpu_name())
 }
 
 /// 按型号名判断该走哪条路由。名字判断是有依据的：这些字符串是驱动自己写进注册表的。

@@ -5,6 +5,7 @@ mod anticheat;
 mod deploy;
 mod gpu;
 mod icon;
+mod log;
 mod scan;
 mod theme;
 mod update;
@@ -24,6 +25,48 @@ fn main() -> eframe::Result<()> {
     // 放在最前面，这样 GUI 和所有命令行模式看到的是同一份备份。
     // 结果会缓存，App::new() 里再调用拿到的就是同一句话。
     let _ = util::migrate_backups();
+
+    // 日志：放在程序同级 logs\ 下。用户反馈问题时把这里面的文件发过来就行。
+    if let Some(p) = log::init() {
+        log::line(&format!("FrameGen Manager v{}", update::SELF_VERSION));
+        log::line(&format!("日志文件: {}", p.display()));
+        log::line(&format!("Windows 构建号: {:?}", gpu::windows_build()));
+        log::line(&format!(
+            "exe: {}",
+            std::env::current_exe()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|e| format!("未知（{e}）"))
+        ));
+        log::line(&format!("参数: {:?}", std::env::args().collect::<Vec<_>>()));
+        log::line(&format!(
+            "assets: {:?}",
+            util::assets_dir().map(|p| p.display().to_string())
+        ));
+        log::line(&format!(
+            "backups: {:?}",
+            util::backups_dir().map(|p| p.display().to_string())
+        ));
+
+        // ---- 显卡识别全过程：用户报「型号识别错」时，这一段就是答案
+        log::section("显卡识别");
+        log::line(&format!("nvidia-smi 报的型号: {:?}", gpu::nvidia_smi_gpu_name()));
+        let adapters = gpu::enumerate();
+        log::line(&format!("在位且在跑的 NVIDIA 显示适配器: {} 个", adapters.len()));
+        for a in &adapters {
+            log::line(&format!(
+                "  {}  类键实例 {}  驱动 {}  硬件 ID {}  Enum {}",
+                a.driver_name, a.class_sub, a.driver_version, a.hardware_id, a.enum_key
+            ));
+        }
+        log::line("（注意：这里只列「设备真的还在」的显卡。类键里可能还有旧显卡留下的幽灵条目，");
+        log::line("  它们不参与判定 —— 以前正是它们导致型号忽而 1030 忽而 40 系。）");
+        let name = scan::detect_gpu();
+        log::line(&format!("最终使用的型号: {:?}", name));
+        if let Some(n) = &name {
+            log::line(&format!("路由判定: {}", scan::classify_gpu(n).label()));
+        }
+        log::line(&format!("硬件加速 GPU 计划: {}", gpu::hags_state().label()));
+    }
 
     // 无界面自检：cargo run -- --selftest
     if std::env::args().any(|a| a == "--selftest") {
@@ -81,7 +124,7 @@ fn main() -> eframe::Result<()> {
         return Ok(());
     }
 
-    // 选源排序 + 看门狗自测（本地起慢服务器，不依赖外网）：cargo run -- --sourcetest
+    // 选源排序 + 慢源下载自测（本地起慢服务器，不依赖外网）：cargo run -- --sourcetest
     if std::env::args().any(|a| a == "--sourcetest") {
         sourcetest();
         return Ok(());
@@ -188,7 +231,7 @@ fn main() -> eframe::Result<()> {
             base_step: 0,
             total_steps: plan.len(),
         };
-        match update::ensure_dlss_runtime(&c, &cancel, &plan, ctx, 0, |msg, _f| {
+        match update::ensure_dlss_runtime(&c, &cancel, &plan, ctx, |msg, _f| {
             println!("  {msg}");
         }) {
             Ok(paths) => {
@@ -277,7 +320,6 @@ fn main() -> eframe::Result<()> {
             Some(&remote.etag),
             &cancel,
             update::DEFAULT_BACKUP_PREFIX,
-            0,
             &mut |_, _, _| {},
         ) {
             Ok(dl) => {
@@ -399,6 +441,25 @@ fn gpuinfo() {
     match gpu::backup_path() {
         Ok(p) => println!("备份文件位置: {}", p.display()),
         Err(e) => println!("备份文件位置: 无法确定（{e}）"),
+    }
+
+    println!();
+    println!("=== 显示适配器类键下的所有实例（含非 NVIDIA、含幽灵条目）===");
+    println!("  本程序判定型号时**不看这里**，只列出来对照。用户报「型号识别错」时，");
+    println!("  下面几行能直接看出有没有旧显卡留下的幽灵条目、或者被人改过的名字。");
+    if let Ok(base) =
+        winreg::RegKey::predef(winreg::enums::HKEY_LOCAL_MACHINE).open_subkey(gpu::CLASS_KEY)
+    {
+        for sub in base.enum_keys().flatten() {
+            if sub.len() != 4 || !sub.chars().all(|c| c.is_ascii_digit()) {
+                continue;
+            }
+            let Ok(k) = base.open_subkey(&sub) else { continue };
+            let desc: String = k.get_value("DriverDesc").unwrap_or_default();
+            let mid: String = k.get_value("MatchingDeviceId").unwrap_or_default();
+            let present = gpu::enumerate().iter().any(|a| a.class_sub == sub);
+            println!("  {sub}  在位={present}  名称={desc}  匹配设备={mid}");
+        }
     }
 
     println!();
@@ -539,7 +600,7 @@ fn speedtest() {
             return;
         }
     };
-    let repo_path = update::proxy_repo_path("version.dll");
+    let repo_path = update::proxy_repo_path("version.dll", false);
     let remote = match update::probe_remote(&c, repo_path) {
         Ok(r) => r,
         Err(e) => {
@@ -572,7 +633,6 @@ fn speedtest() {
         &cancel,
         "",
         true,
-        update::DEFAULT_MIN_SPEED_KBPS,
         // 和界面里一样：代理 DLL 必须带本项目签名
         &|p: &Path| {
             let id = scan::identify_dll(p);
@@ -611,7 +671,7 @@ fn speedtest() {
 }
 
 /// 本地起一个 HTTP 服务，按 chunk/delay 的节奏往外吐 bytes 字节。
-/// 用来把「看门狗」和「放宽速度要求后的兜底重试」真跑一遍 —— 不依赖外网，结果可重复。
+/// 本地起个 HTTP 服务，用来验证下载链路 —— 不依赖外网，结果可重复。
 fn spawn_http_server(bytes: u64, chunk: u64, delay_ms: u64) -> (u16, Arc<AtomicBool>) {
     use std::io::{Read as _, Write as _};
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("绑定本地端口失败");
@@ -680,7 +740,9 @@ fn speedall() {
     for (i, m) in update::rank_mirrors(&builtins).iter().enumerate() {
         println!("    {}. {}", i + 1, update::source_label(m));
     }
-    println!("  （官方源永远排最后；低于 {} KB/s 的源下载中会被看门狗换掉）", update::DEFAULT_MIN_SPEED_KBPS);
+    println!(
+        "  （官方源永远排最后；这个顺序只决定先试谁，下载中不会因为慢而换源 —— 慢源也让它下完）"
+    );
 }
 
 fn ck(fails: &mut Vec<String>, ok: bool, what: &str) {
@@ -690,9 +752,9 @@ fn ck(fails: &mut Vec<String>, ok: bool, what: &str) {
     }
 }
 
-/// 选源 / 看门狗自测。
+/// 选源 / 下载自测。
 fn sourcetest() {
-    println!("===== 选源 + 看门狗 自测 =====");
+    println!("===== 选源 + 下载 自测 =====");
     let mut fails: Vec<String> = Vec::new();
 
     println!("-- 源名字 --");
@@ -727,17 +789,20 @@ fn sourcetest() {
     let cancel = AtomicBool::new(false);
     let tmp = std::env::temp_dir();
 
-    // 慢源：8 MB 的响应，每 200ms 只给 32 KB，约 160 KB/s
-    let (slow_port, slow_stop) = spawn_http_server(8 * 1024 * 1024, 32 * 1024, 200);
-    let d1 = tmp.join("fgm-watchdog-test.bin");
+    // 回归：有用户报「下载到四分之一就断了」。原因是当时按平均速度判 ——
+    // 低于 300 KB/s 就立刻掐掉这个源去换下一个，他线路慢，永远换不到一个「够快」的源。
+    // 现在这条规则没了：慢源必须能慢慢下完，而且字节数要对。
+    // 4 MB 的响应，每 110ms 只给 32 KB，约 220 KB/s（比当年那个阈值还慢）。
+    let (slow_port, slow_stop) = spawn_http_server(4 * 1024 * 1024, 32 * 1024, 110);
+    let d1 = tmp.join("fgm-slow-source-test.bin");
     let _ = std::fs::remove_file(&d1);
     let u1 = format!("http://127.0.0.1:{slow_port}/slow");
-    println!("-- 看门狗：慢源（约 160 KB/s，阈值 300 KB/s）--");
+    println!("-- 慢源（约 220 KB/s，比当年的 300 KB/s 阈值还慢）--");
     let t0 = std::time::Instant::now();
     // 顺手记下进度回调里报给界面的那几段文字 —— 用户能不能看懂就靠它
     let mut notes: Vec<String> = Vec::new();
     let r1 = update::download(
-        &c, "watchdog-test", &d1, &u1, None, &cancel, "本地慢源", 300,
+        &c, "slow-source-test", &d1, &u1, None, &cancel, "本地慢源",
         &mut |_, _, note| {
             if notes.last().map(|n| n != note).unwrap_or(true) {
                 notes.push(note.to_owned());
@@ -746,84 +811,44 @@ fn sourcetest() {
     );
     let el = t0.elapsed().as_secs_f64();
     let msg1 = match &r1 {
-        Ok(_) => "居然成功了".to_owned(),
+        Ok(_) => "成功".to_owned(),
         Err(e) => e.to_string(),
     };
+    ck(&mut fails, r1.is_ok(), &format!("慢源照样下完（{el:.1} 秒）：{msg1}"));
     ck(
         &mut fails,
-        msg1.starts_with(update::TOO_SLOW_PREFIX),
-        &format!("慢源被拦下：{msg1}"),
+        std::fs::metadata(&d1).map(|m| m.len() == 4 * 1024 * 1024).unwrap_or(false),
+        "慢源下到的字节数完整（4 MB）",
     );
-    ck(&mut fails, el < 10.0, &format!("拦得够快（{el:.1} 秒，不是等整个文件）"));
-    ck(&mut fails, !d1.exists(), "被拦下后没留下文件");
-    println!("  进度里报出来的文字：{notes:?}");
     ck(
         &mut fails,
         notes.first().map(|n| n.starts_with("经 ")).unwrap_or(false),
-        "正常进度里会说清楚用的是哪个源（经 xxx）",
+        "进度里会说清楚用的是哪个源（经 xxx）",
     );
     ck(
         &mut fails,
-        notes.iter().any(|n| n.contains("速度不达标")),
-        "换源前会说明原因：速度不达标，换下一个",
+        !notes.iter().any(|n| n.contains("速度不达标")),
+        "不再出现「速度不达标，换下一个」",
     );
 
-    // 小文件豁免：512 KB 的响应，看门狗不该管
+    // 小文件照旧
     let (small_port, small_stop) = spawn_http_server(512 * 1024, 64 * 1024, 0);
     let d2 = tmp.join("fgm-small-test.bin");
     let _ = std::fs::remove_file(&d2);
     let u2 = format!("http://127.0.0.1:{small_port}/small");
-    let r2 = update::download(&c, "small-test", &d2, &u2, None, &cancel, "本地小源", 300, &mut |_, _, _| {});
-    println!("-- 小文件不受看门狗管 --");
-    ck(&mut fails, r2.is_ok(), "512 KB 的文件正常下完（阈值对它是摆设）");
+    let r2 = update::download(&c, "small-test", &d2, &u2, None, &cancel, "本地小源", &mut |_, _, _| {});
+    println!("-- 小文件 --");
+    ck(&mut fails, r2.is_ok(), "512 KB 的文件正常下完");
     ck(
         &mut fails,
         std::fs::metadata(&d2).map(|m| m.len() == 512 * 1024).unwrap_or(false),
         "小文件字节数正确",
     );
 
-    // min_kbps=0：大文件也不该被拦 —— 兜底那一遍靠的就是这个
-    let (big_port, big_stop) = spawn_http_server(4 * 1024 * 1024, 256 * 1024, 0);
-    let d3 = tmp.join("fgm-big-test.bin");
-    let _ = std::fs::remove_file(&d3);
-    let u3 = format!("http://127.0.0.1:{big_port}/big");
-    let r3 = update::download(&c, "big-test", &d3, &u3, None, &cancel, "本地快源", 0, &mut |_, _, _| {});
-    println!("-- min_kbps=0（不按速度挑源）--");
-    ck(&mut fails, r3.is_ok(), "4 MB 的文件不被拦");
-    ck(
-        &mut fails,
-        std::fs::metadata(&d3).map(|m| m.len() == 4 * 1024 * 1024).unwrap_or(false),
-        "大文件字节数正确",
-    );
-
-    // 兜底两遍：第一遍太慢被标，第二遍不按速度挑源就拿到了
-    println!("-- 全部太慢 -> 放宽速度要求重试（download_auto 的兜底路径）--");
-    let too_slow = AtomicBool::new(false);
-    let (s2_port, s2_stop) = spawn_http_server(8 * 1024 * 1024, 32 * 1024, 200);
-    let d4 = tmp.join("fgm-fallback-test.bin");
-    let _ = std::fs::remove_file(&d4);
-    let su = format!("http://127.0.0.1:{s2_port}/x");
-    let p1 = update::download_pass(
-        &c, "fallback-test", &d4, None, &cancel, &su, &[], true, 300, &|_| Ok(()), &too_slow,
-        &mut |_, _, _| {},
-    );
-    ck(
-        &mut fails,
-        p1.is_err() && too_slow.load(Ordering::Relaxed),
-        "第一遍：唯一的源太慢，被标记为「太慢」",
-    );
-    let (ok_port, ok_stop) = spawn_http_server(256 * 1024, 64 * 1024, 0);
-    let ou = format!("http://127.0.0.1:{ok_port}/y");
-    let p2 = update::download_pass(
-        &c, "fallback-test", &d4, None, &cancel, &ou, &[], true, 0, &|_| Ok(()), &too_slow,
-        &mut |_, _, _| {},
-    );
-    ck(&mut fails, p2.is_ok(), "第二遍：放宽速度要求后拿到了文件");
-
-    for s in [&slow_stop, &small_stop, &big_stop, &s2_stop, &ok_stop] {
+    for s in [&slow_stop, &small_stop] {
         s.store(true, Ordering::Relaxed);
     }
-    for d in [&d1, &d2, &d3, &d4] {
+    for d in [&d1, &d2] {
         let _ = std::fs::remove_file(d);
     }
 
@@ -935,6 +960,62 @@ fn selftest() {
         }
     );
 
+    // Q1 回归：显卡型号怎么挑。本机只有一块卡，多卡和幽灵条目只能靠这个纯函数验。
+    println!("  显卡型号挑选（nvidia-smi 优先 / 幽灵条目不参与）:");
+    let mk = |sub: &str, name: &str, ver: &str| gpu::GpuAdapter {
+        class_sub: sub.to_owned(),
+        driver_name: name.to_owned(),
+        driver_version: ver.to_owned(),
+        enum_key: format!("ENUM/{sub}"),
+        hardware_id: "PCI-VEN-10DE".to_owned(),
+        device_desc: None,
+    };
+    let cases: [(&str, Vec<gpu::GpuAdapter>, Option<&str>, Option<&str>); 4] = [
+        (
+            "能识别的 RTX 排在认不出来的 GT 1030 前面",
+            vec![
+                mk("0000", "NVIDIA GeForce GT 1030", "1"),
+                mk("0001", "NVIDIA GeForce RTX 3050", "2"),
+            ],
+            None,
+            Some("NVIDIA GeForce RTX 3050"),
+        ),
+        (
+            "nvidia-smi 报的优先于注册表（注册表可能被别的工具改过）",
+            vec![mk("0000", "NVIDIA GeForce GT 1030", "1")],
+            Some("NVIDIA GeForce RTX 3050"),
+            Some("NVIDIA GeForce RTX 3050"),
+        ),
+        (
+            "两块都认得出来时按驱动版本从新到旧",
+            vec![
+                mk("0000", "NVIDIA GeForce RTX 3070", "32.0.16.1692"),
+                mk("0001", "NVIDIA GeForce RTX 3080", "31.0.15.0000"),
+            ],
+            None,
+            Some("NVIDIA GeForce RTX 3070"),
+        ),
+        ("一块卡都没有就返回空，不瞎猜", vec![], None, None),
+    ];
+    for (label, adapters, smi, want) in cases {
+        let got = scan::pick_gpu_name(&adapters, smi.map(str::to_owned));
+        println!(
+            "    [{}] {label}（得到 {:?}）",
+            if got.as_deref() == want { "PASS" } else { "FAIL" },
+            got
+        );
+    }
+
+    // 日志：用户反馈问题就靠它
+    let log_file = log::path();
+    println!(
+        "  [{}] 日志文件已建立：{}",
+        if log_file.map(|p| p.is_file()).unwrap_or(false) { "PASS" } else { "FAIL" },
+        log_file
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "（没有）".to_owned())
+    );
+
     println!("\n--- 系统反作弊（注册表服务/驱动） ---");
     let sys = anticheat::scan_system();
     for h in &sys.hits {
@@ -960,20 +1041,27 @@ fn selftest() {
         Ok(c) => {
             println!("  README 版本: {:?}", update::fetch_version(&c));
             let st = update::load_state();
-            // 和界面里一样：每个文件发一次 HEAD 拿 ETag，一次 API 都不调
-            let specs = [
-                "version.dll",
-                "altnative/winmm.dll",
-                "altnative/dinput8.dll",
-                "altnative/winhttp.dll",
-                "altnative/dxgi.dll",
-                update::INI_REPO_PATH,
-            ];
+            // 和界面里一样：每个文件发一次 HEAD 拿 ETag，一次 API 都不调。
+            // 名单跟着「在用的那一版」走 —— 上游 0.3.0 把 altnative/ 改成了 alternatives/。
+            let legacy = util::load_config().legacy_native;
+            println!(
+                "  资产版本: {}",
+                if legacy {
+                    "老版 native 包（archive/0.2.4）"
+                } else {
+                    "最新版（上游代理包）"
+                }
+            );
+            let mut specs: Vec<String> = scan::proxy_candidates(legacy)
+                .iter()
+                .map(|p| update::proxy_repo_path(p, legacy).to_owned())
+                .collect();
+            specs.push(update::ini_repo_path(legacy).to_owned());
             println!("  逐个 HEAD 取内容指纹（0 次 API 调用）：");
             // 这一段以前要 15 秒以上：release 直链是 github.com，第一次探测会先干等
             // 连接超时才轮到镜像。现在直链探测改镜像优先，连接超时也从 15s 收到 8s。
             let t_head = std::time::Instant::now();
-            for path in specs {
+            for path in &specs {
                 match update::probe_remote(&c, path) {
                     Ok(r) => {
                         let local = update::local_name(path);
@@ -982,7 +1070,7 @@ fn selftest() {
                             local,
                             &r.etag[..r.etag.len().min(10)],
                             r.size,
-                            st.needs_update(&local, &r.etag)
+                            st.needs_update(&local, &r)
                         );
                     }
                     Err(e) => println!("  {:<22} 取指纹失败: {e}", path),
@@ -1027,7 +1115,7 @@ fn selftest() {
         let target = scan::find_render_exe(&g.install_dir)
             .and_then(|p| p.parent().map(|d| d.to_path_buf()))
             .unwrap_or_else(|| g.install_dir.clone());
-        let a = scan::advise_proxy(&target);
+        let a = scan::advise_proxy(&target, false);
         println!(
             "  [{}]\n       目标目录 = {}",
             g.name,
@@ -1055,7 +1143,74 @@ fn selftest() {
         }
     }
 
-    println!("\n--- INI 改写（强制走 SM75 分支做验证）---");
+    // 上游 0.3.0 换过文件名、路径和 README 写法，下面这两组断言就是防它再改一次
+    let mut fails: Vec<String> = Vec::new();
+
+    println!("\n--- 上游版本号解析（新旧两种写法都要认）---");
+    let cases: [(&str, Option<&str>); 4] = [
+        ("# DLSSG Native 0.2.4\n", Some("0.2.4")),
+        ("# DLSSG for SM86（Proxy）- 0.3.0 版本\n", Some("0.3.0")),
+        ("# DLSSG for SM86 (proxy) - 0.3.0 Version\n", Some("0.3.0")),
+        ("这一行没有任何版本号\n", None),
+    ];
+    for (text, want) in cases {
+        let got = update::extract_version(text);
+        ck(
+            &mut fails,
+            got.as_deref() == want,
+            &format!("{:?} -> {:?}", text.trim(), got),
+        );
+    }
+
+    println!("\n--- 仓库路径（新版代理包 / 老版 native 包）---");
+    ck(
+        &mut fails,
+        update::proxy_repo_path("version.dll", false) == "version.dll",
+        "新版 version.dll 在仓库根目录",
+    );
+    ck(
+        &mut fails,
+        update::proxy_repo_path("winmm.dll", false) == "alternatives/winmm.dll",
+        "新版备用入口在 alternatives/（以前叫 altnative/）",
+    );
+    ck(
+        &mut fails,
+        update::proxy_repo_path("dbghelp.dll", false) == "alternatives/dbghelp.dll",
+        "新版新增的 dbghelp 也能找到",
+    );
+    ck(
+        &mut fails,
+        update::proxy_repo_path("version.dll", true) == "archive/0.2.4/version.dll",
+        "老版 version.dll 在 archive/0.2.4/",
+    );
+    ck(
+        &mut fails,
+        update::proxy_repo_path("winhttp.dll", true) == "archive/0.2.4/altnative/winhttp.dll",
+        "老版备用入口在 altnative/",
+    );
+    ck(
+        &mut fails,
+        update::ini_repo_path(false) == "dlssg_sm86.ini"
+            && update::ini_repo_path(true) == "archive/0.2.4/dlssg_sm86.ini",
+        "两种模式的 INI 路径",
+    );
+    ck(
+        &mut fails,
+        scan::proxy_candidates(false).len() == 6 && scan::proxy_candidates(true).len() == 5,
+        "新版 6 个代理入口 / 老版 5 个",
+    );
+    ck(
+        &mut fails,
+        scan::is_known_proxy("winhttp.dll") && scan::is_known_proxy("d3d12.dll"),
+        "两个版本出现过的入口名都算代理入口",
+    );
+    ck(
+        &mut fails,
+        !scan::is_known_proxy("nvngx_dlssg.dll"),
+        "DLSS 运行库不算代理入口",
+    );
+
+    println!("\n--- INI 改写（SM75 路由）---");
     match update::prepare_deploy_ini(scan::GpuRoute::Sm75, Some("NVIDIA GeForce RTX 2080")) {
         Ok(p) => {
             println!("  生成: {}", p.path.display());
@@ -1071,6 +1226,20 @@ fn selftest() {
             }
         }
         Err(e) => println!("  失败: {e}"),
+    }
+    // 上游 0.3.0 的 INI 里已经没有 Router 项了（路由改由 DLL 自己判断）。
+    // 以前这里直接报错并中止部署，等于把 RTX 20 用户挡在门外 —— 现在必须原样部署成功。
+    ck(
+        &mut fails,
+        update::prepare_deploy_ini(scan::GpuRoute::Sm75, None).is_ok(),
+        "INI 里没有 Router 项时，SM75 部署不再失败（原样部署）",
+    );
+
+    if !fails.is_empty() {
+        println!("\n  ★ 有 {} 项断言失败", fails.len());
+        for f in &fails {
+            println!("    - {f}");
+        }
     }
 
     println!("\n===== 自检结束 =====");
@@ -1116,7 +1285,6 @@ fn canceltest() {
         &cancel,
         "",
         false,
-        update::DEFAULT_MIN_SPEED_KBPS,
         &|_p| Ok(()),
         &mut |_, _, _| {},
     );
@@ -1189,7 +1357,6 @@ fn downloadtest() {
         &cancel,
         "",
         false,
-        update::DEFAULT_MIN_SPEED_KBPS,
         &|_p| Ok(()),
         &mut |got, total, _src| {
             if total > 0 && got >= total {
@@ -1240,10 +1407,10 @@ fn downloadtest() {
             let probe = dest.with_file_name("iscurrent-probe.tmp");
             let _ = std::fs::copy(&dest, &probe);
             let present =
-                update::local_is_current(&st, &update::local_name(repo_path), &probe, &remote.etag);
+                update::local_is_current(&st, &update::local_name(repo_path), &probe, &remote);
             let _ = std::fs::remove_file(&probe);
             let gone =
-                update::local_is_current(&st, &update::local_name(repo_path), &probe, &remote.etag);
+                update::local_is_current(&st, &update::local_name(repo_path), &probe, &remote);
             println!(
                 "  [{}] 记录和文件都在时判定为「已是最新」",
                 if present { "PASS" } else { "FAIL" }
@@ -1547,7 +1714,7 @@ fn deploytest() {
                 "复制过去后仍判定为本项目文件"
             );
             // 先确认它是「可覆盖」的，再实际部署一次
-            let advice = scan::advise_proxy(&t5);
+            let advice = scan::advise_proxy(&t5, false);
             check!(
                 advice.occupied.is_empty() && !advice.own_existing.is_empty(),
                 "已有本项目文件时不算被占用，而是归入 own_existing"
@@ -1740,6 +1907,9 @@ struct AssetRow {
     bytes: u64,
     /// 核心 Mod：远端内容指纹（raw 的 ETag = 内容 SHA-256），用来判断有没有更新
     remote_etag: Option<String>,
+    /// 上面这个指纹是不是**官方源**给的。镜像给的指纹和官方对不上，
+    /// 拿它判「有更新」会误报 —— 见 update::RemoteFile::etag_trusted
+    remote_etag_trusted: bool,
     /// DLSS 运行库：本地文件名，靠签名判断在不在
     runtime_file: Option<String>,
 }
@@ -1824,6 +1994,14 @@ struct App {
     /// Some 里是要问用户是否移除的那些文件名。
     asked_extra_proxies: Option<Vec<String>>,
 
+    // ---- 反作弊：不再直接拦死，改成弹窗问一句（用户明确要求"可以直接继续"）
+    /// Some 时显示确认弹窗，里面是检出明细
+    kernel_ac_pending: Option<AcReport>,
+    /// 用户这次选择了「仍要部署」。只对本次生效，部署完就清掉。
+    allow_kernel_ac: bool,
+    /// 用户在「另一个代理」弹窗里定下来的选择，等真正部署时用
+    deploy_extras: Vec<String>,
+
     // ---- 硬件加速 GPU 计划（DLSS 帧生成的系统前提，只读 + 跳转，绝不写注册表）
     hags: gpu::HagsState,
     /// 部署完成后要不要提示去开硬件加速
@@ -1839,9 +2017,9 @@ struct App {
     cancel: Option<Arc<AtomicBool>>,
     use_backup: bool,
     backup_prefix: String,
+    /// 是否使用老版 native 包（archive/0.2.4/）—— RTX 20 / GTX 16 系用得上
+    legacy_native: bool,
     download_failed: bool,
-    /// 低于这个速率（KB/s）就换源
-    min_speed_kbps: u64,
     /// 测速结果，界面按它列候选源
     speed_results: Vec<update::SourceSpeed>,
     speed_testing: bool,
@@ -1925,6 +2103,9 @@ impl App {
             spoof_pending: None,
             confirm_old_driver: false,
             asked_extra_proxies: None,
+            kernel_ac_pending: None,
+            allow_kernel_ac: false,
+            deploy_extras: Vec::new(),
             hags_fake: match std::env::var("DLSSG_FAKE_HAGS").ok().as_deref() {
                 Some("on") | Some("2") => Some(gpu::HagsState::Enabled),
                 Some("off") | Some("1") => Some(gpu::HagsState::Disabled),
@@ -1951,8 +2132,8 @@ impl App {
             } else {
                 cfg.backup_prefix
             },
+            legacy_native: cfg.legacy_native,
             download_failed: false,
-            min_speed_kbps: cfg.min_speed_kbps as u64,
             speed_results: Vec::new(),
             speed_testing: false,
             dl_started: None,
@@ -1978,7 +2159,7 @@ impl App {
             self.advice = None;
             return;
         };
-        let advice = scan::advise_proxy(&dir);
+        let advice = scan::advise_proxy(&dir, self.legacy_native);
         // 判出来了就把下拉框切到推荐项（用户之后仍可手动改）
         if !advice.undetermined {
             self.proxy = advice.recommended.clone();
@@ -2039,6 +2220,12 @@ impl App {
         if rec.bytes > 0 && size != rec.bytes {
             return AssetState::Outdated;
         }
+        // 指纹只有官方源给的才可信。探测落到镜像时指纹和官方对不上，
+        // 拿它判「有更新」会导致同一个文件每次都被标成需要下载 —— 也就是
+        // 用户报的「不断重复下载」。不可信时按「文件在 + 大小对」当作就绪。
+        if !row.remote_etag_trusted {
+            return AssetState::Ready;
+        }
         match &row.remote_etag {
             Some(remote) if !rec.etag.is_empty() && rec.etag.eq_ignore_ascii_case(remote) => {
                 AssetState::Ready
@@ -2047,6 +2234,82 @@ impl App {
             // 远端指纹没拿到（网络问题）时不要乱报「有更新」
             None => AssetState::Ready,
         }
+    }
+
+    /// 拼一段给开发者看的诊断信息（用户点「复制诊断信息」时用）。
+    /// 只放排查需要的东西，不放任何密钥类内容。
+    fn diagnostic_text(&self) -> String {
+        let mut s = String::new();
+        s.push_str(&format!("FrameGen Manager v{}\n", update::SELF_VERSION));
+        s.push_str(&format!("Windows 构建号: {:?}\n", gpu::windows_build()));
+        s.push_str(&format!("硬件加速 GPU 计划: {}\n", self.hags.label()));
+        s.push_str(&format!(
+            "日志目录: {}\n",
+            log::dir()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "未知".to_owned())
+        ));
+        s.push_str("\n--- 显卡识别 ---\n");
+        s.push_str(&format!("nvidia-smi 报的: {:?}\n", gpu::nvidia_smi_gpu_name()));
+        for a in gpu::enumerate() {
+            s.push_str(&format!(
+                "在位适配器: {}  类键 {}  驱动 {}\n",
+                a.driver_name, a.class_sub, a.driver_version
+            ));
+        }
+        s.push_str(&format!("最终使用: {:?}\n", self.gpu_name));
+        s.push_str(&format!("路由判定: {}\n", self.gpu_route.label()));
+        if let Some(d) = &self.driver {
+            s.push_str(&format!("驱动版本: {}（来源 {}）\n", d.marketing, d.source));
+        }
+        s.push_str(&format!(
+            "资产目录: {}\n",
+            util::assets_dir()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|_| "未知".to_owned())
+        ));
+        if let Some(g) = &self.game_dir {
+            s.push_str(&format!("部署目录: {}\n", g.display()));
+            s.push_str(&format!("部署状态: {}\n", self.deploy_state.label()));
+        }
+        if let Some(ac) = &self.ac_target {
+            s.push_str(&format!("反作弊判定: {}\n", ac.verdict().label()));
+            for h in &ac.hits {
+                s.push_str(&format!(
+                    "  · {}（{}）{}\n",
+                    h.name,
+                    h.tier.label(),
+                    h.evidence
+                ));
+            }
+        }
+        s.push_str(&format!(
+            "下载源: 指定={:?}（下载中不按速度换源，慢源也让它下完）\n",
+            self.backup_prefix
+        ));
+        s.push_str(&format!(
+            "资产版本: {}\n",
+            if self.legacy_native {
+                "老版 native 包 archive/0.2.4（给 RTX 20 / GTX 16 系）"
+            } else {
+                "最新版（上游代理包）"
+            }
+        ));
+        s.push_str("\n--- 最近的操作日志 ---\n");
+        let tail: Vec<&String> = self.logs.iter().rev().take(30).collect();
+        for l in tail.into_iter().rev() {
+            s.push_str(l);
+            s.push('\n');
+        }
+        s
+    }
+
+    /// 记一条日志：既进界面的操作日志，也写磁盘日志。
+    /// 用户反馈问题时把 logs 目录发过来，就有完整上下文了。
+    fn note(&mut self, m: impl Into<String>) {
+        let m = m.into();
+        log::line(&m);
+        self.logs.push(m);
     }
 
     fn refresh(&mut self) {
@@ -2091,7 +2354,7 @@ impl App {
                 for s in &list {
                     match &s.error {
                         None => {
-                            self.logs.push(format!("测速 {}：{} KB/s", s.label, s.kbps));
+                            self.note(format!("测速 {}：{} KB/s", s.label, s.kbps));
                             if !s.prefix.is_empty()
                                 && fastest.as_ref().map(|(k, _)| s.kbps > *k).unwrap_or(true)
                             {
@@ -2099,7 +2362,7 @@ impl App {
                             }
                         }
                         Some(e) => {
-                            self.logs.push(format!("测速 {}：不可用（{e}）", s.label))
+                            self.note(format!("测速 {}：不可用（{e}）", s.label))
                         }
                     }
                 }
@@ -2114,7 +2377,7 @@ impl App {
                 };
             }
             Msg::Done(m) => {
-                self.logs.push(m.clone());
+                self.note(m.clone());
                 self.status = m;
                 self.busy = false;
                 self.progress = None;
@@ -2126,20 +2389,23 @@ impl App {
                 // 否则 Win11 那些本来就开着的用户每次部署都会被骚扰）
                 if self.deploy_in_flight {
                     self.deploy_in_flight = false;
+                    // 只对本次生效的开关，部署完就复位
+                    self.allow_kernel_ac = false;
+                    self.deploy_extras.clear();
                     if self.hags == gpu::HagsState::Disabled {
                         self.hags_prompt = true;
                     }
                 }
             }
             Msg::Failed(e) => {
-                self.logs.push(format!("错误: {e}"));
+                self.note(format!("错误: {e}"));
                 self.status = format!("错误: {e}");
                 self.busy = false;
                 self.progress = None;
                 self.cancel = None;
             }
             Msg::DownloadFailed(e) => {
-                self.logs.push(format!("下载失败: {e}"));
+                self.note(format!("下载失败: {e}"));
                 self.status = format!("下载失败: {e}");
                 self.busy = false;
                 self.progress = None;
@@ -2153,11 +2419,11 @@ impl App {
                 self.driver = gpu::detect_driver(&self.adapters);
                 match r {
                     Ok(m) => {
-                        self.logs.push(m.clone());
+                        self.note(m.clone());
                         self.status = m;
                     }
                     Err(e) => {
-                        self.logs.push(format!("显卡名操作失败: {e}"));
+                        self.note(format!("显卡名操作失败: {e}"));
                         self.status = format!("显卡名操作失败: {e}");
                     }
                 }
@@ -2173,7 +2439,7 @@ impl App {
                             "发现新版本 {v}（当前 v{}），点标题栏的「有新版本」去下载",
                             update::SELF_VERSION
                         );
-                        self.logs.push(m.clone());
+                        self.note(m.clone());
                         self.status = m;
                         self.new_version = Some(v);
                     }
@@ -2181,7 +2447,7 @@ impl App {
                         // 远端版本没变，之前那个入口该撤掉
                         self.new_version = None;
                         let m = format!("已是最新版本（当前 v{}，远端 {v}）", update::SELF_VERSION);
-                        self.logs.push(m.clone());
+                        self.note(m.clone());
                         if manual {
                             self.status = m;
                         }
@@ -2192,7 +2458,7 @@ impl App {
                             "检查新版本失败（网络问题），不影响使用。当前 v{}",
                             update::SELF_VERSION
                         );
-                        self.logs.push(m.clone());
+                        self.note(m.clone());
                         if manual {
                             self.status = m;
                         }
@@ -2208,7 +2474,7 @@ impl App {
                 } else {
                     "已取消下载（未留下任何残留）".to_owned()
                 };
-                self.logs.push(m.clone());
+                self.note(m.clone());
                 self.status = m;
                 self.busy = false;
                 self.progress = None;
@@ -2218,15 +2484,40 @@ impl App {
         }
     }
 
+    /// 切换资产版本：最新版（上游代理包）<-> 老版 native 包（archive/0.2.4）。
+    /// 两版同名文件的内容不同，指纹也不同，所以切换后点「下载 / 更新资产」会重新拉一份。
+    /// 代理入口名单两版不一样，切过去可能停在一个仓库里没有的名字上，顺手重新推断一次。
+    fn set_legacy_native(&mut self, on: bool) {
+        if self.legacy_native == on {
+            return;
+        }
+        self.legacy_native = on;
+        self.save_config();
+        if !scan::proxy_candidates(on).contains(&self.proxy.as_str()) {
+            self.proxy = scan::PROXY_PRIORITY[0].to_owned();
+        }
+        self.redetect();
+        self.status = if on {
+            format!(
+                "已切到老版 native 包（{}）。点「下载 / 更新资产」重新下载（约 16 MB）。",
+                update::LEGACY_PREFIX
+            )
+        } else {
+            "已切回最新版。点「下载 / 更新资产」重新下载（约 17 MB）。".to_owned()
+        };
+        let s = self.status.clone();
+        self.note(s);
+    }
+
     fn save_config(&mut self) {
         let cfg = util::AppConfig {
             asset_dir: util::load_config().asset_dir,
             allow_backup_source: self.use_backup,
             backup_prefix: self.backup_prefix.clone(),
-            min_speed_kbps: self.min_speed_kbps as u32,
+            legacy_native: self.legacy_native,
         };
         if let Err(e) = util::save_config(&cfg) {
-            self.logs.push(format!("保存配置失败: {e}"));
+            self.note(format!("保存配置失败: {e}"));
         }
     }
 
@@ -2241,7 +2532,7 @@ impl App {
         cfg.asset_dir = Some(dir.clone());
         cfg.allow_backup_source = self.use_backup;
         cfg.backup_prefix = self.backup_prefix.clone();
-        cfg.min_speed_kbps = self.min_speed_kbps as u32;
+        cfg.legacy_native = self.legacy_native;
         if let Err(e) = util::save_config(&cfg) {
             self.status = format!("保存配置失败: {e}");
             return;
@@ -2255,7 +2546,7 @@ impl App {
         }
         if let Some(o) = old {
             if o != dir {
-                self.logs.push(format!("旧资产目录仍保留在 {}，需要的话请手动处理。", o.display()));
+                self.note(format!("旧资产目录仍保留在 {}，需要的话请手动处理。", o.display()));
             }
         }
     }
@@ -2303,7 +2594,8 @@ impl App {
     fn start_update_check(&mut self) {
         self.busy = true;
         self.status = "正在检查上游更新...".to_owned();
-        self.spawn(|tx, ctx| {
+        let legacy = self.legacy_native;
+        self.spawn(move |tx, ctx| {
             let res = (|| -> anyhow::Result<UpdateSummary> {
                 let c = update::client()?;
                 let version = update::fetch_version(&c);
@@ -2312,14 +2604,13 @@ impl App {
                 // 六个文件各发一次 HEAD 到 raw.githubusercontent.com 拿内容指纹。
                 // 走的是 CDN，不占 api.github.com 那每小时 60 次的配额 ——
                 // 配额被共享出口 IP 吃光正是之前「检查更新 / 下载」失败的原因。
-                let specs = [
-                    "version.dll".to_owned(),
-                    "altnative/winmm.dll".to_owned(),
-                    "altnative/dinput8.dll".to_owned(),
-                    "altnative/winhttp.dll".to_owned(),
-                    "altnative/dxgi.dll".to_owned(),
-                    update::INI_REPO_PATH.to_owned(),
-                ];
+                // 在用的那一版有哪些文件：新版（代理包）6 个入口，老版 native 5 个。
+                // 名单写死过一次，上游把 altnative/ 改名成 alternatives/ 之后就全 404 了。
+                let mut specs: Vec<String> = scan::proxy_candidates(legacy)
+                    .iter()
+                    .map(|p| update::proxy_repo_path(p, legacy).to_owned())
+                    .collect();
+                specs.push(update::ini_repo_path(legacy).to_owned());
                 let mut first_err: Option<String> = None;
                 for path in specs {
                     match update::probe_remote(&c, &path) {
@@ -2333,6 +2624,7 @@ impl App {
                                     &r.etag[..r.etag.len().min(10)]
                                 ),
                                 bytes: r.size,
+                                remote_etag_trusted: r.etag_trusted,
                                 remote_etag: Some(r.etag),
                                 runtime_file: None,
                             });
@@ -2360,6 +2652,7 @@ impl App {
                         label: dll_name.to_owned(),
                         detail: format!("{tag} · {zip_name}（{label}）"),
                         bytes: size,
+                        remote_etag_trusted: false,
                         remote_etag: None,
                         runtime_file: Some(dll_name.to_owned()),
                     });
@@ -2378,7 +2671,7 @@ impl App {
         let proxy = self.proxy.clone();
         let use_backup = self.use_backup && !self.backup_prefix.trim().is_empty();
         let prefix = self.backup_prefix.trim().to_owned();
-        let min_kbps = self.min_speed_kbps;
+        let legacy = self.legacy_native;
         let cancel = Arc::new(AtomicBool::new(false));
         self.cancel = Some(cancel.clone());
         self.busy = true;
@@ -2412,8 +2705,8 @@ impl App {
                 }
 
                 let specs = [
-                    update::proxy_repo_path(&proxy).to_owned(),
-                    update::INI_REPO_PATH.to_owned(),
+                    update::proxy_repo_path(&proxy, legacy).to_owned(),
+                    update::ini_repo_path(legacy).to_owned(),
                 ];
                 let mut items: Vec<Item> = Vec::new();
                 let mut skipped = 0usize;
@@ -2425,7 +2718,19 @@ impl App {
 
                     // 已经是最新版就不重下 —— 15 MB 的代理 DLL 没必要每次都拉一遍。
                     // 判定要求「记录在 + 指纹一致 + 文件真的在且大小对」，缺一不可。
-                    if update::local_is_current(&state, &local, &dest, &remote.etag) {
+                    let cur = update::local_is_current(&state, &local, &dest, &remote);
+                    let rec = state.files.get(&local);
+                    log::line(&format!(
+                        "{local}: 探测 size={} etag={} 指纹可信={} | 记录 etag={:?} 记录字节={:?} | 文件在={} | 判定={}",
+                        remote.size,
+                        &remote.etag[..remote.etag.len().min(12)],
+                        remote.etag_trusted,
+                        rec.map(|r| r.etag.clone()),
+                        rec.map(|r| r.bytes),
+                        dest.is_file(),
+                        if cur { "已是最新，跳过" } else { "需要下载" }
+                    ));
+                    if cur {
                         skipped += 1;
                         continue;
                     }
@@ -2490,7 +2795,6 @@ impl App {
                         &cancel,
                         &prefix,
                         is_dll,
-                        min_kbps,
                         &verifier,
                         &mut move |got, len, src| {
                             let denom = if len > 0 { len } else { expect };
@@ -2540,12 +2844,16 @@ impl App {
                         base_step: mod_steps,
                         total_steps: steps,
                     };
-                    update::ensure_dlss_runtime(&c, &cancel, &plan, ctx, min_kbps, move |msg, f| {
+                    update::ensure_dlss_runtime(&c, &cancel, &plan, ctx, move |msg, f| {
                         let _ = tx2.send(Msg::Progress(msg, f, total));
                         ctx2.request_repaint();
                     })?;
                 }
 
+                log::line(&format!(
+                    "本次下载结束：跳过 {skipped} 个已是最新的文件，下载目标合计 {} 字节",
+                    total
+                ));
                 Ok(if skipped > 0 {
                     format!(
                         "资产已就绪（{skipped} 个文件本来就是最新版，未重复下载）-> {}",
@@ -2669,14 +2977,18 @@ impl App {
             _ => {}
         }
 
-        // 反作弊闸门：内核级直接拒绝。这里用深度扫描，安全优先。
+        // 反作弊闸门：检出内核级时**先弹窗问一句**，而不是直接拦死。
+        // 用户明确要求可以继续 —— 但默认动作仍然是「取消部署」，而且不管选哪个
+        // 都会写进日志，将来真出问题能追溯。
         let ac = anticheat::scan_deep(&dir);
         let blocked = ac.is_blocked();
-        self.ac_target = Some(ac);
-        if blocked {
-            self.status = "已阻止部署：该游戏检测到内核级反作弊，使用可能导致封号".to_owned();
+        if blocked && !self.allow_kernel_ac {
+            self.ac_target = Some(ac.clone());
+            self.deploy_extras = remove_extra;
+            self.kernel_ac_pending = Some(ac);
             return;
         }
+        self.ac_target = Some(ac);
 
         let proxy = self.proxy.clone();
         let dll = update::asset_path(&proxy).unwrap_or_default();
@@ -2748,7 +3060,7 @@ impl App {
         };
         self.busy = true;
         self.status = "已请求管理员权限，请在弹窗上点「是」...".to_owned();
-        self.logs.push(format!(
+        self.note(format!(
             "正在{}显卡名称（会弹一次 UAC）",
             if matches!(op, gpu::Op::Restore(_)) {
                 "还原"
@@ -3155,7 +3467,7 @@ impl eframe::App for App {
                                 a.recommended, a.reason
                             ),
                         };
-                        self.logs.push(msg.clone());
+                        self.note(msg.clone());
                         self.status = msg;
                     }
 
@@ -3287,7 +3599,7 @@ impl eframe::App for App {
                         ui.label(theme::hint(txt));
                     }
                     ui.label(theme::hint(
-                        "选中的源排最前面，其余镜像仍会兜底；下载中低于阈值会自动换源。",
+                        "选中的源排最前面，其余镜像仍会兜底；下载中不会因为慢而换源，慢也让它慢慢下完。",
                     ));
                     ui.collapsing("填自己的源地址（高级）", |ui| {
                         ui.add(
@@ -3421,8 +3733,8 @@ impl eframe::App for App {
                         egui::ComboBox::from_id_salt("proxy-entry")
                             .selected_text(self.proxy.clone())
                             .show_ui(ui, |ui| {
-                                for p in scan::PROXY_PRIORITY {
-                                    ui.selectable_value(&mut self.proxy, p.to_owned(), p);
+                                for p in scan::proxy_candidates(self.legacy_native) {
+                                    ui.selectable_value(&mut self.proxy, (*p).to_owned(), *p);
                                 }
                             });
                     });
@@ -3449,15 +3761,38 @@ impl eframe::App for App {
                         _ => {}
                     }
 
-                    // 部署前预告会改 INI
+                    // RTX 20 / GTX 16 系（SM75）：上游 0.3.0 改回代理模式后只面向 RTX 30 系，
+                    // 给这类用户一个切到老版 native 包的开关 —— 那一版仍然支持 SM75。
                     if self.gpu_route == scan::GpuRoute::Sm75 {
-                        ui.label(
-                            egui::RichText::new(
-                                "⚠ 部署时会自动把 INI 的 Router 改为 SM75（你的显卡属于 Turing/SM75）。",
+                        ui.add_space(2.0);
+                        if self.legacy_native {
+                            theme::badge(ui, "正在用老版 native 包", theme::WARN);
+                            ui.label(theme::hint(
+                                "老版 native 包（archive/0.2.4）仍支持 RTX 20 / GTX 16 系，部署时会自动把 INI 的 Router 改成 SM75。",
+                            ));
+                            if theme::ghost_button(ui, "改回最新版（上游代理包）", !self.busy).clicked()
+                            {
+                                self.set_legacy_native(false);
+                            }
+                        } else {
+                            ui.label(
+                                egui::RichText::new(
+                                    "你的显卡是 RTX 20 / GTX 16 系（Turing / SM75）。上游 0.3.0 改回代理模式后只面向 RTX 30 系，装了很可能不生效。",
+                                )
+                                .size(11.5)
+                                .color(theme::WARN),
+                            );
+                            if theme::ghost_button(
+                                ui,
+                                "改用老版 native 包（支持 RTX 20 系）",
+                                !self.busy,
                             )
-                            .size(11.5)
-                            .color(theme::WARN),
-                        );
+                            .on_hover_text("下载上游归档的 0.2.4 native 版，约 16 MB；随时可以切回来")
+                            .clicked()
+                            {
+                                self.set_legacy_native(true);
+                            }
+                        }
                     }
                     // 部署后展示实际改动
                     for c in &self.ini_changes {
@@ -3763,6 +4098,39 @@ impl eframe::App for App {
                 // --- 操作日志
                 theme::card(ui, |ui| {
                     theme::card_title(ui, "操作日志");
+                    let mut open_logs = false;
+                    let mut copy_diag = false;
+                    ui.horizontal(|ui| {
+                        if theme::ghost_button(ui, "打开日志文件夹", true)
+                            .on_hover_text("把日志文件发给开发者，问题基本一眼能看出来")
+                            .clicked()
+                        {
+                            open_logs = true;
+                        }
+                        if theme::ghost_button(ui, "复制诊断信息", true)
+                            .on_hover_text("把版本、系统、显卡识别、资产状态等信息复制到剪贴板")
+                            .clicked()
+                        {
+                            copy_diag = true;
+                        }
+                    });
+                    ui.label(theme::hint(format!(
+                        "日志：{}　每次启动一个文件，最多保留 10 个。里面有本地路径和用户名，发给别人前先看一眼。",
+                        log::path()
+                            .map(|p| p.display().to_string())
+                            .unwrap_or_else(|| "程序同级的 logs 目录".to_owned())
+                    )));
+                    if open_logs {
+                        match log::dir() {
+                            Some(d) => open_in_explorer(&d),
+                            None => self.status = "打不开日志目录".to_owned(),
+                        }
+                    }
+                    if copy_diag {
+                        let text = self.diagnostic_text();
+                        self.ctx.copy_text(text);
+                        self.status = "诊断信息已复制到剪贴板".to_owned();
+                    }
                     if self.logs.is_empty() {
                         ui.label(theme::hint("暂无操作记录。"));
                     }
@@ -4099,6 +4467,67 @@ impl eframe::App for App {
             } else if keep {
                 self.asked_extra_proxies = None;
                 self.do_deploy(Vec::new());
+            }
+        }
+
+        // ---------------- 检出内核级反作弊时的确认（不再直接拦死）
+        if let Some(ac) = self.kernel_ac_pending.clone() {
+            let ctx = self.ctx.clone();
+            let mut go = false;
+            let mut cancel = false;
+            egui::Window::new("该游戏检测到内核级反作弊")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+                .show(&ctx, |ui| {
+                    ui.set_max_width(520.0);
+                    for h in &ac.hits {
+                        ui.label(
+                            egui::RichText::new(format!("· {}（{}）", h.name, h.tier.label()))
+                                .size(12.5)
+                                .color(theme::DANGER)
+                                .strong(),
+                        );
+                        if !h.evidence.is_empty() {
+                            ui.label(theme::hint(h.evidence.clone()));
+                        }
+                    }
+                    ui.add_space(6.0);
+                    ui.label(
+                        "修改游戏文件可能被内核级反作弊判定为异常，**存在封号风险**。这一点由你自己判断。",
+                    );
+                    ui.add_space(4.0);
+                    ui.label(theme::hint(
+                        "如果这个游戏你并不在意，或者它只是装了反作弊但你没在玩它，继续一般没问题。",
+                    ));
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        // 默认动作是取消，所以把「取消部署」放在显眼位置
+                        if theme::primary_button(ui, "取消部署", true).clicked() {
+                            cancel = true;
+                        }
+                        if theme::danger_button(ui, "仍要部署", true).clicked() {
+                            go = true;
+                        }
+                    });
+                });
+            if go {
+                self.kernel_ac_pending = None;
+                self.allow_kernel_ac = true;
+                let names: Vec<String> =
+                    ac.hits.iter().map(|h| h.name.clone()).collect();
+                self.note(format!(
+                    "⚠ 用户确认在内核级反作弊（{}）的情况下继续部署，风险自负",
+                    names.join("、")
+                ));
+                let extras = self.deploy_extras.clone();
+                self.do_deploy(extras);
+            } else if cancel {
+                self.kernel_ac_pending = None;
+                self.allow_kernel_ac = false;
+                self.deploy_extras.clear();
+                self.status = "已取消部署".to_owned();
+                log::line("用户在内核级反作弊确认弹窗里选择了取消");
             }
         }
 

@@ -32,8 +32,8 @@ Windows 桌面工具，把 [sdli1995/dlssg_for_sm86](https://github.com/sdli1995
 
 | 文件 | 用途 |
 |---|---|
-| version.dll | 代理入口（名字被占用时自动改用 winmm / dinput8 / winhttp / dxgi） |
-| dlssg_sm86.ini | 配置（RTX 20 系会自动改 Router=SM75） |
+| version.dll | 代理入口（名字被占用时自动改用 winmm / dbghelp / dinput8 / dxgi / d3d12） |
+| dlssg_sm86.ini | 配置（老版 native 包下，RTX 20 系会自动改 Router=SM75） |
 | nvngx_dlssg.dll | DLSS 帧生成运行库 |
 | nvngx_dlss.dll | DLSS 超分运行库 |
 
@@ -44,6 +44,14 @@ Windows 桌面工具，把 [sdli1995/dlssg_for_sm86](https://github.com/sdli1995
 上游更新之后再点一次「部署」也安全：备份里保存的始终是**最开始那份**游戏原文件，
 不会被我们自己部署进去的旧版本覆盖掉。手动换了代理入口再部署时，旧入口会被自动清掉，
 不会出现两个代理并存。
+
+### RTX 20 系（Turing / SM75）用哪一版
+
+上游 0.3.0 把项目从 native 模式改回了代理模式，**新版只面向 RTX 30 系（SM86）**。
+所以如果你是 RTX 20 / GTX 16 系，程序会在「部署」卡片给一个「改用老版 native 包」的按钮
+—— 它会切到上游归档的 archive/0.2.4/（那一版仍然支持 SM75，部署时会自动把 INI 的
+Router 改成 SM75），随时可以再切回最新版。两版的文件名相同、内容不同，所以每次切换后
+都要点一下「下载 / 更新资产」重下一份（约 16–17 MB）。
 
 ## 显卡驱动版本
 

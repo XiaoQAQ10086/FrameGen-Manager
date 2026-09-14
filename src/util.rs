@@ -131,24 +131,20 @@ pub struct AppConfig {
     /// 用户选定的下载源前缀。留空 = 自动（按实测速率挑最快的那个）。
     #[serde(default)]
     pub backup_prefix: String,
-    /// 低于这个速率（KB/s）就换源。0 = 关掉看门狗。
-    #[serde(default = "default_min_speed")]
-    pub min_speed_kbps: u32,
+    /// 是否使用老版 native 包（archive/0.2.4/）。
+    /// 上游 0.3.0 改回代理模式后只面向 RTX 30 系，RTX 20 / GTX 16 系（SM75）用户
+    /// 可以切到这里，换回仍然支持他们的 native 版。默认关。
+    #[serde(default)]
+    pub legacy_native: bool,
 }
 
-fn default_min_speed() -> u32 {
-    crate::update::DEFAULT_MIN_SPEED_KBPS as u32
-}
-
-/// Default 要手写：配置文件不存在时 load_config 会回退到 Default，
-/// 而 u32 的 Default 是 0 —— 那等于默认把看门狗关了，正好是这个功能要修的毛病。
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
             asset_dir: None,
             allow_backup_source: false,
             backup_prefix: String::new(),
-            min_speed_kbps: default_min_speed(),
+            legacy_native: false,
         }
     }
 }
