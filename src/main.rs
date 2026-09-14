@@ -891,6 +891,50 @@ fn selftest() {
         );
     }
 
+    // WeGame：判定保守，只认「里面真能找到游戏程序」的目录。
+    // 开发机上没装 WeGame，所以这里验的是**不变式**（扫出来的都必须是真的），不是数量。
+    let wg = scan::scan_wegame();
+    let wg_ok = wg
+        .iter()
+        .all(|g| g.install_dir.is_dir() && scan::find_render_exe(&g.install_dir).is_some());
+    println!(
+        "  [{}] WeGame 扫出 {} 条，每条都指向真实存在的游戏目录{}",
+        if wg_ok { "PASS" } else { "FAIL" },
+        wg.len(),
+        if wg.is_empty() { "（本机没装 WeGame，属正常）" } else { "" }
+    );
+    for g in &wg {
+        println!("      {} -> {}", g.name, g.install_dir.display());
+    }
+    println!(
+        "  [{}] WeGame 没装就不列任何东西（本机装了 QQ，它的键也在 Tencent 下面）",
+        if scan::wegame_installed() || wg.is_empty() { "PASS" } else { "FAIL" }
+    );
+    println!(
+        "  [{}] 没把 QQNT 之类的客户端当成 WeGame 游戏",
+        if wg.iter().all(|g| !g.name.eq_ignore_ascii_case("QQNT")) { "PASS" } else { "FAIL" }
+    );
+    println!(
+        "  [{}] wegame_value_is_path_like：InstallPath=true / Name=false",
+        if scan::wegame_value_is_path_like("InstallPath")
+            && !scan::wegame_value_is_path_like("Name")
+        {
+            "PASS"
+        } else {
+            "FAIL"
+        }
+    );
+    println!(
+        "  [{}] wegame_name_from_key：带编号的后缀会被去掉",
+        if scan::wegame_name_from_key("铁甲雄兵(2000806)") == "铁甲雄兵"
+            && scan::wegame_name_from_key("DNF") == "DNF"
+        {
+            "PASS"
+        } else {
+            "FAIL"
+        }
+    );
+
     println!("\n--- 系统反作弊（注册表服务/驱动） ---");
     let sys = anticheat::scan_system();
     for h in &sys.hits {
@@ -2220,7 +2264,7 @@ impl App {
 
     fn start_scan(&mut self) {
         self.busy = true;
-        self.status = "正在扫描 Steam / Epic 游戏库...".to_owned();
+        self.status = "正在扫描 Steam / Epic / WeGame 游戏库...".to_owned();
         self.spawn(|tx, ctx| {
             let rows: Vec<GameRow> = scan::scan_all()
                 .into_iter()
@@ -3766,7 +3810,7 @@ impl eframe::App for App {
                         .strong(),
                 );
                 ui.add_space(6.0);
-                if theme::ghost_button(ui, "扫描 Steam / Epic", !self.busy).clicked() {
+                if theme::ghost_button(ui, "扫描 Steam / Epic / WeGame", !self.busy).clicked() {
                     self.start_scan();
                 }
                 if self.scanned {
@@ -3777,7 +3821,7 @@ impl eframe::App for App {
 
             if !self.scanned {
                 ui.label(theme::hint(
-                    "点「扫描 Steam / Epic」列出已安装游戏。启动时不扫描，也不会后台轮询。",
+                    "点「扫描 Steam / Epic / WeGame」列出已安装游戏。启动时不扫描，也不会后台轮询。WeGame 的判定比较保守（它的记录方式没有官方文档），扫不出来的话用「选择目录」手动指到游戏渲染 EXE 所在的文件夹即可。",
                 ));
                 return;
             }

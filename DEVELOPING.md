@@ -351,6 +351,29 @@ Win10 用 `ms-settings:display-advancedgraphics`。
 调试开关 `DLSSG_FAKE_HAGS=on|off|unknown` 可以强制三种状态，用来截图验证显示；
 `--gpuinfo` 里有 5 条断言盯着"值 -> 状态"的翻译；`--openhags` 单独测跳转。
 
+### WeGame 扫描（保守实现，未在真实环境验证）
+
+**上游没有官方文档。** WeGame 把每个游戏的安装位置记在注册表里 —— 网上流传的「重装系统后
+重新关联 WeGame 游戏」的土办法就是手工重建这些键，说明这些键就是 WeGame 判断安装位置的
+依据。所以 `scan_wegame()` 去枚举 `HKLM\SOFTWARE[\WOW6432Node]\Tencent` 的子键，
+从值里找指向真实目录的路径。WeGame 是 32 位程序，所以主要看 WOW6432Node 那一侧。
+
+**开发机上没装 WeGame，所以这部分没有在真实环境验证过**（其他平台都是拿真实机器验的）。
+为此判定做得非常保守：**只有目录里真能找到游戏可执行文件才算一条记录**，宁可漏报也不列
+垃圾。扫不到不影响使用 —— 界面上还有「选择目录」。
+
+**踩到的坑（自测抓出来的）**：本机装了 QQ，而 QQ 的注册表键**也在 Tencent 下面**，它的
+数据指向 QQ 自己的安装目录，里头当然找得到 exe —— 于是一度被当成一条「WeGame 游戏」
+列了出来（显示成 "QQNT"）。现在有两道闸：
+
+1. `wegame_installed()` —— WeGame 自己没装就直接返回空，不去 Tencent 键下面瞎猜；
+2. `WEGAME_NON_GAME_KEYS` —— 精确匹配（不前缀匹配，免得误杀「QQ飞车」这类真游戏）
+   跳过 QQ / QQNT / WeChat / TIM 之类的客户端键。
+
+`--selftest` 里验的是**不变式**（扫出来的每条都必须指向真实存在、且能找到游戏程序的
+目录），不是数量 —— 因为本机没有 WeGame，数量恒为 0，验数量没意义。另外还有两条纯函数
+断言（`wegame_value_is_path_like` / `wegame_name_from_key`）。
+
 ### 显卡名称伪装（注册表）
 
 只改 `HKLM\SYSTEM\CurrentControlSet\Enum\PCI\<设备>\<实例>\DeviceDesc` 一个值。

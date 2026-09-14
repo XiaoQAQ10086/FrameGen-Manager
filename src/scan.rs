@@ -10,6 +10,8 @@ use winreg::RegKey;
 pub enum Launcher {
     Steam,
     Epic,
+    /// 腾讯 WeGame。扫描判定很保守，见 scan_wegame() 的注释。
+    WeGame,
 }
 
 impl Launcher {
@@ -17,6 +19,7 @@ impl Launcher {
         match self {
             Launcher::Steam => "Steam",
             Launcher::Epic => "Epic",
+            Launcher::WeGame => "WeGame",
         }
     }
 }
@@ -272,6 +275,192 @@ fn rd_u32(d: &[u8], o: usize) -> u32 {
 }
 
 /// 解析 PE 导入表，返回被导入的 DLL 名（全小写）。任何异常一律返回空表，不 panic。
+// ---------------------------------------------------------------- WeGame
+
+/// WeGame 把「每个游戏装在哪」记在注册表的这些根下面，一个游戏一个子键。
+///
+/// 这个布局**没有官方文档**，是从社区资料推断出来的 —— 网上流传的「重装系统后重新
+/// 关联 WeGame 游戏」的土办法，就是手工把这些键重建出来，说明这些键正是 WeGame
+/// 判断安装位置的依据。WeGame 是 32 位程序，所以主要看 WOW6432Node 那一侧。
+const WEGAME_REG_ROOTS: [&str; 2] = ["SOFTWARE\\WOW6432Node\\Tencent", "SOFTWARE\\Tencent"];
+
+/// WeGame 自己的安装目录候选（用来找它自带的 apps 目录）。
+const WEGAME_INSTALL_SUBDIRS: [&str; 4] =
+    ["Tencent\\WeGame", "Tencent\\wegame", "WeGame", "wegame"];
+
+/// 值名像不像「安装路径」。纯粹按名字猜 —— 这就是没文档的代价。
+pub fn wegame_value_is_path_like(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    n.contains("path") || n.contains("dir") || n.contains("install") || n.contains("location")
+}
+
+/// 值名像不像「游戏显示名」。
+pub fn wegame_value_is_name_like(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    n == "name" || n == "gamename" || n == "displayname" || n == "title"
+}
+
+/// 注册表键名 -> 游戏名。WeGame 的键名有时带编号后缀，去掉它。
+pub fn wegame_name_from_key(key: &str) -> String {
+    let s = key.trim().trim_end_matches(')');
+    let mut out = s;
+    if let Some(i) = s.rfind(|c: char| c == '(' || c == '_' || c == '-') {
+        let tail = s[i + 1..].trim();
+        if !tail.is_empty() && tail.chars().all(|c| c.is_ascii_digit()) {
+            out = s[..i].trim_end();
+        }
+    }
+    if out.is_empty() {
+        s.to_owned()
+    } else {
+        out.to_owned()
+    }
+}
+
+/// 这些 Tencent 子键明显不是 WeGame 游戏（客户端、聊天工具之类）。
+///
+/// 只做**精确匹配**，不做前缀匹配 —— 免得把「QQ飞车」这种真游戏一起误杀。
+const WEGAME_NON_GAME_KEYS: [&str; 9] = [
+    "WeGame", "wegame", "QQ", "QQNT", "QQProtect", "WeChat", "Weixin", "TIM", "TencentDocs",
+];
+
+/// WeGame 自己装没装。
+///
+/// 这个前提挡掉的是最要命的一类误报：本机装了 QQ，而 QQ 的注册表键**也在 Tencent
+/// 下面**，它的数据指向 QQ 自己的安装目录，里头当然找得到 exe —— 于是被当成一条
+/// 「WeGame 游戏」列出来了（实测踩到过）。装都没装 WeGame，就不可能有 WeGame 游戏。
+pub fn wegame_installed() -> bool {
+    let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
+    for root in ["SOFTWARE\\WOW6432Node\\Tencent\\WeGame", "SOFTWARE\\Tencent\\WeGame"] {
+        if hklm.open_subkey(root).is_ok() {
+            return true;
+        }
+    }
+    !wegame_install_bases().is_empty()
+}
+
+/// 扫描 WeGame 已安装的游戏。
+///
+/// **判定故意非常保守**，两个原因：
+///   1. 这个注册表布局没有官方文档，是从社区资料推断的；
+///   2. 开发机上没装 WeGame，**没法在真实环境验证**（其他平台都是拿真实机器验过的）。
+/// 所以只把「里面真能找到游戏可执行文件的目录」当成一条记录 —— 宁可漏报，也不列一堆
+/// 垃圾让用户困惑。扫不到不影响使用：界面上还能用「选择目录」手动指到渲染 EXE 的文件夹。
+pub fn scan_wegame() -> Vec<GameEntry> {
+    // 没装 WeGame 就直接返回空 —— 别去 Tencent 键下面瞎猜
+    if !wegame_installed() {
+        return Vec::new();
+    }
+    let mut out: Vec<GameEntry> = Vec::new();
+    let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
+
+    for root in WEGAME_REG_ROOTS {
+        let Ok(k) = hklm.open_subkey(root) else { continue };
+        for key_name in k.enum_keys().flatten() {
+            // 客户端 / 聊天工具之类的键不是游戏
+            if WEGAME_NON_GAME_KEYS
+                .iter()
+                .any(|n| key_name.eq_ignore_ascii_case(n))
+            {
+                continue;
+            }
+            let Ok(gk) = k.open_subkey(&key_name) else { continue };
+
+            let mut dir: Option<PathBuf> = None;
+            let mut weak: Option<PathBuf> = None;
+            let mut display: Option<String> = None;
+
+            for (vname, _) in gk.enum_values().flatten() {
+                let Ok(s) = gk.get_value::<String, _>(&vname) else { continue };
+                let s = s.trim();
+                if s.is_empty() {
+                    continue;
+                }
+                if wegame_value_is_name_like(&vname) && display.is_none() {
+                    display = Some(s.to_owned());
+                    continue;
+                }
+                if let Some(d) = wegame_existing_dir(s) {
+                    if wegame_value_is_path_like(&vname) && dir.is_none() {
+                        dir = Some(d);
+                    } else if weak.is_none() {
+                        weak = Some(d);
+                    }
+                }
+            }
+
+            let Some(dir) = dir.or(weak) else { continue };
+            // 必须有能找到的游戏程序 —— 这一条把绝大多数噪音挡在外面
+            if find_render_exe(&dir).is_none() {
+                continue;
+            }
+            let name = display
+                .filter(|n| !n.trim().is_empty())
+                .unwrap_or_else(|| wegame_name_from_key(&key_name));
+            push_wegame(&mut out, name, dir);
+        }
+    }
+
+    // WeGame 自己的安装目录下可能有 apps\ 结构，兜底再扫一遍
+    for base in wegame_install_bases() {
+        let Ok(rd) = std::fs::read_dir(base.join("apps")) else { continue };
+        for e in rd.flatten() {
+            let p = e.path();
+            if !p.is_dir() || find_render_exe(&p).is_none() {
+                continue;
+            }
+            let name = e.file_name().to_string_lossy().to_string();
+            if !name.trim().is_empty() {
+                push_wegame(&mut out, name, p);
+            }
+        }
+    }
+
+    out
+}
+
+/// 一个值里的字符串若指向已存在的目录（或者是文件、就取它所在的目录），返回它。
+fn wegame_existing_dir(s: &str) -> Option<PathBuf> {
+    let p = PathBuf::from(s);
+    if p.is_dir() {
+        return Some(p);
+    }
+    if p.is_file() {
+        if let Some(parent) = p.parent() {
+            if parent.is_dir() {
+                return Some(parent.to_path_buf());
+            }
+        }
+    }
+    None
+}
+
+fn push_wegame(out: &mut Vec<GameEntry>, name: String, dir: PathBuf) {
+    if out.iter().any(|g| g.install_dir == dir) {
+        return;
+    }
+    out.push(GameEntry {
+        source: Launcher::WeGame,
+        app_id: String::new(),
+        name,
+        install_dir: dir,
+    });
+}
+
+fn wegame_install_bases() -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for var in ["ProgramFiles(x86)", "ProgramFiles"] {
+        let Ok(pf) = std::env::var(var) else { continue };
+        for sub in WEGAME_INSTALL_SUBDIRS {
+            let p = PathBuf::from(&pf).join(sub);
+            if p.is_dir() {
+                out.push(p);
+            }
+        }
+    }
+    out
+}
+
 pub fn pe_imports(path: &Path) -> Vec<String> {
     let Ok(file) = std::fs::File::open(path) else {
         return Vec::new();
@@ -921,6 +1110,7 @@ pub fn find_render_exe(install_dir: &Path) -> Option<PathBuf> {
 pub fn scan_all() -> Vec<GameEntry> {
     let mut all = scan_steam();
     all.extend(scan_epic());
+    all.extend(scan_wegame());
     all.sort_by_key(|g| g.name.to_lowercase());
     all
 }
