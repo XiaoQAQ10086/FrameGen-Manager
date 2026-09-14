@@ -1237,6 +1237,34 @@ fn selftest() {
         "INI 里没有 Router 项时，SM75 部署不再失败（原样部署）",
     );
 
+    println!("\n--- Steam 运行库过滤（别误杀真游戏）---");
+    {
+        let cases: [(&str, bool); 7] = [
+            ("Proton Bus Simulator", false),
+            ("Proton 9.0", true),
+            ("Proton Experimental", true),
+            ("Steam Linux Runtime 3.0 (sniper)", true),
+            ("SteamVR", true),
+            ("Steamworks Common Redistributables", true),
+            ("Counter-Strike 2", false),
+        ];
+        for (name, want_junk) in cases {
+            let got = scan::is_steam_junk(name);
+            ck(
+                &mut fails,
+                got == want_junk,
+                &format!("{name} -> 当运行库排除={got}"),
+            );
+        }
+        ck(
+            &mut fails,
+            scan::uninstall_is_steam("Steam")
+                && !scan::uninstall_is_steam("SteamVR")
+                && !scan::uninstall_is_steam("Steamworks"),
+            "卸载项里只有名为 Steam 的那条算 Steam 本体",
+        );
+    }
+
     println!("\n--- 部署状态文案（别让人读成「部署失败」）---");
     {
         let manual = deploy::DeployState::ManuallyInstalled {
@@ -2085,8 +2113,8 @@ struct UpdateSummary {
 }
 
 enum Msg {
-    /// 扫描完成
-    Scanned(Vec<GameRow>),
+    /// 扫描完成（附带扫描过程的说明：谁被跳过了、为什么）
+    Scanned(Vec<GameRow>, Vec<String>),
     /// 启动时从缓存里恢复出来的游戏库（行 / 扫描时间 / 丢掉了几个失效条目）
     LibraryLoaded(Vec<GameRow>, String, usize),
     /// 后台跑完的深度反作弊扫描（带着目录，用来丢弃过期的结果）
@@ -2699,7 +2727,7 @@ impl App {
 
     fn handle(&mut self, msg: Msg) {
         match msg {
-            Msg::Scanned(rows) => {
+            Msg::Scanned(rows, notes) => {
                 // 手动条目接在扫描结果后面 —— 重新扫描绝不能把它们冲掉
                 let manual_rows: Vec<GameRow> = self
                     .manual
@@ -2712,7 +2740,26 @@ impl App {
                 self.scanned = true;
                 self.busy = false;
                 self.scanned_at = util::now_utc();
-                self.status = format!("扫描完成，共 {n} 个游戏");
+                // 扫描过程说明也放进界面上的操作日志（太多就只放前面一部分），
+                // 这样用户在界面上就能看到「某某被跳过、为什么」。
+                let shown = notes.len().min(25);
+                for l in notes.iter().take(shown) {
+                    self.note(l.clone());
+                }
+                if notes.len() > shown {
+                    self.note(format!(
+                        "（还有 {} 条扫描说明，见 logs 目录）",
+                        notes.len() - shown
+                    ));
+                }
+                self.status = if notes.is_empty() {
+                    format!("扫描完成，共 {n} 个游戏")
+                } else {
+                    format!(
+                        "扫描完成，共 {n} 个游戏（{} 条扫描说明，见下方操作日志）",
+                        notes.len()
+                    )
+                };
                 // 顺手把这次的结果留给下一次启动用
                 self.persist_library();
             }
@@ -2973,11 +3020,14 @@ impl App {
         self.busy = true;
         self.status = "正在扫描 Steam / Epic / WeGame 游戏库...".to_owned();
         self.spawn(|tx, ctx| {
-            let rows: Vec<GameRow> = scan::scan_all()
+            // scan_all_notes 会把「谁被跳过、为什么」一并带回来（同时已经写进日志），
+            // 用户报「扫不出来」时这就是唯一的线索。
+            let (entries, notes) = scan::scan_all_notes();
+            let rows: Vec<GameRow> = entries
                 .into_iter()
                 .map(|entry| App::build_row(entry, false))
                 .collect();
-            let _ = tx.send(Msg::Scanned(rows));
+            let _ = tx.send(Msg::Scanned(rows, notes));
             ctx.request_repaint();
         });
     }

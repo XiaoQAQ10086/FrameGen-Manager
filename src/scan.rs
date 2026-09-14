@@ -193,80 +193,236 @@ fn norm_key(p: &Path) -> String {
     p.to_string_lossy().to_lowercase().replace('/', "\\")
 }
 
-pub fn steam_roots() -> Vec<PathBuf> {
-    let mut cands = Vec::new();
-    if let Some(p) = reg_str(
-        RegKey::predef(HKEY_CURRENT_USER),
-        "Software\\Valve\\Steam",
-        "SteamPath",
-    ) {
-        cands.push(normalize_win_path(&p));
-    }
-    if let Some(p) = reg_str(
-        RegKey::predef(HKEY_LOCAL_MACHINE),
-        "SOFTWARE\\WOW6432Node\\Valve\\Steam",
-        "InstallPath",
-    ) {
-        cands.push(normalize_win_path(&p));
-    }
+/// 卸载项里那条是不是 Steam 本体（SteamVR / Steamworks 之类的名字不算）。
+pub fn uninstall_is_steam(display: &str) -> bool {
+    display.trim().eq_ignore_ascii_case("steam")
+}
 
-    let mut seen: Vec<String> = Vec::new();
+/// 从「卸载」列表里找出 Steam 安装目录。
+///
+/// 为什么要这一步：有些机器上 Valve\Steam 那两个键是缺的（换过盘、装过两份、
+/// 或是用别的方式装的），但「卸载」项里一定有 InstallLocation。装了两份 Steam 时，
+/// 也只有这里能同时看到两处。
+fn steam_from_uninstall() -> Vec<PathBuf> {
     let mut out = Vec::new();
-    for p in cands {
-        let k = norm_key(&p);
-        if p.is_dir() && !seen.contains(&k) {
-            seen.push(k);
-            out.push(p);
+    let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
+    for root in [
+        "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall",
+        "SOFTWARE\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall",
+    ] {
+        let Ok(k) = hklm.open_subkey(root) else { continue };
+        for name in k.enum_keys().flatten() {
+            let Ok(gk) = k.open_subkey(&name) else { continue };
+            let disp = gk.get_value::<String, _>("DisplayName").unwrap_or_default();
+            if !uninstall_is_steam(&disp) {
+                continue;
+            }
+            let Ok(loc) = gk.get_value::<String, _>("InstallLocation") else {
+                continue;
+            };
+            let p = normalize_win_path(&loc);
+            // 卸载项里的路径不一定靠谱，得能看出这是 Steam 才算
+            if p.join("steamapps").is_dir() || p.join("steam.exe").is_file() {
+                out.push(p);
+            }
         }
     }
     out
 }
 
+/// 找出这台机器上所有 Steam 安装目录。
+///
+/// 来源顺序（全部都会试，最后去重）：
+///   1. HKCU\Software\Valve\Steam\SteamPath（最常见的那个）
+///   2. HKLM\...\Valve\Steam\InstallPath（32 位视图和原生视图各试一次）
+///   3. HKCU\Software\Valve\Steam\SteamExe 的所在目录（前两个都缺时的兜底）
+///   4. 「卸载」项里的 InstallLocation（装了两份 Steam 时只有这里都能看到）
+///   5. 两个默认安装路径（只在目录真的存在时才用）
+pub fn steam_roots() -> Vec<PathBuf> {
+    let mut cands: Vec<(PathBuf, &'static str)> = Vec::new();
+    // 注：RegKey 不是 Clone，需要哪个就现场 predef 一个（predef 只是包一个预定义句柄，很便宜）
+    if let Some(p) = reg_str(
+        RegKey::predef(HKEY_CURRENT_USER),
+        "Software\\Valve\\Steam",
+        "SteamPath",
+    ) {
+        cands.push((normalize_win_path(&p), "HKCU SteamPath"));
+    }
+    for (sub, from) in [
+        ("SOFTWARE\\WOW6432Node\\Valve\\Steam", "HKLM 32 位 InstallPath"),
+        ("SOFTWARE\\Valve\\Steam", "HKLM 原生 InstallPath"),
+    ] {
+        if let Some(p) = reg_str(RegKey::predef(HKEY_LOCAL_MACHINE), sub, "InstallPath") {
+            cands.push((normalize_win_path(&p), from));
+        }
+    }
+    if let Some(exe) = reg_str(
+        RegKey::predef(HKEY_CURRENT_USER),
+        "Software\\Valve\\Steam",
+        "SteamExe",
+    ) {
+        if let Some(dir) = normalize_win_path(&exe).parent() {
+            cands.push((dir.to_path_buf(), "HKCU SteamExe"));
+        }
+    }
+    for p in steam_from_uninstall() {
+        cands.push((p, "卸载项 InstallLocation"));
+    }
+    if let Some(pf) = std::env::var_os("ProgramFiles(x86)") {
+        cands.push((PathBuf::from(pf).join("Steam"), "默认路径"));
+    }
+    if let Some(pf) = std::env::var_os("ProgramFiles") {
+        cands.push((PathBuf::from(pf).join("Steam"), "默认路径"));
+    }
+
+    let mut seen: Vec<String> = Vec::new();
+    let mut out = Vec::new();
+    for (p, from) in cands {
+        let k = norm_key(&p);
+        if !p.is_dir() || seen.contains(&k) {
+            continue;
+        }
+        seen.push(k);
+        crate::log::line(&format!("发现 Steam：{}（来源：{from}）", p.display()));
+        out.push(p);
+    }
+    if out.is_empty() {
+        crate::log::line("没找到任何 Steam 安装目录（注册表和卸载项里都没有）");
+    }
+    out
+}
+
+/// 记一条扫描说明：既写进日志，也带回去给界面显示。
+///
+/// 扫描「扫不出来」这类反馈以前完全没法查 —— 现在每个跳过都有理由落在日志里，
+/// 用户把 logs 目录发过来就能定论。
+fn note(notes: &mut Vec<String>, s: String) {
+    crate::log::line(&s);
+    notes.push(s);
+}
+
 pub fn steam_libraries(root: &Path) -> Vec<PathBuf> {
+    let mut notes = Vec::new();
+    steam_libraries_notes(root, &mut notes)
+}
+
+pub fn steam_libraries_notes(root: &Path, notes: &mut Vec<String>) -> Vec<PathBuf> {
     let mut libs = vec![root.to_path_buf()];
     let vdf = root.join("steamapps").join("libraryfolders.vdf");
-    if let Ok(text) = std::fs::read_to_string(&vdf) {
-        for (k, v) in vdf_pairs(&text) {
-            // 新格式用 "path"，老格式是数字键直接给路径
-            let is_path = k.eq_ignore_ascii_case("path")
-                || (!k.is_empty() && k.chars().all(|c| c.is_ascii_digit()));
-            if !is_path {
-                continue;
+    match std::fs::read_to_string(&vdf) {
+        Ok(text) => {
+            for (k, v) in vdf_pairs(&text) {
+                // 新格式用 "path"，老格式是数字键直接给路径
+                let is_path = k.eq_ignore_ascii_case("path")
+                    || (!k.is_empty() && k.chars().all(|c| c.is_ascii_digit()));
+                if !is_path {
+                    continue;
+                }
+                let p = normalize_win_path(&v);
+                if !p.is_dir() {
+                    note(
+                        notes,
+                        format!("  库里记着的目录不存在，跳过：{}", p.display()),
+                    );
+                    continue;
+                }
+                let k2 = norm_key(&p);
+                if !libs.iter().any(|l| norm_key(l) == k2) {
+                    libs.push(p);
+                }
             }
-            let p = normalize_win_path(&v);
-            if !p.is_dir() {
-                continue;
-            }
-            let k2 = norm_key(&p);
-            if !libs.iter().any(|l| norm_key(l) == k2) {
-                libs.push(p);
-            }
+        }
+        Err(e) => {
+            // 这条最要命：读不到库清单 = 只知道默认库，其它盘的游戏全看不到。
+            note(
+                notes,
+                format!(
+                    "读不了库清单 {}：{e} —— 这次只扫默认库，其它盘上的游戏会看不到",
+                    vdf.display()
+                ),
+            );
         }
     }
     libs
 }
 
-/// 这些不是游戏，只是 Steam 的运行库/再分发包
-fn is_steam_junk(name: &str) -> bool {
-    let n = name.to_lowercase();
-    n.contains("steamworks common redistributables")
-        || n.contains("steam linux runtime")
-        || n.contains("proton")
-        || n.contains("steamvr")
+/// 这些不是游戏，只是 Steam 的运行库 / 再分发包。
+///
+/// 早先用「名字里包含 proton 就算运行库」的子串匹配，会把真游戏一起误杀
+/// （Proton Bus Simulator 就是）；所以现在按 Steam 对运行库的固定命名来判：
+/// 精确名 + 明确的版本号前缀。
+pub fn is_steam_junk(name: &str) -> bool {
+    let n = name.trim().to_lowercase();
+    // 固定名字
+    if matches!(
+        n.as_str(),
+        "steamworks common redistributables"
+            | "steamvr"
+            | "steamvr beta"
+            | "proton experimental"
+            | "proton hotfix"
+            | "proton - experimental"
+            | "steam linux runtime"
+    ) {
+        return true;
+    }
+    // 带版本号的：Steam Linux Runtime 3.0 (sniper) / Proton 9.0
+    if n.starts_with("steam linux runtime ") {
+        return true;
+    }
+    if let Some(rest) = n.strip_prefix("proton ") {
+        // 只有「Proton + 数字版本」才是运行库；Proton Bus Simulator 这种真游戏放过
+        if rest.chars().next().map(|c| c.is_ascii_digit()) == Some(true) {
+            return true;
+        }
+    }
+    false
 }
 
-pub fn scan_steam() -> Vec<GameEntry> {
+pub fn scan_steam_notes(notes: &mut Vec<String>) -> Vec<GameEntry> {
     let mut out = Vec::new();
-    for root in steam_roots() {
-        for lib in steam_libraries(&root) {
+    let roots = steam_roots();
+    note(notes, format!("Steam：找到 {} 个安装目录", roots.len()));
+    let (mut manifests, mut junk, mut missing_dir, mut read_fail) = (0usize, 0usize, 0usize, 0usize);
+
+    for root in &roots {
+        let libs = steam_libraries_notes(root, notes);
+        let shown: Vec<String> = libs.iter().map(|l| l.display().to_string()).collect();
+        note(
+            notes,
+            format!(
+                "  根目录 {}：{} 个库目录（{}）",
+                root.display(),
+                libs.len(),
+                shown.join(" | ")
+            ),
+        );
+        for lib in &libs {
             let sa = lib.join("steamapps");
-            let Ok(read) = std::fs::read_dir(&sa) else { continue };
+            let Ok(read) = std::fs::read_dir(&sa) else {
+                note(
+                    notes,
+                    format!("  读不了库目录 {}（被占用或权限不足），里面的游戏这次会漏掉", sa.display()),
+                );
+                continue;
+            };
             for e in read.flatten() {
                 let fname = e.file_name().to_string_lossy().to_string();
                 if !fname.starts_with("appmanifest_") || !fname.ends_with(".acf") {
                     continue;
                 }
-                let Ok(text) = std::fs::read_to_string(e.path()) else { continue };
+                manifests += 1;
+                let text = match std::fs::read_to_string(e.path()) {
+                    Ok(t) => t,
+                    Err(err) => {
+                        read_fail += 1;
+                        note(
+                            notes,
+                            format!("  读不了 {}：{err}（这个游戏这次会漏掉）", e.path().display()),
+                        );
+                        continue;
+                    }
+                };
                 let pairs = vdf_pairs(&text);
                 let get = |key: &str| {
                     pairs
@@ -278,11 +434,28 @@ pub fn scan_steam() -> Vec<GameEntry> {
                 let app_id = get("appid");
                 let name = get("name");
                 let installdir = get("installdir");
-                if name.is_empty() || installdir.is_empty() || is_steam_junk(&name) {
+                if name.is_empty() || installdir.is_empty() {
+                    note(
+                        notes,
+                        format!(
+                            "  跳过 {}：manifest 里没读到名字或目录名",
+                            e.path().display()
+                        ),
+                    );
+                    continue;
+                }
+                if is_steam_junk(&name) {
+                    junk += 1;
+                    note(notes, format!("  按运行库排除：{name}"));
                     continue;
                 }
                 let dir = sa.join("common").join(&installdir);
                 if !dir.is_dir() {
+                    missing_dir += 1;
+                    note(
+                        notes,
+                        format!("  目录不存在，跳过 {name}（{}）", dir.display()),
+                    );
                     continue;
                 }
                 out.push(GameEntry {
@@ -294,6 +467,15 @@ pub fn scan_steam() -> Vec<GameEntry> {
             }
         }
     }
+
+    note(
+        notes,
+        format!(
+            "Steam 扫描完成：读到 {manifests} 个 manifest，收下 {} 个游戏，跳过 {}（运行库 {junk}、目录不在 {missing_dir}、读失败 {read_fail}）",
+            out.len(),
+            junk + missing_dir + read_fail
+        ),
+    );
     out
 }
 
@@ -303,29 +485,60 @@ pub fn epic_manifest_dir() -> PathBuf {
     PathBuf::from(r"C:\ProgramData\Epic\EpicGamesLauncher\Data\Manifests")
 }
 
-pub fn scan_epic() -> Vec<GameEntry> {
+pub fn scan_epic_notes(notes: &mut Vec<String>) -> Vec<GameEntry> {
     let mut out = Vec::new();
-    let Ok(read) = std::fs::read_dir(epic_manifest_dir()) else {
+    let dir0 = epic_manifest_dir();
+    let Ok(read) = std::fs::read_dir(&dir0) else {
+        note(
+            notes,
+            format!(
+                "Epic：读不了清单目录 {}（没装 Epic 启动器时就是这样，属正常）",
+                dir0.display()
+            ),
+        );
         return out;
     };
+    let (mut total, mut not_app, mut no_field, mut missing) = (0usize, 0usize, 0usize, 0usize);
     for e in read.flatten() {
         let p = e.path();
         if p.extension().map(|x| x != "item").unwrap_or(true) {
             continue;
         }
-        let Ok(text) = std::fs::read_to_string(&p) else { continue };
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else { continue };
+        total += 1;
+        let text = match std::fs::read_to_string(&p) {
+            Ok(t) => t,
+            Err(err) => {
+                note(notes, format!("  读不了 {}：{err}", p.display()));
+                continue;
+            }
+        };
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
+            note(notes, format!("  解析不了 {}（不是合法 JSON）", p.display()));
+            continue;
+        };
 
         let s = |k: &str| v.get(k).and_then(|x| x.as_str()).map(|x| x.to_owned());
         // 只要应用本体，跳过引擎/插件/DLC
         if v.get("bIsApplication").and_then(|x| x.as_bool()) == Some(false) {
+            not_app += 1;
             continue;
         }
-        let Some(name) = s("DisplayName") else { continue };
-        let Some(loc) = s("InstallLocation") else { continue };
+        let Some(name) = s("DisplayName") else {
+            no_field += 1;
+            continue;
+        };
+        let Some(loc) = s("InstallLocation") else {
+            no_field += 1;
+            continue;
+        };
         let app_id = s("AppName").unwrap_or_default();
         let dir = PathBuf::from(&loc);
         if name.is_empty() || !dir.is_dir() {
+            missing += 1;
+            note(
+                notes,
+                format!("  目录不存在，跳过 {name}（{}）", dir.display()),
+            );
             continue;
         }
         out.push(GameEntry {
@@ -335,6 +548,14 @@ pub fn scan_epic() -> Vec<GameEntry> {
             install_dir: dir,
         });
     }
+    note(
+        notes,
+        format!(
+            "Epic 扫描完成：清单 {total} 个，收下 {} 个，跳过 {}（引擎/DLC {not_app}、缺字段 {no_field}、目录不在 {missing}）",
+            out.len(),
+            not_app + no_field + missing
+        ),
+    );
     out
 }
 
@@ -430,21 +651,33 @@ pub fn wegame_installed() -> bool {
 /// 所以只把「里面真能找到游戏可执行文件的目录」当成一条记录 —— 宁可漏报，也不列一堆
 /// 垃圾让用户困惑。扫不到不影响使用：界面上还能用「选择目录」手动指到渲染 EXE 的文件夹。
 pub fn scan_wegame() -> Vec<GameEntry> {
+    let mut notes = Vec::new();
+    scan_wegame_notes(&mut notes)
+}
+
+pub fn scan_wegame_notes(notes: &mut Vec<String>) -> Vec<GameEntry> {
     // 没装 WeGame 就直接返回空 —— 别去 Tencent 键下面瞎猜
     if !wegame_installed() {
+        note(
+            notes,
+            "WeGame：本机没装（Tencent 下没有 WeGame 的安装目录），跳过".to_owned(),
+        );
         return Vec::new();
     }
     let mut out: Vec<GameEntry> = Vec::new();
     let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
+    let (mut keys, mut non_game, mut no_dir, mut no_exe) = (0usize, 0usize, 0usize, 0usize);
 
     for root in WEGAME_REG_ROOTS {
         let Ok(k) = hklm.open_subkey(root) else { continue };
         for key_name in k.enum_keys().flatten() {
             // 客户端 / 聊天工具之类的键不是游戏
+            keys += 1;
             if WEGAME_NON_GAME_KEYS
                 .iter()
                 .any(|n| key_name.eq_ignore_ascii_case(n))
             {
+                non_game += 1;
                 continue;
             }
             let Ok(gk) = k.open_subkey(&key_name) else { continue };
@@ -472,9 +705,13 @@ pub fn scan_wegame() -> Vec<GameEntry> {
                 }
             }
 
-            let Some(dir) = dir.or(weak) else { continue };
+            let Some(dir) = dir.or(weak) else {
+                no_dir += 1;
+                continue;
+            };
             // 必须有能找到的游戏程序 —— 这一条把绝大多数噪音挡在外面
             if find_render_exe(&dir).is_none() {
+                no_exe += 1;
                 continue;
             }
             let name = display
@@ -499,6 +736,14 @@ pub fn scan_wegame() -> Vec<GameEntry> {
         }
     }
 
+    note(
+        notes,
+        format!(
+            "WeGame 扫描完成：看了 {keys} 个注册表项，收下 {} 个游戏，跳过 {}（非游戏键 {non_game}、没读到目录 {no_dir}、目录里找不到游戏程序 {no_exe}）",
+            out.len(),
+            non_game + no_dir + no_exe
+        ),
+    );
     out
 }
 
@@ -1225,9 +1470,27 @@ pub fn find_render_exe(install_dir: &Path) -> Option<PathBuf> {
 }
 
 pub fn scan_all() -> Vec<GameEntry> {
-    let mut all = scan_steam();
-    all.extend(scan_epic());
-    all.extend(scan_wegame());
+    scan_all_notes().0
+}
+
+/// 扫描全部平台，并带回一份「扫描过程说明」（这些说明同时已经写进日志）。
+///
+/// 说明里既有统计，也有**每个被跳过的条目和原因**：用户报「扫不出来」时，
+/// 让他把 logs 目录发过来就能直接定位，不用再靠猜。
+pub fn scan_all_notes() -> (Vec<GameEntry>, Vec<String>) {
+    let mut notes = Vec::new();
+    let t0 = std::time::Instant::now();
+    let mut all = scan_steam_notes(&mut notes);
+    all.extend(scan_epic_notes(&mut notes));
+    all.extend(scan_wegame_notes(&mut notes));
     all.sort_by_key(|g| g.name.to_lowercase());
-    all
+    note(
+        &mut notes,
+        format!(
+            "扫描结束：共 {} 个游戏，用时 {:.1} 秒",
+            all.len(),
+            t0.elapsed().as_secs_f64()
+        ),
+    );
+    (all, notes)
 }
