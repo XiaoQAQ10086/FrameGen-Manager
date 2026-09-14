@@ -1,6 +1,6 @@
 [package]
 name = "framegen-manager"
-version = "0.9.2"
+version = "0.9.3"
 edition = "2021"
 rust-version = "1.85"
 description = "Lightweight manager for dlssg_for_sm86 - deploy DLSS Frame Generation to game directories"
@@ -43,6 +43,10 @@ windows-sys = { version = "0.61", features = [
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
     "Win32_Graphics_Gdi",
+    # 手动导入要严格校验签名：WinVerifyTrust 验内容有没有被改，
+    # CryptQueryObject 取出「真正签名的那张证书」再比指纹
+    "Win32_Security_Cryptography",
+    "Win32_Security_WinTrust",
 ] }
 
 # 反作弊模块（模块 3）需要读注册表服务项 / PE 导入表时再加，不要现在加

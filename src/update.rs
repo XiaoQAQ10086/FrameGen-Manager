@@ -114,6 +114,10 @@ pub struct LocalFile {
     pub sha256: String,
     pub bytes: u64,
     pub downloaded_at: String,
+    /// 是不是用户「手动导入」放进来的（不是下载来的）。
+    /// 这种记录没有官方指纹可比 —— 判定「已就绪」只比文件在不在、大小对不对。
+    #[serde(default)]
+    pub imported: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -527,6 +531,13 @@ pub fn local_is_current(
     let Some(r) = state.files.get(local_name) else {
         return false;
     };
+    // 手动导入的文件没有官方指纹可比（用户就是下不动才导入的）：
+    // 只要文件还在、大小对，就算已就绪，别动不动又去下一遍。
+    if r.imported {
+        return std::fs::metadata(dest)
+            .map(|m| m.len() == r.bytes)
+            .unwrap_or(false);
+    }
     // 指纹**只在可信时**才拿来判定。探测落到镜像时指纹和官方对不上，
     // 用它比对会导致「文件明明在、每次都被判为需要更新」—— 用户看到的就是
     // 「不断重复下载」。指纹不可信时退化成「记录在 + 文件在且大小对得上」。
@@ -876,10 +887,23 @@ pub fn prepare_deploy_ini_files(
 ///   ghproxy.net    0.02 ~ 0.16 MB/s   <- 原来内置的是它，慢到基本不可用
 ///   raw 官方直连   0.00 ~ 0.06 MB/s   <- 基本不通
 /// 换成 gh-proxy.com 之后，48 MB 资产从十几分钟降到十几秒。
-pub const MIRRORS: [&str; 3] = [
+pub const MIRRORS: [&str; 14] = [
+    // 第一轮实测活下来的
     "https://gh-proxy.com/",
     "https://ghfast.top/",
+    "https://ghfile.geekertao.top/",
     "https://ghproxy.net/",
+    // 第二轮候选
+    "https://ghproxy.cfd/",
+    "https://ghps.cc/",
+    "https://gh.xxooo.cf/",
+    "https://ghproxy.cdn.9i0i.com/",
+    "https://gh-proxy.cn/",
+    "https://ghp.icu/",
+    "https://gh-proxy.top/",
+    "https://ghproxy.homeboyc.cn/",
+    "https://gh.jasonzeng.dev/",
+    "https://mirror.ghproxy.com/",
 ];
 
 /// 默认备用源（= 最快的那个镜像）。界面上「当前备用源」显示的就是它。
@@ -889,18 +913,35 @@ pub const DEFAULT_BACKUP_PREFIX: &str = "https://gh-proxy.com/";
 ///
 /// 用户选中的源（界面上的测速列表，或手填的前缀）排在最前面，其余内置镜像跟在
 /// 后面兜底 —— 选中的源整个挂掉时不至于直接失败。
+/// 用户自己填的源：界面上允许一行一个（以前只支持一个）。
+/// 顺手把常见的写法归一化：去空格、补上结尾的斜杠（前缀是拼在官方地址前面的）。
+pub fn split_custom_sources(custom: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for raw in custom.split(['\n', '\r', ',', ';', ' ', '\t']) {
+        let s = raw.trim();
+        if s.len() < 8 || !s.contains("://") {
+            continue;
+        }
+        let s = s.trim_end_matches('/').to_owned() + "/";
+        if !out.contains(&s) {
+            out.push(s);
+        }
+    }
+    out
+}
+
 fn mirrors(custom: &str) -> Vec<String> {
-    let c = custom.trim();
+    let customs = split_custom_sources(custom);
     let rest: Vec<String> = MIRRORS
         .iter()
-        .filter(|m| **m != c)
+        .filter(|m| !customs.iter().any(|c| c == *m))
         .map(|s| (*s).to_owned())
         .collect();
     let rest = rank_mirrors(&rest);
-    if c.is_empty() {
+    if customs.is_empty() {
         rest
     } else {
-        let mut out = vec![c.to_owned()];
+        let mut out = customs;
         out.extend(rest);
         out
     }
@@ -1347,96 +1388,135 @@ fn rd_u32le(d: &[u8], o: usize) -> u32 {
     u32::from_le_bytes([d[o], d[o + 1], d[o + 2], d[o + 3]])
 }
 
-/// 从 zip 里解出第一个 .dll 到 out_path，返回该条目名。
-pub fn zip_extract_dll(zip_path: &Path, out_path: &Path) -> Result<String> {
-    let data = std::fs::read(zip_path).with_context(|| format!("读取 {}", zip_path.display()))?;
-    if data.len() < 22 {
+/// zip 里一个条目的元信息（不解压）
+#[derive(Debug, Clone)]
+pub struct ZipMeta {
+    pub name: String,
+    pub method: u16,
+    pub comp_size: u64,
+    pub local_off: usize,
+}
+
+/// 列出 zip 里的所有文件。
+///
+/// 只支持 store(0) / deflate(8) 两种压缩方式 —— 上游的源码包和运行库的包都是这两种，
+/// 而 zip64 / 加密包直接报错，不猜。
+///
+/// 注意这里是**只读文件头和中央目录**，不把整包读进内存：上游源码包有一百多 MB，
+/// 整包读进来会让内存爆掉（这个程序的卖点之一就是轻量）。
+pub fn zip_list(zip_path: &Path) -> Result<Vec<ZipMeta>> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = std::fs::File::open(zip_path)
+        .with_context(|| format!("打开 {}", zip_path.display()))?;
+    let len = f.metadata()?.len() as usize;
+    if len < 22 {
         bail!("zip 文件太小，不像是有效的压缩包");
     }
-
-    // 1. 从尾部往前找 EOCD (PK\x05\x06)
-    let min = data.len().saturating_sub(22 + 65535);
-    let mut i = data.len() - 22;
+    // 尾部最多 22 + 65535 字节里找 EOCD
+    let tail_len = (22 + 65535).min(len);
+    let mut tail = vec![0u8; tail_len];
+    f.seek(SeekFrom::Start((len - tail_len) as u64))?;
+    f.read_exact(&mut tail)?;
     let mut eocd = None;
+    let mut i = tail_len - 22;
     loop {
-        if &data[i..i + 4] == b"PK\x05\x06" {
+        if &tail[i..i + 4] == b"PK\x05\x06" {
             eocd = Some(i);
             break;
         }
-        if i <= min {
+        if i == 0 {
             break;
         }
         i -= 1;
     }
     let eocd = eocd.context("找不到 zip 中央目录结尾，可能不是有效的 zip")?;
-
-    let count = rd_u16le(&data, eocd + 10) as usize;
-    let cd_off = rd_u32le(&data, eocd + 16) as usize;
-    if cd_off >= data.len() {
+    let count = rd_u16le(&tail, eocd + 10) as usize;
+    let cd_off = rd_u32le(&tail, eocd + 16) as usize;
+    if cd_off >= len {
         bail!("zip 中央目录偏移越界");
     }
 
-    // 2. 遍历中央目录，选第一个 .dll
-    let mut p = cd_off;
-    let mut chosen: Option<(String, u16, u64, usize)> = None;
+    let mut cd = vec![0u8; len - cd_off];
+    f.seek(SeekFrom::Start(cd_off as u64))?;
+    f.read_exact(&mut cd)?;
+
+    let mut out = Vec::new();
+    let mut p = 0usize;
     for _ in 0..count {
-        if p + 46 > data.len() || &data[p..p + 4] != b"PK\x01\x02" {
+        if p + 46 > cd.len() || &cd[p..p + 4] != b"PK\x01\x02" {
             break;
         }
-        let method = rd_u16le(&data, p + 10);
-        let comp_size = rd_u32le(&data, p + 20) as u64;
-        let name_len = rd_u16le(&data, p + 28) as usize;
-        let extra_len = rd_u16le(&data, p + 30) as usize;
-        let comment_len = rd_u16le(&data, p + 32) as usize;
-        let local_off = rd_u32le(&data, p + 42) as usize;
-        let name = data
+        let method = rd_u16le(&cd, p + 10);
+        let comp_size = rd_u32le(&cd, p + 20) as u64;
+        let name_len = rd_u16le(&cd, p + 28) as usize;
+        let extra_len = rd_u16le(&cd, p + 30) as usize;
+        let comment_len = rd_u16le(&cd, p + 32) as usize;
+        let local_off = rd_u32le(&cd, p + 42) as usize;
+        let name = cd
             .get(p + 46..p + 46 + name_len)
             .map(|b| String::from_utf8_lossy(b).to_string())
             .unwrap_or_default();
-        if chosen.is_none() && name.to_ascii_lowercase().ends_with(".dll") {
-            chosen = Some((name, method, comp_size, local_off));
-        }
+        out.push(ZipMeta {
+            name,
+            method,
+            comp_size,
+            local_off,
+        });
         p += 46 + name_len + extra_len + comment_len;
     }
-    let (name, method, comp_size, local_off) = chosen.context("zip 里没有 .dll 文件")?;
+    Ok(out)
+}
 
-    // 3. 读本地头算数据起点（本地头的名字/扩展区长度未必和中央目录一致）
-    if local_off + 30 > data.len() || &data[local_off..local_off + 4] != b"PK\x03\x04" {
+/// 把 zip 里的某个条目**流式**解到 dest，返回解出来的字节数。
+/// 流式的意义同上：一百多 MB 的包不能整包读进内存。
+pub fn zip_extract_to(zip_path: &Path, meta: &ZipMeta, dest: &Path) -> Result<u64> {
+    use std::io::{Read, Seek, SeekFrom, Write};
+    let mut f = std::fs::File::open(zip_path)
+        .with_context(|| format!("打开 {}", zip_path.display()))?;
+    f.seek(SeekFrom::Start(meta.local_off as u64))?;
+    let mut head = [0u8; 30];
+    f.read_exact(&mut head)?;
+    if &head[0..4] != b"PK\x03\x04" {
         bail!("zip 本地头损坏");
     }
-    let l_name_len = rd_u16le(&data, local_off + 26) as usize;
-    let l_extra_len = rd_u16le(&data, local_off + 28) as usize;
-    let data_off = local_off + 30 + l_name_len + l_extra_len;
-    let end = data_off + comp_size as usize;
-    if end > data.len() {
-        bail!("zip 数据区越界");
-    }
-    let raw = &data[data_off..end];
+    let l_name = rd_u16le(&head, 26) as u64;
+    let l_extra = rd_u16le(&head, 28) as u64;
+    f.seek(SeekFrom::Start(meta.local_off as u64 + 30 + l_name + l_extra))?;
 
-    // 4. 解压
-    let out: Vec<u8> = match method {
-        0 => raw.to_vec(),
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut out = std::fs::File::create(dest)
+        .with_context(|| format!("创建 {}", dest.display()))?;
+    let limited = f.take(meta.comp_size);
+    let n = match meta.method {
+        0 => std::io::copy(&mut { limited }, &mut out)?,
         8 => {
-            let mut v = Vec::new();
-            flate2::read::DeflateDecoder::new(raw)
-                .read_to_end(&mut v)
-                .context("Deflate 解压失败")?;
-            v
+            let mut dec = flate2::read::DeflateDecoder::new(limited);
+            std::io::copy(&mut dec, &mut out)?
         }
         m => bail!("不支持的 zip 压缩方式 {m}"),
     };
-    if out.is_empty() {
+    out.flush()?;
+    Ok(n)
+}
+
+/// 从 zip 里解出第一个 .dll 到 out_path，返回该条目名。
+pub fn zip_extract_dll(zip_path: &Path, out_path: &Path) -> Result<String> {
+    let list = zip_list(zip_path)?;
+    let meta = list
+        .iter()
+        .find(|m| !m.name.ends_with('/') && m.name.to_ascii_lowercase().ends_with(".dll"))
+        .context("zip 里没有 .dll 文件")?;
+    let tmp = part_path(out_path);
+    let n = zip_extract_to(zip_path, meta, &tmp)?;
+    if n == 0 {
+        let _ = std::fs::remove_file(&tmp);
         bail!("解压结果是空文件");
     }
-
-    if let Some(parent) = out_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let tmp = part_path(out_path);
-    std::fs::write(&tmp, &out)?;
     util::atomic_replace(&tmp, out_path)?;
     util::clear_motw(out_path);
-    Ok(name)
+    Ok(meta.name.clone())
 }
 
 /// 一个待下载的 DLSS 运行库。界面算「总进度」要用到它的 size。

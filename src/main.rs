@@ -5,11 +5,13 @@ mod anticheat;
 mod deploy;
 mod gpu;
 mod icon;
+mod importer;
 mod log;
 mod scan;
 mod theme;
 mod update;
 mod util;
+mod verify;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -186,6 +188,61 @@ fn main() -> eframe::Result<()> {
                 );
             }
             None => println!("{} -> 提取失败", p.display()),
+        }
+        return Ok(());
+    }
+
+    // 手动导入流水线（只解包 + 校验，不写资产目录）：cargo run -- --importtest <zip/文件夹>...
+    let argv_i2: Vec<String> = std::env::args().collect();
+    if let Some(pos) = argv_i2.iter().position(|a| a == "--importtest") {
+        println!("===== 手动导入 自测（只校验，不写资产目录）=====");
+        let paths: Vec<PathBuf> = argv_i2.iter().skip(pos + 1).map(PathBuf::from).collect();
+        let work = std::env::temp_dir().join("fgm-import-selftest");
+        let _ = std::fs::remove_dir_all(&work);
+        let cancel = AtomicBool::new(false);
+        match importer::stage(&paths, &work, &cancel, |m| println!("  {m}")) {
+            Ok(items) => {
+                println!("  认出来 {} 个文件：", items.len());
+                for it in &items {
+                    println!(
+                        "  [{}] {}（{}，{}）来自 {}",
+                        if it.trusted { "通过" } else { "待确认" },
+                        it.name,
+                        it.kind.label(),
+                        util::format_bytes(it.bytes),
+                        it.from
+                    );
+                    println!("        {}", it.note);
+                    println!("        sha256 {}", it.sha256);
+                }
+                importer::cleanup(&items);
+            }
+            Err(e) => println!("  [FAIL] {e}"),
+        }
+        let _ = std::fs::remove_dir_all(&work);
+        return Ok(());
+    }
+
+    // 严格签名校验（手动导入用的那套）：cargo run -- --verifytest <文件>...
+    let argv_v: Vec<String> = std::env::args().collect();
+    if let Some(pos) = argv_v.iter().position(|a| a == "--verifytest") {
+        println!("===== 严格签名校验 =====");
+        for p in argv_v.iter().skip(pos + 1) {
+            let path = PathBuf::from(p);
+            if !path.is_file() {
+                println!("{} -> 文件不存在", path.display());
+                continue;
+            }
+            let rep = verify::verify_file(&path);
+            println!("{}", path.display());
+            println!("  {}", rep.summary());
+            println!(
+                "  静默通过（内容可信）= {}",
+                if rep.content_trusted() { "是" } else { "否" }
+            );
+            if let Some(n) = &rep.note {
+                println!("  说明: {n}");
+            }
         }
         return Ok(());
     }
@@ -1286,6 +1343,76 @@ fn selftest() {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    println!("\n--- 手动导入：校验与自定义源 ---");
+    {
+        // 没签名的文件（就是本程序自己）必须判成「不可信」
+        if let Ok(exe) = std::env::current_exe() {
+            let rep = verify::verify_file(&exe);
+            ck(
+                &mut fails,
+                rep.sig == verify::SigState::NoSignature && !rep.content_trusted(),
+                "没签名的文件判成「不可信」",
+            );
+        }
+        // 资产目录里有真文件时，顺手验一遍（开发机上一定有）
+        if let Ok(dir) = util::assets_dir() {
+            let proxy = dir.join("version.dll");
+            if proxy.is_file() {
+                let rep = verify::verify_file(&proxy);
+                ck(
+                    &mut fails,
+                    rep.content_trusted() && rep.kind == verify::SignerKind::Author,
+                    "作者的代理 DLL 判成「本项目作者签的、内容可信」",
+                );
+            }
+            let rt = dir.join("nvngx_dlssg.dll");
+            if rt.is_file() {
+                let rep = verify::verify_file(&rt);
+                ck(
+                    &mut fails,
+                    rep.content_trusted() && rep.kind == verify::SignerKind::Nvidia,
+                    "NVIDIA 运行库判成「NVIDIA 签的、内容可信」",
+                );
+            }
+        }
+        // ini 的结构检查
+        let good = "; c\n[General]\nEnabled=1\n[FrameGeneration]\nOptimized=1\n";
+        ck(
+            &mut fails,
+            importer::ini_sanity(good).is_ok(),
+            "正常的 ini 结构检查通过",
+        );
+        ck(
+            &mut fails,
+            importer::ini_sanity("garbage\nno equals sign\n").is_err(),
+            "不像 ini 的内容判成可疑",
+        );
+        ck(
+            &mut fails,
+            importer::ini_sanity("").is_err(),
+            "空文件判成可疑",
+        );
+        ck(
+            &mut fails,
+            importer::ini_sanity("[Unknown]\nKey=1\n").is_err(),
+            "没有任何已知段落也判成可疑",
+        );
+        // 自定义源：一行一个，顺便归一化结尾斜杠、去重
+        let multi = update::split_custom_sources("https://a.example\nhttps://b.example/\n\nhttps://a.example/");
+        ck(
+            &mut fails,
+            multi.len() == 2
+                && multi[0] == "https://a.example/"
+                && multi[1] == "https://b.example/",
+            "自定义源支持一行一个（归一化 + 去重）",
+        );
+        ck(
+            &mut fails,
+            update::split_custom_sources("随便写点什么").is_empty(),
+            "不像网址的行会被忽略",
+        );
+    }
+
     println!("\n--- Steam 运行库过滤（别误杀真游戏）---");
     {
         let cases: [(&str, bool); 7] = [
@@ -1598,6 +1725,7 @@ fn downloadtest() {
                     sha256: dl.sha256.clone(),
                     bytes: dl.bytes,
                     downloaded_at: util::now_utc(),
+                    imported: false,
                 },
             );
             let probe = dest.with_file_name("iscurrent-probe.tmp");
@@ -2168,6 +2296,10 @@ enum Msg {
     LibraryLoaded(Vec<GameRow>, String, usize),
     /// 后台跑完的深度反作弊扫描（带着目录，用来丢弃过期的结果）
     AcScanned(PathBuf, AcReport),
+    /// 手动导入：zip 读完并逐个校验完了
+    ImportStaged(Vec<importer::Staged>),
+    /// 手动导入：写盘完成，带回给用户看的结果清单
+    ImportDone(String),
     UpdateChecked(UpdateSummary),
     /// 文案 / 总进度 / 总字节数（0 表示还没算出来）
     Progress(String, f32, u64),
@@ -2206,6 +2338,13 @@ struct App {
     /// 反作弊深度扫描正在后台跑（徽章先显示「分析中」）
     ac_scanning: bool,
     ac_system: AcReport,
+
+    // ---- 手动导入（网盘 / U 盘 拿到的 zip）
+    import_busy: bool,
+    /// 校验没过、等用户确认的项（Some 时显示确认弹窗）
+    import_pending: Option<Vec<importer::Staged>>,
+    /// 导入结果清单（Some 时显示结果窗口）
+    import_report: Option<String>,
 
     /// 正在飞的选中动画
     fly: Option<FlyAnim>,
@@ -2342,6 +2481,9 @@ impl App {
             ac_scanning: false,
             // 枚举注册表很快，同步做完即可
             ac_system: anticheat::scan_system(),
+            import_busy: false,
+            import_pending: None,
+            import_report: None,
             fly: None,
             target_card_rect: None,
             flash_until: None,
@@ -2830,6 +2972,36 @@ impl App {
                     self.ac_target = Some(rep);
                 }
             }
+            Msg::ImportStaged(items) => {
+                let untrusted = items.iter().filter(|i| !i.trusted).count();
+                if untrusted == 0 {
+                    self.status = format!("{} 个文件校验通过，正在写入 ...", items.len());
+                    self.finish_import(items, true);
+                } else {
+                    self.busy = false;
+                    self.import_busy = false;
+                    self.cancel = None;
+                    self.status = format!("{untrusted} 个文件校验没过，等你确认");
+                    self.note(format!(
+                        "手动导入：{} 个文件校验没过（等用户确认）",
+                        untrusted
+                    ));
+                    self.import_pending = Some(items);
+                }
+            }
+            Msg::ImportDone(report) => {
+                self.busy = false;
+                self.import_busy = false;
+                self.cancel = None;
+                self.update_state = update::load_state();
+                for line in report.lines() {
+                    if !line.trim().is_empty() {
+                        self.note(line.to_owned());
+                    }
+                }
+                self.status = "导入完成".to_owned();
+                self.import_report = Some(report);
+            }
             Msg::UpdateChecked(s) => {
                 self.status = "更新检查完成".to_owned();
                 self.update_summary = Some(s);
@@ -3064,6 +3236,96 @@ impl App {
     }
 
     // ---- 后台任务
+
+    /// 手动导入：选中 zip / 文件夹 → 后台解包 + 逐个校验。
+    fn start_import(&mut self, paths: Vec<PathBuf>) {
+        if paths.is_empty() {
+            return;
+        }
+        let work = match util::assets_dir() {
+            Ok(d) => d.join(".import"),
+            Err(e) => {
+                self.status = format!("定位资产目录失败: {e}");
+                return;
+            }
+        };
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.cancel = Some(cancel.clone());
+        self.busy = true;
+        self.import_busy = true;
+        self.status = "正在读取压缩包并校验（大包要几秒）...".to_owned();
+        self.note(format!("开始手动导入：{} 个来源", paths.len()));
+        self.spawn(move |tx, ctx| {
+            let ptx = tx.clone();
+            let r = importer::stage(&paths, &work, &cancel, move |m| {
+                let _ = ptx.send(Msg::Progress(m, 0.0, 0));
+            });
+            let _ = tx.send(match r {
+                Ok(items) => Msg::ImportStaged(items),
+                Err(e) => Msg::Failed(e.to_string()),
+            });
+            ctx.request_repaint();
+        });
+    }
+
+    /// 校验能过的直接装；有可疑项时界面先弹窗问一句（跳过 / 强行导入）。
+    fn finish_import(&mut self, items: Vec<importer::Staged>, include_untrusted: bool) {
+        let keep: Vec<importer::Staged> = items
+            .iter()
+            .filter(|i| i.trusted || include_untrusted)
+            .cloned()
+            .collect();
+        let skipped = items.len() - keep.len();
+        if keep.is_empty() {
+            importer::cleanup(&items);
+            self.busy = false;
+            self.import_busy = false;
+            self.cancel = None;
+            self.status = "没有可导入的文件".to_owned();
+            return;
+        }
+        self.status = format!("正在写入 {} 个文件 ...", keep.len());
+        self.spawn(move |tx, ctx| {
+            let mut report = String::new();
+            match importer::install(&keep) {
+                Ok(_) => {
+                    report.push_str(&format!("已导入 {} 个文件：\n", keep.len()));
+                    for it in &keep {
+                        report.push_str(&format!(
+                            "  ✓ {}（{}，{}）来自 {}{}\n",
+                            it.name,
+                            it.kind.label(),
+                            util::format_bytes(it.bytes),
+                            it.from,
+                            if it.trusted {
+                                ""
+                            } else {
+                                "  ⚠ 你选择了强行导入"
+                            }
+                        ));
+                    }
+                }
+                Err(e) => report.push_str(&format!("导入失败：{e}\n")),
+            }
+            if skipped > 0 {
+                report.push_str(&format!(
+                    "\n跳过 {skipped} 个（校验没过，按你的选择没有安装）：\n"
+                ));
+                for it in items.iter().filter(|i| !(i.trusted || include_untrusted)) {
+                    report.push_str(&format!(
+                        "  · {}（{}，来自 {}）{}\n",
+                        it.name,
+                        it.kind.label(),
+                        it.from,
+                        it.note
+                    ));
+                }
+            }
+            importer::cleanup(&items);
+            let _ = tx.send(Msg::ImportDone(report));
+            ctx.request_repaint();
+        });
+    }
 
     fn start_scan(&mut self) {
         self.busy = true;
@@ -3318,6 +3580,7 @@ impl App {
                             sha256: dl.sha256,
                             bytes: dl.bytes,
                             downloaded_at: util::now_utc(),
+                            imported: false,
                         },
                     );
                 }
@@ -4040,13 +4303,45 @@ impl eframe::App for App {
                             self.start_update_check();
                         }
                     });
+                    // 网络实在下不动时的后路：网盘/U 盘拿到的 zip，在这里选它就行。
+                    // 程序自己解压、递归找需要的文件、逐个校验，用户不用管目录结构。
+                    ui.horizontal(|ui| {
+                        if theme::ghost_button(ui, "导入压缩包…", !self.busy)
+                            .on_hover_text(
+                                "选中从网盘 / U 盘拿到的 zip（可多选，上游源码包 + 运行库包一起选）",
+                            )
+                            .clicked()
+                        {
+                            if let Some(files) = rfd::FileDialog::new()
+                                .set_title("选择上游压缩包（可多选）")
+                                .add_filter("压缩包", &["zip"])
+                                .pick_files()
+                            {
+                                self.start_import(files);
+                            }
+                        }
+                        if theme::ghost_button(ui, "导入文件夹…", !self.busy)
+                            .on_hover_text("已经自己解压过的话，直接选那个文件夹")
+                            .clicked()
+                        {
+                            if let Some(dir) = rfd::FileDialog::new()
+                                .set_title("选择解压出来的文件夹")
+                                .pick_folder()
+                            {
+                                self.start_import(vec![dir]);
+                            }
+                        }
+                        if self.import_busy {
+                            ui.add(egui::Spinner::new().size(12.0));
+                        }
+                    });
 
                     // ---- 下载源：先测速，再把结果摆出来让用户自己挑最快的
                     ui.add_space(4.0);
                     ui.horizontal(|ui| {
                         ui.label(egui::RichText::new("下载源").size(12.5).color(theme::TEXT));
                         if theme::ghost_button(ui, "测速", !self.busy)
-                            .on_hover_text("对每个源各拉 512 KB，实测你这条线路上的真实速度")
+                            .on_hover_text("对每个源各拉 512 KB（每个最多 4 秒），实测你这条线路上的真实速度")
                             .clicked()
                         {
                             self.start_speed_test();
@@ -4087,16 +4382,43 @@ impl eframe::App for App {
                         String::new()
                     };
                     let mut choice = current.clone();
-                    ui.horizontal_wrapped(|ui| {
-                        ui.selectable_value(&mut choice, String::new(), "自动");
-                        for (prefix, label, speed) in &rows {
+                    // 一行下拉：源多的时候不再把界面铺成好几行。
+                    // 「自动」时把当前实测最快的那个写进标题，用户一眼知道会用谁。
+                    let selected_text = if current.is_empty() {
+                        let fastest = self
+                            .speed_results
+                            .iter()
+                            .filter(|s| !s.prefix.is_empty() && s.error.is_none())
+                            .max_by_key(|s| s.kbps);
+                        match fastest {
+                            Some(s) => format!("自动（最快：{}  {} KB/s）", s.label, s.kbps),
+                            None => "自动（按实测速度挑最快）".to_owned(),
+                        }
+                    } else if current.contains('\n') {
+                        format!(
+                            "指定：自定义 {} 个源",
+                            current.lines().filter(|l| !l.trim().is_empty()).count()
+                        )
+                    } else {
+                        format!("指定：{}", update::source_label(&current))
+                    };
+                    egui::ComboBox::from_id_salt("source-pick")
+                        .width(320.0)
+                        .selected_text(selected_text)
+                        .show_ui(ui, |ui| {
                             ui.selectable_value(
                                 &mut choice,
-                                prefix.clone(),
-                                format!("{label}  {speed}"),
+                                String::new(),
+                                "自动（按实测速度挑最快）",
                             );
-                        }
-                    });
+                            for (prefix, label, speed) in &rows {
+                                ui.selectable_value(
+                                    &mut choice,
+                                    prefix.clone(),
+                                    format!("{label}   {speed}"),
+                                );
+                            }
+                        });
                     if choice != current {
                         self.use_backup = !choice.is_empty();
                         if !choice.is_empty() {
@@ -4123,19 +4445,29 @@ impl eframe::App for App {
                     ui.label(theme::hint(
                         "选中的源排最前面，其余镜像仍会兜底；下载中不会因为慢而换源，慢也让它慢慢下完。",
                     ));
-                    ui.collapsing("填自己的源地址（高级）", |ui| {
+                    ui.collapsing("自定义下载源（高级，一行一个）", |ui| {
                         ui.add(
-                            egui::TextEdit::singleline(&mut self.backup_prefix)
-                                .desired_width(260.0)
-                                .hint_text("https://xxx/"),
+                            egui::TextEdit::multiline(&mut self.backup_prefix)
+                                .desired_width(f32::INFINITY)
+                                .desired_rows(3)
+                                .hint_text("https://自己的镜像/\nhttps://再来一个/"),
                         );
-                        if theme::ghost_button(ui, "用这个源", true).clicked() {
-                            self.use_backup = !self.backup_prefix.trim().is_empty();
-                            self.save_config();
-                            self.status = "下载源已保存".to_owned();
-                        }
+                        ui.horizontal(|ui| {
+                            if theme::ghost_button(ui, "用这些源", true).clicked() {
+                                self.use_backup = !self.backup_prefix.trim().is_empty();
+                                self.save_config();
+                                self.status = "下载源已保存".to_owned();
+                            }
+                            if theme::ghost_button(ui, "改回自动", true).clicked() {
+                                self.backup_prefix.clear();
+                                self.use_backup = false;
+                                self.save_config();
+                                self.status =
+                                    "已改回自动选源（按实测速度挑最快的）".to_owned();
+                            }
+                        });
                         ui.label(theme::hint(
-                            "前缀会拼在官方地址前面。填错也没关系，内容对不上会被自动拒绝。",
+                            "一行一个前缀，会拼在官方地址前面，按你填的顺序先试。填错也没关系：内容对不上会被自动拒绝。",
                         ));
                     });
 
@@ -5141,6 +5473,106 @@ impl eframe::App for App {
                 }
             } else if ok {
                 self.hags_prompt = false;
+            }
+        }
+
+        // ---------------- 手动导入：可疑项的确认弹窗
+        if let Some(items) = self.import_pending.clone() {
+            let ctx = self.ctx.clone();
+            let (mut skip, mut force, mut cancel) = (false, false, false);
+            let bad: Vec<&importer::Staged> = items.iter().filter(|i| !i.trusted).collect();
+            egui::Window::new("有文件没有通过校验")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+                .show(&ctx, |ui| {
+                    ui.set_max_width(600.0);
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "{} 个文件没能通过校验：没签名、内容被改过，或者签名证书不认识。",
+                            bad.len()
+                        ))
+                        .size(13.0)
+                        .color(theme::DANGER)
+                        .strong(),
+                    );
+                    ui.add_space(6.0);
+                    for it in &bad {
+                        ui.label(
+                            egui::RichText::new(format!("· {}（{}）", it.name, it.kind.label()))
+                                .strong(),
+                        );
+                        ui.label(theme::hint(it.note.clone()));
+                        ui.label(theme::path_text(format!(
+                            "sha256 {}",
+                            &it.sha256[..it.sha256.len().min(16)]
+                        )));
+                    }
+                    ui.add_space(6.0);
+                    ui.label(theme::hint(
+                        "推荐只导入通过校验的那些。如果你确定这些文件是自己从可信来源拿的，也可以全部导入 —— 这个选择会写进日志。",
+                    ));
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if theme::primary_button(ui, "跳过可疑项", true).clicked() {
+                            skip = true;
+                        }
+                        if theme::danger_button(ui, "全部仍然导入", true).clicked() {
+                            force = true;
+                        }
+                        if theme::ghost_button(ui, "取消本次导入", true).clicked() {
+                            cancel = true;
+                        }
+                    });
+                });
+            if skip {
+                self.import_pending = None;
+                self.note("手动导入：用户选择跳过校验没过的文件".to_owned());
+                self.finish_import(items, false);
+            } else if force {
+                self.import_pending = None;
+                let names: Vec<String> = bad
+                    .iter()
+                    .map(|i| format!("{}（sha256 {}）", i.name, i.sha256))
+                    .collect();
+                self.note(format!(
+                    "⚠ 手动导入：用户选择强行导入校验没过的文件：{}",
+                    names.join("、")
+                ));
+                self.finish_import(items, true);
+            } else if cancel {
+                self.import_pending = None;
+                importer::cleanup(&items);
+                self.busy = false;
+                self.import_busy = false;
+                self.cancel = None;
+                self.status = "已取消导入".to_owned();
+            }
+        }
+
+        // ---------------- 手动导入：结果清单
+        if let Some(text) = self.import_report.clone() {
+            let ctx = self.ctx.clone();
+            let mut close = false;
+            egui::Window::new("导入结果")
+                .collapsible(false)
+                .resizable(true)
+                .default_width(620.0)
+                .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+                .show(&ctx, |ui| {
+                    ui.set_max_width(660.0);
+                    egui::ScrollArea::vertical()
+                        .max_height(420.0)
+                        .show(ui, |ui| {
+                            ui.label(text.clone());
+                        });
+                    ui.add_space(8.0);
+                    if theme::primary_button(ui, "知道了", true).clicked() {
+                        close = true;
+                    }
+                });
+            if close {
+                self.import_report = None;
             }
         }
 
