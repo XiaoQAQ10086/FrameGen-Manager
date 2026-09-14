@@ -1213,29 +1213,78 @@ fn selftest() {
     );
 
     println!("\n--- INI 改写（SM75 路由）---");
-    match update::prepare_deploy_ini(scan::GpuRoute::Sm75, Some("NVIDIA GeForce RTX 2080")) {
-        Ok(p) => {
-            println!("  生成: {}", p.path.display());
+    // 用临时文件造两种 INI：带 Router 的老版、没有 Router 的新版。
+    // 不依赖 assets 目录里有没有下载过东西，结果可重复。
+    {
+        let dir = std::env::temp_dir().join("fgm-ini-selftest");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+
+        let old_ini = dir.join("old.ini");
+        std::fs::write(
+            &old_ini,
+            "; Native 0.2.4\n[Compatibility]\nRouter=SM86\nKernelImage=PTX\n",
+        )
+        .unwrap();
+        let old_out = dir.join("old-out.ini");
+        let ok = update::prepare_deploy_ini_files(
+            &old_ini,
+            &old_out,
+            scan::GpuRoute::Sm75,
+            Some("NVIDIA GeForce RTX 2080"),
+        );
+        let patched = ok
+            .as_ref()
+            .ok()
+            .and_then(|_| std::fs::read_to_string(&old_out).ok())
+            .unwrap_or_default();
+        ck(
+            &mut fails,
+            patched.contains("Router=SM75"),
+            "带 Router 的老 INI：会被改成 SM75",
+        );
+        if let Ok(p) = &ok {
             for c in &p.changes {
                 println!("  改动说明: {c}");
             }
-            if let Ok(t) = std::fs::read_to_string(&p.path) {
-                for l in t.lines() {
-                    if l.starts_with("Router") || l.starts_with("KernelImage") {
-                        println!("  实际写入: {l}");
-                    }
-                }
+        }
+
+        // 上游 0.3.0 的 INI 里已经没有 Router 项了（路由改由 DLL 自己判断）。
+        // 以前这里直接报错并中止部署，等于把 RTX 20 用户挡在门外。
+        let new_ini = dir.join("new.ini");
+        std::fs::write(&new_ini, "; slim 0.3.0\n[Compatibility]\nPreset=Auto\n").unwrap();
+        let new_out = dir.join("new-out.ini");
+        let r = update::prepare_deploy_ini_files(
+            &new_ini,
+            &new_out,
+            scan::GpuRoute::Sm75,
+            Some("NVIDIA GeForce RTX 2080"),
+        );
+        ck(
+            &mut fails,
+            r.is_ok(),
+            "没有 Router 的 INI：SM75 部署不再失败（原样部署）",
+        );
+        ck(
+            &mut fails,
+            std::fs::read_to_string(&new_out)
+                .map(|t| t.contains("Preset=Auto"))
+                .unwrap_or(false),
+            "原样部署的文件内容和上游一致",
+        );
+        if let Ok(p) = &r {
+            for c in &p.changes {
+                println!("  改动说明: {c}");
             }
         }
-        Err(e) => println!("  失败: {e}"),
+
+        // 顺带看看真实资产目录里的那份（只显示，不做断言）
+        match update::prepare_deploy_ini(scan::GpuRoute::Sm75, Some("NVIDIA GeForce RTX 2080")) {
+            Ok(p) => println!("  真实 assets 里的 INI：生成 {}", p.path.display()),
+            Err(e) => println!("  真实 assets 里没有可用的 INI：{e}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
-    // 上游 0.3.0 的 INI 里已经没有 Router 项了（路由改由 DLL 自己判断）。
-    // 以前这里直接报错并中止部署，等于把 RTX 20 用户挡在门外 —— 现在必须原样部署成功。
-    ck(
-        &mut fails,
-        update::prepare_deploy_ini(scan::GpuRoute::Sm75, None).is_ok(),
-        "INI 里没有 Router 项时，SM75 部署不再失败（原样部署）",
-    );
 
     println!("\n--- Steam 运行库过滤（别误杀真游戏）---");
     {

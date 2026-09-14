@@ -808,10 +808,21 @@ pub struct IniPlan {
 /// 改写后写到单独的文件，上游原文件保持不动（用于比对哈希）。
 pub fn prepare_deploy_ini(route: GpuRoute, gpu_name: Option<&str>) -> Result<IniPlan> {
     let upstream = util::assets_dir()?.join(INI_REPO_PATH);
+    let dest = util::assets_dir()?.join("dlssg_sm86.deploy.ini");
+    prepare_deploy_ini_files(&upstream, &dest, route, gpu_name)
+}
+
+/// 指定输入 / 输出路径的版本。抽出来是为了自测：测试不该依赖「用户有没有下载过资产」。
+pub fn prepare_deploy_ini_files(
+    upstream: &Path,
+    dest: &Path,
+    route: GpuRoute,
+    gpu_name: Option<&str>,
+) -> Result<IniPlan> {
     if !upstream.is_file() {
         bail!("还没有下载 {}, 请先点「下载 / 更新资产」", INI_REPO_PATH);
     }
-    let text = std::fs::read_to_string(&upstream).context("读取 INI 失败")?;
+    let text = std::fs::read_to_string(upstream).context("读取 INI 失败")?;
 
     let mut changes = Vec::new();
     let out_text = if route == GpuRoute::Sm75 {
@@ -844,10 +855,9 @@ pub fn prepare_deploy_ini(route: GpuRoute, gpu_name: Option<&str>) -> Result<Ini
         text
     };
 
-    let dest = util::assets_dir()?.join("dlssg_sm86.deploy.ini");
-    std::fs::write(&dest, &out_text).context("写入部署用 INI 失败")?;
+    std::fs::write(dest, &out_text).context("写入部署用 INI 失败")?;
     Ok(IniPlan {
-        path: dest,
+        path: dest.to_path_buf(),
         changes,
     })
 }
