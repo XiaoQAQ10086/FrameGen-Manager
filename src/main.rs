@@ -1174,6 +1174,35 @@ fn deploytest() {
         };
     }
 
+    // ---- 旧代理入口的处置规则（纯逻辑，不需要真 DLL）----
+    println!("
+-- 旧代理入口怎么处置 --");
+    check!(
+        deploy::plan_orphan(true, false, true, true, false) == deploy::OrphanAction::Remove,
+        "原本空着、我们放进去的旧入口 -> 删掉"
+    );
+    check!(
+        deploy::plan_orphan(true, false, true, true, true)
+            == deploy::OrphanAction::RemoveButKeepRecord,
+        "原本就有文件的旧入口 -> 删掉但保留备份记录（这次修的就是这条）"
+    );
+    check!(
+        deploy::plan_orphan(true, true, true, true, true) == deploy::OrphanAction::Keep,
+        "这次还要用的入口 -> 不碰"
+    );
+    check!(
+        deploy::plan_orphan(true, false, true, false, false) == deploy::OrphanAction::Keep,
+        "内容已被用户换过 -> 不碰"
+    );
+    check!(
+        deploy::plan_orphan(false, false, true, true, false) == deploy::OrphanAction::Keep,
+        "不是代理入口 -> 不碰"
+    );
+    check!(
+        deploy::plan_orphan(true, false, false, false, true) == deploy::OrphanAction::Keep,
+        "文件已经不在了 -> 不碰"
+    );
+
     check!(
         deploy::state_of(&target) == deploy::DeployState::NotDeployed,
         "初始状态 = 未部署"
@@ -1402,7 +1431,59 @@ fn deploytest() {
             );
             let r = deploy::deploy(&t5, "version.dll", &dep_files);
             check!(r.is_ok(), "目标已有本项目文件时允许覆盖（不再误拒）");
-            let _ = deploy::restore(&t5);
+            let recorded_as_existing = deploy::load_manifest(&t5)
+                .map(|m| {
+                    m.files
+                        .iter()
+                        .any(|e| e.rel_path == "version.dll" && e.existed_before)
+                })
+                .unwrap_or(false);
+            check!(recorded_as_existing, "这个位置被记成「原本就有文件」");
+
+            // 换成别的入口再部署：以前这一分支被直接跳过，
+            // 结果是两个代理并存，而且原件再也还原不回来。
+            let winmm_switch = src.join("winmm_switch.dll");
+            fs::write(&winmm_switch, b"FAKE_WINMM_SWITCH").unwrap();
+            let switch = [deploy::DeployFile::new("winmm.dll", &winmm_switch)];
+            match deploy::deploy(&t5, "winmm.dll", &switch) {
+                Ok(_) => {
+                    check!(
+                        !t5.join("version.dll").exists(),
+                        "换入口后旧的 version.dll 已从游戏目录挪走（不再两个代理并存）"
+                    );
+                    check!(t5.join("winmm.dll").is_file(), "新入口 winmm.dll 已部署");
+                    let backup_kept = deploy::load_manifest(&t5)
+                        .map(|m| {
+                            m.files.iter().any(|e| {
+                                e.rel_path == "version.dll"
+                                    && e.existed_before
+                                    && e.backup_name.is_some()
+                            })
+                        })
+                        .unwrap_or(false);
+                    check!(backup_kept, "旧入口的备份记录保留下来了（还原还管得着）");
+                    match deploy::restore(&t5) {
+                        Ok(_) => {
+                            check!(
+                                scan::identify_dll(&t5.join("version.dll")).is_ours(),
+                                "还原后原本那份本项目文件原样回来了"
+                            );
+                            check!(
+                                !t5.join("winmm.dll").exists(),
+                                "还原后本次部署的 winmm.dll 也移除了"
+                            );
+                        }
+                        Err(e) => {
+                            println!("  [FAIL] 换入口后还原报错: {e}");
+                            fails += 1;
+                        }
+                    }
+                }
+                Err(e) => {
+                    println!("  [FAIL] 换入口部署报错: {e}");
+                    fails += 1;
+                }
+            }
         }
     }
 

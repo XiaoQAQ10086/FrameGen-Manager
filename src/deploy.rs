@@ -39,6 +39,45 @@ pub struct BackupManifest {
     pub files: Vec<BackupEntry>,
 }
 
+/// 旧记录里的代理入口这次不用了，该怎么处置。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OrphanAction {
+    /// 不碰
+    Keep,
+    /// 我们新放的：直接从目录里删掉
+    Remove,
+    /// 那个位置**原本就有文件**（用户手动装的、或旧版本装的同项目文件）：
+    /// 也要从目录里删掉（否则两个代理并存），但**备份记录必须留下来**，
+    /// 否则「还原」再也放不回原件，就变成还原也管不到的孤儿。
+    RemoveButKeepRecord,
+}
+
+/// 决定一条旧记录该怎么处置。
+///
+/// 抽成纯函数是为了能单独测：真实的代理 DLL 带本项目签名，自测里造不出来。
+///
+/// 判定故意保守 —— 只有「确实是我们当初写进去的那一份」才动：
+///   * 不是代理入口 -> 不碰（ini 每次都在清单里，走不到这）
+///   * 这次还要用 -> 不碰
+///   * 文件已经不在了 -> 不碰
+///   * 内容不是我们写的那份（用户换过）-> 不碰
+pub fn plan_orphan(
+    is_proxy: bool,
+    in_payload: bool,
+    file_present: bool,
+    still_ours: bool,
+    existed_before: bool,
+) -> OrphanAction {
+    if !is_proxy || in_payload || !file_present || !still_ours {
+        return OrphanAction::Keep;
+    }
+    if existed_before {
+        OrphanAction::RemoveButKeepRecord
+    } else {
+        OrphanAction::Remove
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DeployState {
     NotDeployed,
@@ -289,7 +328,7 @@ pub fn deploy(target_dir: &Path, proxy: &str, files: &[DeployFile]) -> Result<St
     }
 
     // 5. 先写 manifest，保证后面任何失败都能回滚
-    let manifest = BackupManifest {
+    let mut manifest = BackupManifest {
         game_key: key,
         game_dir: target_dir.to_path_buf(),
         deployed_at: util::now_utc(),
@@ -323,26 +362,44 @@ pub fn deploy(target_dir: &Path, proxy: &str, files: &[DeployFile]) -> Result<St
     //
     // 用户手动换代理入口再部署时，旧的那个会留在游戏目录里，而且新 manifest
     // 里没有它 —— 变成一个「还原也管不到」的孤儿，游戏加载哪个全看运气。
-    // 判定条件很保守：必须是旧 manifest 记过账、当时没有原文件、而且现在这个
-    // 文件的内容还等于我们当初写进去的那份（没被用户换过），才删。
+    //
+    // 两种情况要分开处理，规则见 plan_orphan：
+    //   * 这个位置本来空着、是我们放进去的 -> 直接删掉
+    //   * 这个位置**原本就有文件**（用户手动装过、或旧版本装的同项目文件）
+    //     -> 也要删掉（不然两个代理并存），但要把那条备份记录搬进新 manifest，
+    //        否则「还原」就再也放不回原件了。这个分支以前是直接跳过的，
+    //        结果就是两个代理并存 + 原件失联。
     let mut removed: Vec<String> = Vec::new();
+    let mut carried: Vec<BackupEntry> = Vec::new();
+    let mut kept_record: Vec<String> = Vec::new();
     if let Some(old) = &existing_manifest {
         for e in &old.files {
-            if !PROXY_ENTRIES.contains(&e.rel_path.as_str()) || e.existed_before {
-                continue;
-            }
-            if payload.iter().any(|(n, _, _)| *n == e.rel_path) {
-                continue;
-            }
+            let in_payload = payload.iter().any(|(n, _, _)| *n == e.rel_path);
             let p = target_dir.join(&e.rel_path);
-            if !p.is_file() {
-                continue;
-            }
-            let still_ours = util::sha256_file(&p)
-                .map(|h| h == e.deployed_sha256)
-                .unwrap_or(false);
-            if still_ours && std::fs::remove_file(&p).is_ok() {
-                removed.push(e.rel_path.clone());
+            let present = p.is_file();
+            let still_ours = present
+                && util::sha256_file(&p)
+                    .map(|h| h == e.deployed_sha256)
+                    .unwrap_or(false);
+            let action = plan_orphan(
+                PROXY_ENTRIES.contains(&e.rel_path.as_str()),
+                in_payload,
+                present,
+                still_ours,
+                e.existed_before,
+            );
+            match action {
+                OrphanAction::Keep => {}
+                OrphanAction::Remove | OrphanAction::RemoveButKeepRecord => {
+                    if std::fs::remove_file(&p).is_ok() {
+                        if action == OrphanAction::RemoveButKeepRecord {
+                            kept_record.push(e.rel_path.clone());
+                            carried.push(e.clone());
+                        } else {
+                            removed.push(e.rel_path.clone());
+                        }
+                    }
+                }
             }
         }
     }
@@ -351,6 +408,18 @@ pub fn deploy(target_dir: &Path, proxy: &str, files: &[DeployFile]) -> Result<St
             "已移除上次部署、这次不用的代理入口：{}（避免同时存在两个代理）",
             removed.join("、")
         ));
+    }
+    if !kept_record.is_empty() {
+        notes.push(format!(
+            "{} 原来就有本项目的文件，已从游戏目录挪走（避免两个代理并存），原件仍在备份里，点「还原」可以恢复",
+            kept_record.join("、")
+        ));
+        // 把记录补进刚落盘的新 manifest，否则「还原」找不到它
+        manifest.files.extend(carried);
+        std::fs::write(
+            base.join("manifest.json"),
+            serde_json::to_string_pretty(&manifest)?,
+        )?;
     }
 
     let names: Vec<&str> = payload.iter().map(|(n, _, _)| n.as_str()).collect();
