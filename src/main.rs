@@ -1250,7 +1250,7 @@ fn deploytest() {
         deploy::DeployFile::new("version.dll", &dll_src),
         deploy::DeployFile::new(deploy::INI_NAME, &ini_src),
     ];
-    match deploy::deploy(&target, "version.dll", &dep_files) {
+    match deploy::deploy(&target, "version.dll", &dep_files, &[]) {
         Ok(_) => {
             check!(
                 fs::read(target.join("version.dll")).ok().as_deref() == Some(&b"FAKE_DLL_PAYLOAD_V1"[..]),
@@ -1306,11 +1306,11 @@ fn deploytest() {
     fs::write(t4.join(deploy::INI_NAME), orig_ini).unwrap();
     let ini_only = [deploy::DeployFile::new(deploy::INI_NAME, &ini_src)];
     fs::write(&ini_src, b"FAKE_INI_PAYLOAD_V1").unwrap();
-    match deploy::deploy(&t4, "version.dll", &ini_only) {
+    match deploy::deploy(&t4, "version.dll", &ini_only, &[]) {
         Ok(_) => {
             // 上游更新了：源文件换成 V2，注意中间**没有**先还原
             fs::write(&ini_src, b"FAKE_INI_PAYLOAD_V2").unwrap();
-            match deploy::deploy(&t4, "version.dll", &ini_only) {
+            match deploy::deploy(&t4, "version.dll", &ini_only, &[]) {
                 Ok(_) => {
                     check!(
                         fs::read(t4.join(deploy::INI_NAME)).ok().as_deref()
@@ -1360,10 +1360,10 @@ fn deploytest() {
     fs::write(&winmm_src, b"FAKE_WINMM_V1").unwrap();
     let only_version = [deploy::DeployFile::new("version.dll", &dll_src)];
     let only_winmm = [deploy::DeployFile::new("winmm.dll", &winmm_src)];
-    match deploy::deploy(&t5, "version.dll", &only_version) {
+    match deploy::deploy(&t5, "version.dll", &only_version, &[]) {
         Ok(_) => {
             check!(t5.join("version.dll").is_file(), "先用 version.dll 部署成功");
-            match deploy::deploy(&t5, "winmm.dll", &only_winmm) {
+            match deploy::deploy(&t5, "winmm.dll", &only_winmm, &[]) {
                 Ok(_) => {
                     check!(t5.join("winmm.dll").is_file(), "换入口后 winmm.dll 已部署");
                     check!(
@@ -1400,7 +1400,7 @@ fn deploytest() {
     let _ = fs::create_dir_all(&t2);
     fs::write(t2.join("version.dll"), b"SOME_OTHER_MOD").unwrap();
     check!(
-        deploy::deploy(&t2, "version.dll", &dep_files).is_err(),
+        deploy::deploy(&t2, "version.dll", &dep_files, &[]).is_err(),
         "已存在第三方 version.dll 时拒绝部署"
     );
     check!(
@@ -1412,7 +1412,7 @@ fn deploytest() {
         deploy::DeployFile::new(deploy::INI_NAME, &ini_src),
     ];
     check!(
-        deploy::deploy(&t2, "winmm.dll", &dep_files_alt).is_ok(),
+        deploy::deploy(&t2, "winmm.dll", &dep_files_alt, &[]).is_ok(),
         "改用 winmm.dll 替代入口可以部署"
     );
     check!(t2.join("winmm.dll").is_file(), "替代入口文件已写入");
@@ -1467,7 +1467,7 @@ fn deploytest() {
                 advice.occupied.is_empty() && !advice.own_existing.is_empty(),
                 "已有本项目文件时不算被占用，而是归入 own_existing"
             );
-            let r = deploy::deploy(&t5, "version.dll", &dep_files);
+            let r = deploy::deploy(&t5, "version.dll", &dep_files, &[]);
             check!(r.is_ok(), "目标已有本项目文件时允许覆盖（不再误拒）");
             let recorded_as_existing = deploy::load_manifest(&t5)
                 .map(|m| {
@@ -1483,7 +1483,7 @@ fn deploytest() {
             let winmm_switch = src.join("winmm_switch.dll");
             fs::write(&winmm_switch, b"FAKE_WINMM_SWITCH").unwrap();
             let switch = [deploy::DeployFile::new("winmm.dll", &winmm_switch)];
-            match deploy::deploy(&t5, "winmm.dll", &switch) {
+            match deploy::deploy(&t5, "winmm.dll", &switch, &[]) {
                 Ok(_) => {
                     check!(
                         !t5.join("version.dll").exists(),
@@ -1519,6 +1519,83 @@ fn deploytest() {
                 }
                 Err(e) => {
                     println!("  [FAIL] 换入口部署报错: {e}");
+                    fails += 1;
+                }
+            }
+        }
+    }
+
+    // ---- 目录里有「本项目的另一个代理入口」，但不是本工具装的 ----
+    println!("
+-- 目录里有另一个本项目代理（手动装的）--");
+    let real_ours: Option<PathBuf> = [
+        r"D:\Epic Game\HogwartsLegacy\Phoenix\Binaries\Win64\version.dll",
+        r"E:\SteamLibrary\steamapps\common\PUBG\TslGame\Binaries\Win64\version.dll",
+    ]
+    .iter()
+    .map(PathBuf::from)
+    .find(|p| p.is_file());
+    match real_ours {
+        None => println!("  （本机没有真实的本项目 DLL，跳过这段）"),
+        Some(real) => {
+            let t6 = root.join("extra-proxy");
+            let _ = fs::create_dir_all(&t6);
+            // 模拟「用户手动装了 dinput8.dll」，而我们这次要用 version.dll
+            fs::copy(&real, t6.join("dinput8.dll")).unwrap();
+            check!(
+                deploy::find_extra_own_proxies(&t6, "version.dll") == vec!["dinput8.dll".to_owned()],
+                "认出了目录里另一个本项目代理（该弹窗问用户）"
+            );
+            check!(
+                deploy::find_extra_own_proxies(&t6, "dinput8.dll").is_empty(),
+                "和本次要用的入口同名时不算多余"
+            );
+
+            let ver2 = src.join("ver_extra.dll");
+            let ini2 = src.join("ini_extra.ini");
+            fs::write(&ver2, b"FAKE_VER_EXTRA").unwrap();
+            fs::write(&ini2, b"FAKE_INI_EXTRA").unwrap();
+            let payload2 = [
+                deploy::DeployFile::new("version.dll", &ver2),
+                deploy::DeployFile::new(deploy::INI_NAME, &ini2),
+            ];
+            let r = deploy::deploy(&t6, "version.dll", &payload2, &["dinput8.dll".to_owned()]);
+            check!(r.is_ok(), "用户选「移除并继续」后部署成功");
+            check!(
+                !t6.join("dinput8.dll").exists(),
+                "多余的那个本项目代理已移出游戏目录（只剩一个代理）"
+            );
+            let recorded = deploy::load_manifest(&t6)
+                .map(|m| {
+                    m.files.iter().any(|e| {
+                        e.rel_path == "dinput8.dll" && e.existed_before && e.backup_name.is_some()
+                    })
+                })
+                .unwrap_or(false);
+            check!(recorded, "移除的那份原件备份记录留下来了");
+
+            // 再部署一次（用户往往还会再点一次），记录不能被丢掉
+            let ini_only2 = [deploy::DeployFile::new(deploy::INI_NAME, &ini2)];
+            let r2 = deploy::deploy(&t6, "version.dll", &ini_only2, &[]);
+            check!(r2.is_ok(), "再部署一次也成功");
+            let recorded2 = deploy::load_manifest(&t6)
+                .map(|m| m.files.iter().any(|e| e.rel_path == "dinput8.dll"))
+                .unwrap_or(false);
+            check!(recorded2, "再部署之后那条记录还在（还原仍管得着）");
+
+            match deploy::restore(&t6) {
+                Ok(_) => {
+                    check!(
+                        scan::identify_dll(&t6.join("dinput8.dll")).is_ours(),
+                        "还原后手动装的那份 dinput8.dll 回来了"
+                    );
+                    check!(
+                        !t6.join("version.dll").exists(),
+                        "还原后本次部署的 version.dll 已移除"
+                    );
+                }
+                Err(e) => {
+                    println!("  [FAIL] 还原报错: {e}");
                     fails += 1;
                 }
             }
@@ -1658,6 +1735,9 @@ struct App {
     spoof_pending: Option<gpu::Op>,
     /// 驱动过旧时点「部署」需要再确认一次
     confirm_old_driver: bool,
+    /// 目标目录里有「本项目的另一个代理入口」时，先弹窗问一句。
+    /// Some 里是要问用户是否移除的那些文件名。
+    asked_extra_proxies: Option<Vec<String>>,
 
     // ---- 下载控制
     cancel: Option<Arc<AtomicBool>>,
@@ -1748,6 +1828,7 @@ impl App {
             spoof_ack: false,
             spoof_pending: None,
             confirm_old_driver: false,
+            asked_extra_proxies: None,
             cancel: None,
             use_backup: cfg.allow_backup_source,
             // 配置里没填过就用内置备用源，省得用户自己去查网址
@@ -2431,10 +2512,20 @@ impl App {
             self.confirm_old_driver = true;
             return;
         }
-        self.do_deploy();
+        // 上游要求「每次只保留本项目的一个代理」。如果目标目录里还躺着本项目的
+        // 另一个入口（比如用户手动装过），本工具没有记录可查、也不会自动清 ——
+        // 那就先问一句，别让用户以为部署成功了却有两个代理在打架。
+        if let Some(dir) = self.game_dir.clone() {
+            let extras = deploy::find_extra_own_proxies(&dir, &self.proxy);
+            if !extras.is_empty() {
+                self.asked_extra_proxies = Some(extras);
+                return;
+            }
+        }
+        self.do_deploy(Vec::new());
     }
 
-    fn do_deploy(&mut self) {
+    fn do_deploy(&mut self, remove_extra: Vec<String>) {
         let Some(dir) = self.game_dir.clone() else {
             self.status = "请先选择游戏目录".to_owned();
             return;
@@ -2500,7 +2591,7 @@ impl App {
         self.busy = true;
         self.status = "正在部署...".to_owned();
         self.spawn(move |tx, ctx| {
-            let r = deploy::deploy(&dir, &proxy, &files);
+            let r = deploy::deploy(&dir, &proxy, &files, &remove_extra);
             let _ = tx.send(match r {
                 Ok(m) => Msg::Done(m),
                 Err(e) => Msg::Failed(e.to_string()),
@@ -3787,12 +3878,57 @@ impl eframe::App for App {
                 });
             if go {
                 self.confirm_old_driver = false;
-                self.do_deploy();
+                self.do_deploy(Vec::new());
             } else if close {
                 self.confirm_old_driver = false;
                 if let Err(e) = util::open_url(gpu::DRIVER_URL) {
                     self.status = format!("打开驱动下载页失败: {e}");
                 }
+            }
+        }
+
+        // ---------------- 目录里还有另一个本项目代理时的确认
+        if let Some(extras) = self.asked_extra_proxies.clone() {
+            let ctx = self.ctx.clone();
+            let list = extras.join("、");
+            let mut go = false;
+            let mut keep = false;
+            egui::Window::new("目录里还有另一个代理入口")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+                .show(&ctx, |ui| {
+                    ui.set_max_width(470.0);
+                    ui.label(
+                        egui::RichText::new(format!("目标目录里还有本项目的 {list}。"))
+                            .size(13.0)
+                            .color(theme::WARN)
+                            .strong(),
+                    );
+                    ui.add_space(6.0);
+                    ui.label(
+                        "上游要求「每次只保留本项目的一个代理」。同时存在两个时，游戏加载哪一个是没准的 —— 可能用的还是旧的那个，看起来就像部署没生效。",
+                    );
+                    ui.add_space(4.0);
+                    ui.label(theme::hint(
+                        "移除前会先把原文件备份下来，之后点「还原」可以恢复。",
+                    ));
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if theme::primary_button(ui, "移除并继续部署", true).clicked() {
+                            go = true;
+                        }
+                        if theme::ghost_button(ui, "保留并继续", true).clicked() {
+                            keep = true;
+                        }
+                    });
+                });
+            if go {
+                self.asked_extra_proxies = None;
+                self.do_deploy(extras);
+            } else if keep {
+                self.asked_extra_proxies = None;
+                self.do_deploy(Vec::new());
             }
         }
     }

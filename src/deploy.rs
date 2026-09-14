@@ -171,10 +171,41 @@ impl DeployFile {
     }
 }
 
+/// 目标目录里有没有「本项目的另一个代理入口」——也就是本次不打算用、又不是本工具
+/// 部署过的那些。
+///
+/// 为什么需要它：上游 README 明确要求「每次只保留本项目的一个代理」。如果旧的那个是
+/// 用户**手动**装进去的，本工具的 manifest 里没有记录，原来那套清理就没有依据可查，
+/// 而那道「目录里还有别的东西」的提醒又只针对非本项目文件 —— 结果两个代理并存，
+/// 用户还以为部署成功了。所以界面上要拿这个结果去问用户一句。
+pub fn find_extra_own_proxies(target_dir: &Path, proxy: &str) -> Vec<String> {
+    let recorded: Vec<String> = load_manifest(target_dir)
+        .map(|m| m.files.into_iter().map(|e| e.rel_path).collect())
+        .unwrap_or_default();
+    PROXY_ENTRIES
+        .iter()
+        .copied()
+        .filter(|e| *e != proxy)
+        .filter(|e| {
+            let p = target_dir.join(e);
+            p.is_file()
+                && crate::scan::identify_dll(&p).is_ours()
+                && !recorded.iter().any(|r| r == e)
+        })
+        .map(str::to_owned)
+        .collect()
+}
+
 /// 部署。步骤：冲突检查 -> 占用检查 -> 备份 -> 写 manifest -> 原子写入 -> 校验（失败即回滚）
 ///
 /// proxy 是代理入口名（决定按哪个入口判冲突），files 是本次要写入的全部文件。
-pub fn deploy(target_dir: &Path, proxy: &str, files: &[DeployFile]) -> Result<String> {
+/// extra_proxies 是用户在弹窗里确认要移除的「本项目的另一个代理入口」。
+pub fn deploy(
+    target_dir: &Path,
+    proxy: &str,
+    files: &[DeployFile],
+    extra_proxies: &[String],
+) -> Result<String> {
     if !target_dir.is_dir() {
         bail!("目标目录不存在: {}", target_dir.display());
     }
@@ -327,6 +358,40 @@ pub fn deploy(target_dir: &Path, proxy: &str, files: &[DeployFile]) -> Result<St
         });
     }
 
+    // 4b. 用户确认要移除的「另一个本项目代理」也必须先备份。
+    // 记成 existed_before=true 的条目，这样「还原」还能把原件放回去 ——
+    // 上游的步骤是「备份到单独目录，再移出游戏目录」，两步都不能少。
+    // 已经在旧 manifest 里记过账的交给第 8 步处理，这里不重复备份
+    // （重复备份会用当前文件覆盖掉真正的原件，这个坑踩过一次）。
+    let mut extra_removed: Vec<String> = Vec::new();
+    for name in extra_proxies {
+        if !PROXY_ENTRIES.contains(&name.as_str()) || name == proxy {
+            continue;
+        }
+        if prev.contains_key(name) {
+            continue;
+        }
+        if entries.iter().any(|e| &e.rel_path == name) {
+            continue;
+        }
+        let dst = target_dir.join(name);
+        if !dst.is_file() {
+            continue;
+        }
+        let orig = std::fs::read(&dst).with_context(|| format!("备份 {}", dst.display()))?;
+        let sha = util::sha256_hex(&orig);
+        let bn = format!("{name}.bak");
+        std::fs::write(files_dir.join(&bn), &orig)?;
+        entries.push(BackupEntry {
+            rel_path: name.clone(),
+            existed_before: true,
+            backup_name: Some(bn),
+            original_sha256: Some(sha.clone()),
+            deployed_sha256: sha,
+        });
+        extra_removed.push(name.clone());
+    }
+
     // 5. 先写 manifest，保证后面任何失败都能回滚
     let mut manifest = BackupManifest {
         game_key: key,
@@ -358,51 +423,73 @@ pub fn deploy(target_dir: &Path, proxy: &str, files: &[DeployFile]) -> Result<St
         }
     }
 
-    // 8. 清掉上次部署、这次不再使用的代理入口
+    // 8. 清掉这次不用的代理入口
     //
-    // 用户手动换代理入口再部署时，旧的那个会留在游戏目录里，而且新 manifest
-    // 里没有它 —— 变成一个「还原也管不到」的孤儿，游戏加载哪个全看运气。
+    // 三个来源，规则见 plan_orphan：
+    //   * 用户在弹窗里确认要移除的「另一个本项目代理」（extra_removed）—— 上面已备份
+    //   * 旧 manifest 记过账、这次不用的：本来空着、是我们放的就直接删；那位置
+    //     **原本就有文件**的也要删（不然两个代理并存），但备份记录必须搬进新
+    //     manifest，否则「还原」再也放不回原件（这分支以前是直接跳过的）
+    //   * 其它：不碰
     //
-    // 两种情况要分开处理，规则见 plan_orphan：
-    //   * 这个位置本来空着、是我们放进去的 -> 直接删掉
-    //   * 这个位置**原本就有文件**（用户手动装过、或旧版本装的同项目文件）
-    //     -> 也要删掉（不然两个代理并存），但要把那条备份记录搬进新 manifest，
-    //        否则「还原」就再也放不回原件了。这个分支以前是直接跳过的，
-    //        结果就是两个代理并存 + 原件失联。
+    // 另外：凡是有原件备份、这次又不部署的条目，记录都要一直传下去 —— 包括文件
+    // 已经不在了的。因为「还原」收尾会把整个备份目录删掉，记录一丢，原件就永久
+    // 拿不回来了。
     let mut removed: Vec<String> = Vec::new();
     let mut carried: Vec<BackupEntry> = Vec::new();
     let mut kept_record: Vec<String> = Vec::new();
+
+    for name in &extra_removed {
+        let p = target_dir.join(name);
+        if std::fs::remove_file(&p).is_ok() {
+            kept_record.push(name.clone());
+        }
+    }
+
     if let Some(old) = &existing_manifest {
         for e in &old.files {
-            let in_payload = payload.iter().any(|(n, _, _)| *n == e.rel_path);
+            if payload.iter().any(|(n, _, _)| *n == e.rel_path) {
+                continue;
+            }
             let p = target_dir.join(&e.rel_path);
             let present = p.is_file();
             let still_ours = present
                 && util::sha256_file(&p)
                     .map(|h| h == e.deployed_sha256)
                     .unwrap_or(false);
+            let has_backup = e.existed_before && e.backup_name.is_some();
             let action = plan_orphan(
                 PROXY_ENTRIES.contains(&e.rel_path.as_str()),
-                in_payload,
+                false,
                 present,
                 still_ours,
                 e.existed_before,
             );
+            let mut keep_record = false;
             match action {
-                OrphanAction::Keep => {}
-                OrphanAction::Remove | OrphanAction::RemoveButKeepRecord => {
+                OrphanAction::Keep => {
+                    // 文件不在了、或者还写着我们的东西但没被当成代理处理：
+                    // 只要有原件备份，这条记录就得传下去
+                    keep_record = has_backup && (!present || still_ours);
+                }
+                OrphanAction::Remove => {
                     if std::fs::remove_file(&p).is_ok() {
-                        if action == OrphanAction::RemoveButKeepRecord {
-                            kept_record.push(e.rel_path.clone());
-                            carried.push(e.clone());
-                        } else {
-                            removed.push(e.rel_path.clone());
-                        }
+                        removed.push(e.rel_path.clone());
                     }
                 }
+                OrphanAction::RemoveButKeepRecord => {
+                    if std::fs::remove_file(&p).is_ok() {
+                        kept_record.push(e.rel_path.clone());
+                    }
+                    keep_record = has_backup;
+                }
+            }
+            if keep_record && !carried.iter().any(|c| c.rel_path == e.rel_path) {
+                carried.push(e.clone());
             }
         }
     }
+
     if !removed.is_empty() {
         notes.push(format!(
             "已移除上次部署、这次不用的代理入口：{}（避免同时存在两个代理）",
@@ -411,10 +498,15 @@ pub fn deploy(target_dir: &Path, proxy: &str, files: &[DeployFile]) -> Result<St
     }
     if !kept_record.is_empty() {
         notes.push(format!(
-            "{} 原来就有本项目的文件，已从游戏目录挪走（避免两个代理并存），原件仍在备份里，点「还原」可以恢复",
+            "已按你的选择移出本项目的其它代理入口：{}（上游要求每次只留一个），原件在备份里，点「还原」可以恢复",
             kept_record.join("、")
         ));
-        // 把记录补进刚落盘的新 manifest，否则「还原」找不到它
+    }
+    if !carried.is_empty() {
+        // 把记录补进刚落盘的新 manifest，否则「还原」找不到它们
+        manifest
+            .files
+            .retain(|m| !carried.iter().any(|c| c.rel_path == m.rel_path));
         manifest.files.extend(carried);
         std::fs::write(
             base.join("manifest.json"),
