@@ -101,7 +101,8 @@ impl DeployState {
             DeployState::NotDeployed => "未部署".to_owned(),
             DeployState::Deployed { proxy, .. } => format!("已部署 ({})", proxy),
             DeployState::ManuallyInstalled { files } => {
-                format!("已安装，非本工具部署（{}）", files.join("、"))
+                // 「非本工具部署」容易被读成「部署失败了」，这里说清是「没有本工具的记录」
+                format!("已安装，本工具无记录（{}）", files.join("、"))
             }
             DeployState::Occupied { files } => format!("入口被占用: {}", files.join(", ")),
         }

@@ -1237,6 +1237,23 @@ fn selftest() {
         "INI 里没有 Router 项时，SM75 部署不再失败（原样部署）",
     );
 
+    println!("\n--- 部署状态文案（别让人读成「部署失败」）---");
+    {
+        let manual = deploy::DeployState::ManuallyInstalled {
+            files: vec!["version.dll".to_owned()],
+        };
+        ck(
+            &mut fails,
+            manual.label().contains("本工具无记录"),
+            "文件在但没记录时，说的是「本工具无记录」而不是「非本工具部署」",
+        );
+        ck(
+            &mut fails,
+            deploy::DeployState::NotDeployed.label().contains("未部署"),
+            "没装过的文案还是「未部署」",
+        );
+    }
+
     println!("\n--- 游戏库缓存（下次打开不用再扫一遍）---");
     {
         let dir = std::env::temp_dir().join("fgm-lib-selftest");
@@ -2670,6 +2687,14 @@ impl App {
             self.ac_target = None;
             self.start_ac_scan(d);
         }
+        // 游戏库里每一行的「部署状态」也要跟着刷新。
+        //
+        // 不刷的话行上的徽章会停在部署前的状态：用户在库里点开一个「已安装，非本工具部署」
+        // 的游戏、部署成功之后，左侧卡片已经变成「已部署」，行上却还写着「非本工具部署」
+        // —— 看上去就像部署没生效。这个状态本来就该在每次部署 / 还原之后重算。
+        for row in &mut self.games {
+            row.deployed = deploy::state_of(&row.target);
+        }
     }
 
     fn handle(&mut self, msg: Msg) {
@@ -3393,6 +3418,17 @@ impl App {
         self.status = "正在部署...".to_owned();
         self.spawn(move |tx, ctx| {
             let r = deploy::deploy(&dir, &proxy, &files, &remove_extra);
+            // 「部署成功却显示非本工具部署」这类投诉，看这一行就能定论：
+            // 备份记录（manifest）到底写没写进去、能不能读回来。
+            match &r {
+                Ok(_) => log::line(&format!(
+                    "部署完成：{} 代理={} 备份记录可读={}",
+                    dir.display(),
+                    proxy,
+                    deploy::load_manifest(&dir).is_some()
+                )),
+                Err(e) => log::line(&format!("部署失败：{} {} ", dir.display(), e)),
+            }
             let _ = tx.send(match r {
                 Ok(m) => Msg::Done(m),
                 Err(e) => Msg::Failed(e.to_string()),
@@ -3410,6 +3446,14 @@ impl App {
         self.status = "正在还原...".to_owned();
         self.spawn(move |tx, ctx| {
             let r = deploy::restore(&dir);
+            match &r {
+                Ok(_) => log::line(&format!(
+                    "还原完成：{} 备份记录还在={}",
+                    dir.display(),
+                    deploy::load_manifest(&dir).is_some()
+                )),
+                Err(e) => log::line(&format!("还原失败：{} {e}", dir.display())),
+            }
             let _ = tx.send(match r {
                 Ok(m) => Msg::Done(m),
                 Err(e) => Msg::Failed(e.to_string()),
