@@ -328,6 +328,29 @@ Cargo.toml 的那几分钟，缓存还在吐旧内容。实测发 0.4.0 时官�
 manifest，包括文件已经不在了的 —— 因为「还原」收尾会删掉整个备份目录，记录一丢，
 原件就永久拿不回来了。@@--deploytest@@ 里有一条专门验"再部署一次记录还在"。
 
+### 硬件加速 GPU 计划（只读 + 跳转，绝不写）
+
+DLSS 帧生成要求系统开启「硬件加速 GPU 计划」（CDPR 官方的 DLSS FG 支持页明确写了这一条；
+上游作者的文档反倒一个字没提，所以这是帧生成本身的系统前提，不是这个 Mod 特有的）。
+
+**注册表里只有一个地方记它**：`HKLM\SYSTEM\CurrentControlSet\Control\GraphicsDrivers` 的
+`HwSchMode`（2 = 开，1 = 关）。但这个值**可能根本不存在** —— Windows 11 默认就是开启，
+系统不一定往注册表写这一项。实测本机 Win11 26300 **实际开着、值却不存在**，而且把整个
+`HKLM\SYSTEM\CurrentControlSet` 扫了一遍也没有第二个地方记状态。所以：
+
+* 读到 2 -> 已开启；读到 1 -> 已关闭；**读不到 -> 未知**，绝不能当成"关着"。
+* 界面按三态显示，未知时加一句「Win11 默认开启，想确认请点「去设置」」。
+* 部署后的提示**只在明确读到 1 时弹** —— 否则 Win11 那些本来就开着的用户每次部署都会被骚扰。
+
+**为什么不写注册表**：写它要管理员权限（UAC）、而且必须重启才生效，而用户自己在设置里点
+一下只要一秒。所以这个功能只做两件事：读状态、跳转到设置那一页。不碰系统设置、不要提权、
+不涉及重启。跳转走 `ShellExecute`（和打开网址同一套），URI 见微软官方的 ms-settings 列表：
+Win11 用 `ms-settings:display-advancedgraphics-default`（"默认图形设置"，开关在这页上），
+Win10 用 `ms-settings:display-advancedgraphics`。
+
+调试开关 `DLSSG_FAKE_HAGS=on|off|unknown` 可以强制三种状态，用来截图验证显示；
+`--gpuinfo` 里有 5 条断言盯着"值 -> 状态"的翻译；`--openhags` 单独测跳转。
+
 ### 显卡名称伪装（注册表）
 
 只改 `HKLM\SYSTEM\CurrentControlSet\Enum\PCI\<设备>\<实例>\DeviceDesc` 一个值。

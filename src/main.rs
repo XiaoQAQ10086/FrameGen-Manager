@@ -87,6 +87,18 @@ fn main() -> eframe::Result<()> {
         return Ok(());
     }
 
+    // 打开系统设置里「硬件加速 GPU 计划」那一页（测试跳转用）：cargo run -- --openhags
+    if std::env::args().any(|a| a == "--openhags") {
+        println!("系统构建号 = {:?}", gpu::windows_build());
+        println!("用的 URI  = {}", gpu::hags_settings_uri());
+        println!("当前状态 = {}", gpu::hags_state().label());
+        match gpu::open_hags_settings() {
+            Ok(()) => println!("已请求打开系统设置（ShellExecute 成功）"),
+            Err(e) => println!("[FAIL] 打开失败: {e}"),
+        }
+        return Ok(());
+    }
+
     // 把所有候选源实测一遍并打印速度表：cargo run -- --speedall
     // 和界面上「测速」按钮走的是同一个函数，用来验证选源这条链路。
     if std::env::args().any(|a| a == "--speedall") {
@@ -358,7 +370,9 @@ fn gpuinfo() {
         Some(d) => {
             println!("  市场版本     : {}（来源 {}）", d.marketing, d.source);
             if let Some(w) = &d.windows {
-                println!("  Windows 版本 : {w}");
+                // 注意：这是驱动的 Windows 格式版本号（32.0.16.1692 这种），
+                // 不是系统版本 —— 原来的标签会让人误以为是系统版本
+                println!("  驱动的 Windows 格式版本 : {w}");
             }
             println!(
                 "  低于 {}      : {}",
@@ -385,6 +399,33 @@ fn gpuinfo() {
     match gpu::backup_path() {
         Ok(p) => println!("备份文件位置: {}", p.display()),
         Err(e) => println!("备份文件位置: 无法确定（{e}）"),
+    }
+
+    println!();
+    println!("=== 硬件加速 GPU 计划（DLSS 帧生成的系统前提）===");
+    println!("  当前状态   : {}", gpu::hags_state().label());
+    println!("  系统构建号 : {:?}（Win11 = 22000 起）", gpu::windows_build());
+    println!("  跳转 URI   : {}", gpu::hags_settings_uri());
+    println!(
+        "  注册表位置 : HKLM\\SYSTEM\\CurrentControlSet\\Control\\GraphicsDrivers\\HwSchMode"
+    );
+    println!("  （这个值可能根本不存在 —— Win11 默认开启，系统不一定写它；读不到只能报未知）");
+    println!("  值 -> 状态的翻译：");
+    let cases: [(Option<u32>, gpu::HagsState, &str); 5] = [
+        (Some(2), gpu::HagsState::Enabled, "2 = 已开启"),
+        (Some(1), gpu::HagsState::Disabled, "1 = 已关闭"),
+        (None, gpu::HagsState::Unknown, "值不存在 = 未知"),
+        (Some(0), gpu::HagsState::Unknown, "0 = 未知（没见过，不瞎猜）"),
+        (Some(3), gpu::HagsState::Unknown, "3 = 未知（没见过，不瞎猜）"),
+    ];
+    for (v, want, label) in cases {
+        let got = gpu::hags_from_value(v);
+        println!(
+            "    [{}] {label}（读到 {:?} -> {}）",
+            if got == want { "PASS" } else { "FAIL" },
+            v,
+            got.label()
+        );
     }
 }
 
@@ -1739,6 +1780,17 @@ struct App {
     /// Some 里是要问用户是否移除的那些文件名。
     asked_extra_proxies: Option<Vec<String>>,
 
+    // ---- 硬件加速 GPU 计划（DLSS 帧生成的系统前提，只读 + 跳转，绝不写注册表）
+    hags: gpu::HagsState,
+    /// 部署完成后要不要提示去开硬件加速
+    hags_prompt: bool,
+    /// 这次 Msg::Done 是不是部署来的（用它决定要不要弹提示）
+    deploy_in_flight: bool,
+    /// 上一帧窗口有没有焦点 —— 用户从系统设置切回来时重读状态
+    was_focused: bool,
+    /// 调试开关：DLSSG_FAKE_HAGS=on|off|unknown 强制一个状态，只为截图验证三种显示
+    hags_fake: Option<gpu::HagsState>,
+
     // ---- 下载控制
     cancel: Option<Arc<AtomicBool>>,
     use_backup: bool,
@@ -1829,6 +1881,24 @@ impl App {
             spoof_pending: None,
             confirm_old_driver: false,
             asked_extra_proxies: None,
+            hags_fake: match std::env::var("DLSSG_FAKE_HAGS").ok().as_deref() {
+                Some("on") | Some("2") => Some(gpu::HagsState::Enabled),
+                Some("off") | Some("1") => Some(gpu::HagsState::Disabled),
+                Some("unknown") | Some("0") => Some(gpu::HagsState::Unknown),
+                _ => None,
+            },
+            hags: {
+                let fake = std::env::var("DLSSG_FAKE_HAGS").ok();
+                match fake.as_deref() {
+                    Some("on") | Some("2") => gpu::HagsState::Enabled,
+                    Some("off") | Some("1") => gpu::HagsState::Disabled,
+                    Some("unknown") | Some("0") => gpu::HagsState::Unknown,
+                    _ => gpu::hags_state(),
+                }
+            },
+            hags_prompt: false,
+            deploy_in_flight: false,
+            was_focused: true,
             cancel: None,
             use_backup: cfg.allow_backup_source,
             // 配置里没填过就用内置备用源，省得用户自己去查网址
@@ -2008,6 +2078,14 @@ impl App {
                 self.download_failed = false;
                 self.dl_started = None;
                 self.refresh();
+                // 部署完，如果硬件加速明确是关着的，提示一次（「未知」不提示，
+                // 否则 Win11 那些本来就开着的用户每次部署都会被骚扰）
+                if self.deploy_in_flight {
+                    self.deploy_in_flight = false;
+                    if self.hags == gpu::HagsState::Disabled {
+                        self.hags_prompt = true;
+                    }
+                }
             }
             Msg::Failed(e) => {
                 self.logs.push(format!("错误: {e}"));
@@ -2589,6 +2667,7 @@ impl App {
         files.push(deploy::DeployFile::new(deploy::INI_NAME, plan.path.clone()));
 
         self.busy = true;
+        self.deploy_in_flight = true;
         self.status = "正在部署...".to_owned();
         self.spawn(move |tx, ctx| {
             let r = deploy::deploy(&dir, &proxy, &files, &remove_extra);
@@ -2677,6 +2756,13 @@ impl eframe::App for App {
         while let Ok(m) = self.rx.try_recv() {
             self.handle(m);
         }
+        // 用户去系统设置里看完/改完再切回来 —— 这时重读一次硬件加速状态。
+        // 只在「刚获得焦点」那一帧读，不是每帧都读注册表。
+        let focused = self.ctx.input(|i| i.focused);
+        if focused && !self.was_focused {
+            self.hags = self.hags_fake.unwrap_or_else(gpu::hags_state);
+        }
+        self.was_focused = focused;
         if self.busy {
             self.ctx.request_repaint_after(std::time::Duration::from_millis(120));
         }
@@ -2911,6 +2997,46 @@ impl eframe::App for App {
                                 self.status = format!("打开驱动下载页失败: {e}");
                             }
                         }
+                    }
+
+                    // 硬件加速 GPU 计划：和驱动版本同一个性质（帧生成的系统前提），
+                    // 所以放在一起。只读显示 + 一个跳转按钮，程序不碰系统设置。
+                    ui.add_space(2.0);
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new("硬件加速 GPU 计划")
+                                .size(12.0)
+                                .color(theme::TEXT_MUTED),
+                        );
+                        let color = match self.hags {
+                            gpu::HagsState::Enabled => theme::OK,
+                            gpu::HagsState::Disabled => theme::DANGER,
+                            gpu::HagsState::Unknown => theme::NEUTRAL,
+                        };
+                        theme::badge(ui, self.hags.label(), color);
+                        if theme::ghost_button(ui, "去设置", true)
+                            .on_hover_text("打开 Windows 设置里「硬件加速 GPU 计划」那一页")
+                            .clicked()
+                        {
+                            if let Err(e) = gpu::open_hags_settings() {
+                                self.status = format!("打开系统设置失败: {e}");
+                            }
+                        }
+                    });
+                    match self.hags {
+                        gpu::HagsState::Unknown => {
+                            ui.label(theme::hint("Win11 默认开启，想确认请点「去设置」"));
+                        }
+                        gpu::HagsState::Disabled => {
+                            ui.label(
+                                egui::RichText::new(
+                                    "DLSS 帧生成要求这一项开启，关着的话可能不生效。",
+                                )
+                                .size(11.5)
+                                .color(theme::DANGER),
+                            );
+                        }
+                        gpu::HagsState::Enabled => {}
                     }
 
                     // 入口推荐
@@ -3929,6 +4055,50 @@ impl eframe::App for App {
             } else if keep {
                 self.asked_extra_proxies = None;
                 self.do_deploy(Vec::new());
+            }
+        }
+
+        // ---------------- 部署完发现「硬件加速 GPU 计划」是关着的
+        if self.hags_prompt {
+            let ctx = self.ctx.clone();
+            let (mut go, mut ok) = (false, false);
+            egui::Window::new("建议开启硬件加速 GPU 计划")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+                .show(&ctx, |ui| {
+                    ui.set_max_width(470.0);
+                    ui.label(
+                        egui::RichText::new("检测到「硬件加速 GPU 计划」是关闭的。")
+                            .size(13.0)
+                            .color(theme::DANGER)
+                            .strong(),
+                    );
+                    ui.add_space(6.0);
+                    ui.label(
+                        "DLSS 帧生成要求这一项开启（游戏官方的支持说明里也是这么写的）。关着的话，即使部署全对，帧生成也可能不生效。",
+                    );
+                    ui.add_space(4.0);
+                    ui.label(theme::hint(
+                        "点「去设置」会打开 Windows 设置里那一页，你自己把开关打开即可。改完要重启一次电脑才生效 —— 程序不会替你重启。",
+                    ));
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if theme::primary_button(ui, "去设置", true).clicked() {
+                            go = true;
+                        }
+                        if theme::ghost_button(ui, "知道了", true).clicked() {
+                            ok = true;
+                        }
+                    });
+                });
+            if go {
+                self.hags_prompt = false;
+                if let Err(e) = gpu::open_hags_settings() {
+                    self.status = format!("打开系统设置失败: {e}");
+                }
+            } else if ok {
+                self.hags_prompt = false;
             }
         }
     }

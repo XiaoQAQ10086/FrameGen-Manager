@@ -264,6 +264,87 @@ pub fn detect_driver(adapters: &[GpuAdapter]) -> Option<DriverInfo> {
     })
 }
 
+// ------------------------------------------------- 「硬件加速 GPU 计划」
+
+/// 「硬件加速 GPU 计划」的当前状态。
+///
+/// 注册表里**只有一个地方**记它：`HKLM\SYSTEM\CurrentControlSet\Control\GraphicsDrivers`
+/// 的 `HwSchMode`（2 = 开，1 = 关）。但这个值**可能根本不存在** —— Windows 11 默认
+/// 就是开启，而系统不一定往注册表里写这一项（实测本机 Win11 26300 实际开着、值却不存在，
+/// 全注册表扫了一遍也没有第二个地方记状态）。所以读不到时绝不能当成「关着」，
+/// 只能老实报「未知」，让用户点「去设置」自己看。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HagsState {
+    Enabled,
+    Disabled,
+    Unknown,
+}
+
+impl HagsState {
+    pub fn label(self) -> &'static str {
+        match self {
+            HagsState::Enabled => "已开启",
+            HagsState::Disabled => "已关闭",
+            HagsState::Unknown => "未知",
+        }
+    }
+}
+
+/// 把注册表里读到的值翻译成状态。抽成纯函数是为了能单独测。
+pub fn hags_from_value(v: Option<u32>) -> HagsState {
+    match v {
+        Some(2) => HagsState::Enabled,
+        Some(1) => HagsState::Disabled,
+        // 0、3 之类的值没见过 —— 按未知处理，别瞎猜
+        _ => HagsState::Unknown,
+    }
+}
+
+const HAGS_KEY: &str = "SYSTEM\\CurrentControlSet\\Control\\GraphicsDrivers";
+
+/// 读当前状态。**不需要管理员权限。**
+pub fn hags_state() -> HagsState {
+    let v = RegKey::predef(HKEY_LOCAL_MACHINE)
+        .open_subkey(HAGS_KEY)
+        .ok()
+        .and_then(|k| k.get_value::<u32, _>("HwSchMode").ok());
+    hags_from_value(v)
+}
+
+/// 当前系统构建号。读不到返回 None（那就按 Win10 处理）。
+///
+/// 注意别和 `DriverInfo::windows` 搞混 —— 那个是**驱动**的 Windows 格式版本号
+/// （32.0.16.1692 这种），不是系统版本。
+pub fn windows_build() -> Option<u32> {
+    let k = RegKey::predef(HKEY_LOCAL_MACHINE)
+        .open_subkey("SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion")
+        .ok()?;
+    let s: String = k.get_value("CurrentBuildNumber").ok()?;
+    s.trim().parse().ok()
+}
+
+/// Win11 是 22000 起步。
+pub fn is_windows_11() -> bool {
+    windows_build().map(|b| b >= 22000).unwrap_or(false)
+}
+
+/// 「硬件加速 GPU 计划」那一页在设置里的 URI。见微软官方 ms-settings 列表：
+///   Win11 = 系统 > 显示 > 图形 > **更改默认图形设置**（开关在这一页上）
+///   Win10 = 系统 > 显示 > **图形设置**，开关直接就在页面上
+pub fn hags_settings_uri() -> &'static str {
+    if is_windows_11() {
+        "ms-settings:display-advancedgraphics-default"
+    } else {
+        "ms-settings:display-advancedgraphics"
+    }
+}
+
+/// 打开系统设置里的那一页，让用户自己看/改。
+/// 走 ShellExecute（和打开网址同一套），ms-settings 协议由它处理；不写任何注册表。
+pub fn open_hags_settings() -> Result<()> {
+    crate::util::open_url(hags_settings_uri())
+}
+
 // ---------------------------------------------------------------- 备份
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
