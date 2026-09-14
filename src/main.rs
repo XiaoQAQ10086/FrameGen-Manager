@@ -206,7 +206,7 @@ fn main() -> eframe::Result<()> {
             if legacy { "310.1 版（RTX 20 系）" } else { "最新版（310.9）" }
         );
         match importer::stage(&paths, legacy, &work, &cancel, |m| println!("  {m}")) {
-            Ok(items) => {
+            Ok((items, notes)) => {
                 println!("  认出来 {} 个文件：", items.len());
                 for it in &items {
                     println!(
@@ -219,6 +219,9 @@ fn main() -> eframe::Result<()> {
                     );
                     println!("        {}", it.note);
                     println!("        sha256 {}", it.sha256);
+                }
+                for n in &notes {
+                    println!("  说明: {n}");
                 }
                 // 真写一遍到临时目录：验证「点了继续导入之后」那条路不会再失败
                 let dest = std::env::temp_dir().join("fgm-import-install-test");
@@ -2337,8 +2340,8 @@ enum Msg {
     LibraryLoaded(Vec<GameRow>, String, usize),
     /// 后台跑完的深度反作弊扫描（带着目录，用来丢弃过期的结果）
     AcScanned(PathBuf, AcReport),
-    /// 手动导入：zip 读完并逐个校验完了
-    ImportStaged(Vec<importer::Staged>),
+    /// 手动导入：zip 读完并逐个校验完了（第二项是「跳过/说明」清单）
+    ImportStaged(Vec<importer::Staged>, Vec<String>),
     /// 手动导入：写盘完成，带回给用户看的结果清单
     ImportDone(String),
     UpdateChecked(UpdateSummary),
@@ -2386,6 +2389,8 @@ struct App {
     import_pending: Option<Vec<importer::Staged>>,
     /// 导入结果清单（Some 时显示结果窗口）
     import_report: Option<String>,
+    /// 本次导入的「跳过 / 说明」清单（写进结果窗口）
+    import_notes: Vec<String>,
 
     /// 正在飞的选中动画
     fly: Option<FlyAnim>,
@@ -2525,6 +2530,7 @@ impl App {
             import_busy: false,
             import_pending: None,
             import_report: None,
+            import_notes: Vec::new(),
             fly: None,
             target_card_rect: None,
             flash_until: None,
@@ -3013,7 +3019,8 @@ impl App {
                     self.ac_target = Some(rep);
                 }
             }
-            Msg::ImportStaged(items) => {
+            Msg::ImportStaged(items, notes) => {
+                self.import_notes = notes;
                 let untrusted = items.iter().filter(|i| !i.trusted).count();
                 if untrusted == 0 {
                     self.status = format!("{} 个文件校验通过，正在写入 ...", items.len());
@@ -3303,7 +3310,7 @@ impl App {
                 let _ = ptx.send(Msg::Progress(m, 0.0, 0));
             });
             let _ = tx.send(match r {
-                Ok(items) => Msg::ImportStaged(items),
+                Ok((items, notes)) => Msg::ImportStaged(items, notes),
                 Err(e) => Msg::Failed(e.to_string()),
             });
             ctx.request_repaint();
@@ -3327,6 +3334,7 @@ impl App {
             return;
         }
         self.status = format!("正在写入 {} 个文件 ...", keep.len());
+        let notes = self.import_notes.clone();
         self.spawn(move |tx, ctx| {
             let mut report = String::new();
             match importer::install(&keep) {
@@ -3363,10 +3371,22 @@ impl App {
                     ));
                 }
             }
+            App::append_import_notes(&mut report, &notes);
             importer::cleanup(&items);
             let _ = tx.send(Msg::ImportDone(report));
             ctx.request_repaint();
         });
+    }
+
+    /// 结果清单里补上「跳过 / 说明」那一段（哪些文件没装、为什么）
+    fn append_import_notes(report: &mut String, notes: &[String]) {
+        if notes.is_empty() {
+            return;
+        }
+        report.push_str("\n说明：\n");
+        for n in notes {
+            report.push_str(&format!("  · {n}\n"));
+        }
     }
 
     fn start_scan(&mut self) {

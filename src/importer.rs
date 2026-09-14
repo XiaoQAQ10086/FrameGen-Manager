@@ -228,7 +228,8 @@ pub fn stage(
     work_dir: &Path,
     cancel: &AtomicBool,
     mut progress: impl FnMut(String),
-) -> Result<Vec<Staged>> {
+    // 第二个返回值是「说明」清单：哪些文件被跳过、为什么，界面会写进导入结果
+) -> Result<(Vec<Staged>, Vec<String>)> {
     std::fs::create_dir_all(work_dir)?;
     // 每个解出来的候选带着「它属于哪一版」的排名，等同名的都收齐了再挑赢家
     let mut cands: Vec<(u8, String, Staged)> = Vec::new();
@@ -331,10 +332,19 @@ pub fn stage(
     }
 
     let mut out: Vec<Staged> = Vec::new();
-    let mut ignored_other = 0usize;
+    let mut notes: Vec<String> = Vec::new();
     for (rank, path, mut st) in winners {
-        ignored_other += 0; // 占位：同名被丢掉的数量上面已经处理
-        if rank > 0 && st.trusted {
+        // 上游当前版本已经不用这个入口了（winhttp 只有 archive/0.2.4/altnative 里才有）。
+        // 它放进来纯属备用：两个版本的可选入口里都没有它，部署时永远不会用到，
+        // 所以**不要**因为它来自老版就弹窗（用户会当成误判）。照收，只在清单里说明一句。
+        let unused_entry =
+            st.kind == Kind::Proxy && !crate::scan::PROXY_PRIORITY.contains(&st.name.as_str());
+        if unused_entry {
+            notes.push(format!(
+                "{}：上游当前版本不使用这个入口（只有老版包里才有），仍然放进资产目录备用",
+                st.name
+            ));
+        } else if rank > 0 && st.trusted {
             // 签名没问题，但这是「另一版」的文件：静默装下去会悄悄换掉资产里的版本，
             // 所以降级成「让用户确认一句」，并把原因说清楚
             st.trusted = false;
@@ -347,8 +357,7 @@ pub fn stage(
         }
         out.push(st);
     }
-    let _ = ignored_other;
-    Ok(out)
+    Ok((out, notes))
 }
 
 /// 把校验过的文件搬进资产目录，并记进状态（界面就会显示「已就绪」）。
