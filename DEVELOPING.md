@@ -120,13 +120,21 @@ archive/0.2.4/，仓库根目录现在就是新版。这一版变了五处，每
 
 因此代码里现在有两套「资产版本」：
 
-* **最新版**（默认）：仓库根目录 + alternatives/，面向 RTX 30 系（SM86）。
-* **老版 native 包**：archive/0.2.4/ + archive/0.2.4/altnative/，仍然支持 SM75。
-  入口是「部署」卡片里给 RTX 20 系显示的那个按钮，状态存在配置的 `legacy_native`。
+* **最新版**（默认）：仓库根目录 + alternatives/，后端是 310.9，面向 RTX 30 系。
+* **310.1 版**：310.1/ + 310.1/alternatives/，后端是 310.1 —— 二进制里带
+dlssg-310.1-d3d12-sm86+sm75、sm75_route_limits、sm75_slots，即**带 SM75 内核**，
+给 RTX 20 / GTX 16 系用。INI 仍然用根目录那份（出厂 INI 自己会按内嵌运行库钳倍率：
+310.9 钳到 6X、310.1 钳到 4X）。入口是「部署」卡片里给 SM75 机器显示的按钮，
+状态存在配置的 `legacy_3101`。
 
-路径由 `update::proxy_repo_path(proxy, legacy)` / `update::ini_repo_path(legacy)` 统一决定，
-入口名单由 `scan::proxy_candidates(legacy)` 决定 —— 路径或名单要改时只动这两处，别再散落
-硬编码（0.7.0 那种写死名单的写法正是这次集体 404 的原因）。
+判断依据（翻的是程序本体里的字符串，不是猜的）：根目录那份写着
+"The 310.9 backend has no SM75 kernel family; use Router=Auto or SM86"，
+310.1 那份没有这句话，而且文件大 1.4 MB（正好多一个内核族）。
+
+路径由 `update::proxy_repo_path(proxy, legacy)` 和 `update::ini_repo_path(legacy)` 统一决定，
+入口名单只有一份 `scan::PROXY_PRIORITY`（两个版本的目录结构相同）—— 要改只动这几处，
+别再散落硬编码（0.7.0 那种写死名单的写法正是这次集体 404 的原因）。
+老名字（winhttp.dll）留在 `scan::PROXY_HISTORIC` 里，只用于「这算不算代理入口」的判断。
 
 版本号解析（`update::extract_version`）先按 "Native " 锚点找，找不到再取首行第一个
 「带小数点的数字」，两种写法都能认；`--selftest` 里有这两种格式的断言。
@@ -143,9 +151,9 @@ archive/0.2.4/，仓库根目录现在就是新版。这一版变了五处，每
 
 1. 目录里已有本项目的文件 -> 直接复用那个入口（避免同时存在两个代理）
 2. 排除被第三方占用的入口
-3. 按导入表匹配，优先级跟着「在用哪一版」走（scan::proxy_candidates）：
-   最新版 version -> winmm -> dbghelp -> dinput8 -> dxgi -> d3d12；
-   老版 native 包 version -> winmm -> dinput8 -> winhttp -> dxgi
+3. 按导入表匹配，优先级见 scan::PROXY_PRIORITY：
+   version -> winmm -> dbghelp -> dinput8 -> dxgi -> d3d12
+   （310.1 版的目录结构相同，所以两个版本共用这一份清单）
 4. 都判不出来就用上游默认 version.dll，并在界面上明确说明「未能自动判定」
 
 PE 解析是**随机读取**的：先读头部拿节表，再按节表把 RVA 换算成文件偏移 seek 过去读。

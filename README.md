@@ -33,7 +33,7 @@ Windows 桌面工具，把 [sdli1995/dlssg_for_sm86](https://github.com/sdli1995
 | 文件 | 用途 |
 |---|---|
 | version.dll | 代理入口（名字被占用时自动改用 winmm / dbghelp / dinput8 / dxgi / d3d12） |
-| dlssg_sm86.ini | 配置（老版 native 包下，RTX 20 系会自动改 Router=SM75） |
+| dlssg_sm86.ini | 配置（出厂只有两个开关；RTX 20 系会自动换用 310.1 版程序本体） |
 | nvngx_dlssg.dll | DLSS 帧生成运行库 |
 | nvngx_dlss.dll | DLSS 超分运行库 |
 
@@ -47,11 +47,15 @@ Windows 桌面工具，把 [sdli1995/dlssg_for_sm86](https://github.com/sdli1995
 
 ### RTX 20 系（Turing / SM75）用哪一版
 
-上游 0.3.0 把项目从 native 模式改回了代理模式，**新版只面向 RTX 30 系（SM86）**。
-所以如果你是 RTX 20 / GTX 16 系，程序会在「部署」卡片给一个「改用老版 native 包」的按钮
-—— 它会切到上游归档的 archive/0.2.4/（那一版仍然支持 SM75，部署时会自动把 INI 的
-Router 改成 SM75），随时可以再切回最新版。两版的文件名相同、内容不同，所以每次切换后
-都要点一下「下载 / 更新资产」重下一份（约 16–17 MB）。
+上游 0.3.0 的默认版（根目录那份）用的是 **310.9 后端，里面没有 SM75 内核**（程序本体里
+明确写着「The 310.9 backend has no SM75 kernel family」），所以它只面向 RTX 30 系。
+
+同一个仓库里还有一份 **310.1 版**，用的后端带 SM75 内核（二进制里带
+dlssg-310.1-d3d12-sm86+sm75 和 sm75_route_limits / sm75_slots），是给 RTX 20 / GTX 16 系
+用的。程序会在「部署」卡片给检测到 SM75 的机器一个「改用 310.1 版」按钮，点它就会把
+程序本体换成 310.1 那份（配置文件仍然用新版出厂的那份，倍率上限会由程序自己钳到
+310.1 支持的 4X）；随时可以切回最新版。两版文件名相同、内容不同，所以每次切换后都要
+点一下「下载 / 更新资产」重下一份（约 17–19 MB）。
 
 ## 显卡驱动版本
 

@@ -12,7 +12,8 @@ use std::path::{Path, PathBuf};
 use crate::util;
 
 /// 两个版本里出现过的所有代理入口名，同一时刻只应存在一个。
-/// 新版（0.3.0 代理包）用 alternatives/ 下的 6 个，老版 native 包用 altnative/ 下的 5 个。
+/// 现用清单是 alternatives/ 下的 6 个（根目录和 310.1/ 同一套目录结构）；
+/// archive/0.2.4/altnative/ 里那份更老的归档包还用过 winhttp.dll。
 /// 这里取并集：判断「这个文件算不算代理入口」时两边的名字都得认，
 /// 否则用户从老版切到新版后，目录里残留的 winhttp.dll 会被当成第三方文件而拒绝处理。
 pub const PROXY_ENTRIES: [&str; 7] = [

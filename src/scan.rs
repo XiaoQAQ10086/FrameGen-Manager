@@ -734,6 +734,7 @@ pub fn identify_dll(path: &Path) -> FileIdentity {
 
 /// 当前版（上游 0.3.0 代理模式）支持的代理入口，按上游推荐顺序排列。
 /// version.dll 是上游默认；dbghelp / d3d12 是 0.3.0 新增的，winhttp 已被上游删掉。
+/// 根目录（310.9）和 310.1/ 两个版本的目录结构一样，所以清单是同一份。
 pub const PROXY_PRIORITY: [&str; 6] = [
     "version.dll",
     "winmm.dll",
@@ -743,29 +744,14 @@ pub const PROXY_PRIORITY: [&str; 6] = [
     "d3d12.dll",
 ];
 
-/// 老版 native 包（archive/0.2.4/）支持的代理入口。
-/// RTX 20 / GTX 16 系（SM75）要用这一版，所以候选名单也得跟着换。
-pub const PROXY_PRIORITY_LEGACY: [&str; 5] = [
-    "version.dll",
-    "winmm.dll",
-    "dinput8.dll",
-    "winhttp.dll",
-    "dxgi.dll",
-];
+/// 上游历史上用过、现在只剩归档包（archive/0.2.4/altnative/）里才有的入口名。
+/// 判断「要不要拒绝覆盖」「要不要清理多余代理」时老名字也得认，
+/// 否则用户从老版切过来时，目录里残留的 winhttp.dll 会被当成第三方文件。
+pub const PROXY_HISTORIC: [&str; 1] = ["winhttp.dll"];
 
-/// 某个文件名是不是代理入口（两个版本的并集）。
-/// 判断「要不要拒绝覆盖」「要不要清理多余代理」都得用它。
+/// 某个文件名是不是代理入口（现用清单 + 历史上的名字）。
 pub fn is_known_proxy(name: &str) -> bool {
-    PROXY_PRIORITY.contains(&name) || PROXY_PRIORITY_LEGACY.contains(&name)
-}
-
-/// 按模式取候选入口名单。
-pub fn proxy_candidates(legacy: bool) -> &'static [&'static str] {
-    if legacy {
-        &PROXY_PRIORITY_LEGACY
-    } else {
-        &PROXY_PRIORITY
-    }
+    PROXY_PRIORITY.contains(&name) || PROXY_HISTORIC.contains(&name)
 }
 
 /// 判断入口时最多分析多少个模块，避免在大游戏目录上卡住
@@ -799,11 +785,8 @@ pub struct ProxyAdvice {
 /// 导入了 version.dll，把代理放进这个目录就会被加载。判据是**导入表**，不是游戏名字。
 ///
 /// 三级：先排除被占用的 -> 再按导入表匹配 -> 都判不出来就用上游默认并标 undetermined。
-///
-/// 参数 legacy 决定候选名单：新版是 6 个入口（含 dbghelp/d3d12），
-/// 老版 native 包是 5 个（含 winhttp）—— 名单错了就会推荐一个仓库里根本没有的文件。
-pub fn advise_proxy(target_dir: &Path, legacy: bool) -> ProxyAdvice {
-    let cands = proxy_candidates(legacy);
+pub fn advise_proxy(target_dir: &Path) -> ProxyAdvice {
+    let cands: &[&str] = &PROXY_PRIORITY;
     // 先看目录里已经有哪些入口，并判断它们的来源身份。
     // 这一步同时回答了「用户是不是已经手动装过本项目」。
     let mut occupied: Vec<ExistingEntry> = Vec::new();

@@ -600,7 +600,10 @@ fn speedtest() {
             return;
         }
     };
-    let repo_path = update::proxy_repo_path("version.dll", false);
+    // 跟随配置里选的版本，命令行才能把两种版本都端到端跑一遍
+    let legacy = util::load_config().legacy_3101;
+    let repo_path = update::proxy_repo_path("version.dll", legacy);
+    println!("  资产版本 = {}", if legacy { "310.1（RTX 20 系）" } else { "最新版 310.9" });
     let remote = match update::probe_remote(&c, repo_path) {
         Ok(r) => r,
         Err(e) => {
@@ -1043,16 +1046,16 @@ fn selftest() {
             let st = update::load_state();
             // 和界面里一样：每个文件发一次 HEAD 拿 ETag，一次 API 都不调。
             // 名单跟着「在用的那一版」走 —— 上游 0.3.0 把 altnative/ 改成了 alternatives/。
-            let legacy = util::load_config().legacy_native;
+            let legacy = util::load_config().legacy_3101;
             println!(
                 "  资产版本: {}",
                 if legacy {
-                    "老版 native 包（archive/0.2.4）"
+                    "310.1 版（给 RTX 20 / GTX 16 系）"
                 } else {
-                    "最新版（上游代理包）"
+                    "最新版（上游 310.9 代理包）"
                 }
             );
-            let mut specs: Vec<String> = scan::proxy_candidates(legacy)
+            let mut specs: Vec<String> = scan::PROXY_PRIORITY
                 .iter()
                 .map(|p| update::proxy_repo_path(p, legacy).to_owned())
                 .collect();
@@ -1115,7 +1118,7 @@ fn selftest() {
         let target = scan::find_render_exe(&g.install_dir)
             .and_then(|p| p.parent().map(|d| d.to_path_buf()))
             .unwrap_or_else(|| g.install_dir.clone());
-        let a = scan::advise_proxy(&target, false);
+        let a = scan::advise_proxy(&target);
         println!(
             "  [{}]\n       目标目录 = {}",
             g.name,
@@ -1162,7 +1165,7 @@ fn selftest() {
         );
     }
 
-    println!("\n--- 仓库路径（新版代理包 / 老版 native 包）---");
+    println!("\n--- 仓库路径（最新版 / 给 RTX 20 系的 310.1 版）---");
     ck(
         &mut fails,
         update::proxy_repo_path("version.dll", false) == "version.dll",
@@ -1180,29 +1183,28 @@ fn selftest() {
     );
     ck(
         &mut fails,
-        update::proxy_repo_path("version.dll", true) == "archive/0.2.4/version.dll",
-        "老版 version.dll 在 archive/0.2.4/",
+        update::proxy_repo_path("version.dll", true) == "310.1/version.dll",
+        "RTX 20 系用的 310.1 版在 310.1/ 下",
     );
     ck(
         &mut fails,
-        update::proxy_repo_path("winhttp.dll", true) == "archive/0.2.4/altnative/winhttp.dll",
-        "老版备用入口在 altnative/",
+        update::proxy_repo_path("dbghelp.dll", true) == "310.1/alternatives/dbghelp.dll",
+        "310.1 版的备用入口在 310.1/alternatives/",
     );
     ck(
         &mut fails,
-        update::ini_repo_path(false) == "dlssg_sm86.ini"
-            && update::ini_repo_path(true) == "archive/0.2.4/dlssg_sm86.ini",
-        "两种模式的 INI 路径",
+        update::ini_repo_path(true) == "dlssg_sm86.ini",
+        "310.1 版也配根目录那份出厂 INI",
     );
     ck(
         &mut fails,
-        scan::proxy_candidates(false).len() == 6 && scan::proxy_candidates(true).len() == 5,
-        "新版 6 个代理入口 / 老版 5 个",
+        scan::PROXY_PRIORITY.len() == 6,
+        "现在有 6 个代理入口",
     );
     ck(
         &mut fails,
         scan::is_known_proxy("winhttp.dll") && scan::is_known_proxy("d3d12.dll"),
-        "两个版本出现过的入口名都算代理入口",
+        "历史上出现过的入口名都算代理入口",
     );
     ck(
         &mut fails,
@@ -1714,7 +1716,7 @@ fn deploytest() {
                 "复制过去后仍判定为本项目文件"
             );
             // 先确认它是「可覆盖」的，再实际部署一次
-            let advice = scan::advise_proxy(&t5, false);
+            let advice = scan::advise_proxy(&t5);
             check!(
                 advice.occupied.is_empty() && !advice.own_existing.is_empty(),
                 "已有本项目文件时不算被占用，而是归入 own_existing"
@@ -2017,8 +2019,8 @@ struct App {
     cancel: Option<Arc<AtomicBool>>,
     use_backup: bool,
     backup_prefix: String,
-    /// 是否使用老版 native 包（archive/0.2.4/）—— RTX 20 / GTX 16 系用得上
-    legacy_native: bool,
+    /// 是否使用 310.1 版程序本体（310.1/）—— RTX 20 / GTX 16 系（SM75）用得上
+    legacy_3101: bool,
     download_failed: bool,
     /// 测速结果，界面按它列候选源
     speed_results: Vec<update::SourceSpeed>,
@@ -2132,7 +2134,7 @@ impl App {
             } else {
                 cfg.backup_prefix
             },
-            legacy_native: cfg.legacy_native,
+            legacy_3101: cfg.legacy_3101,
             download_failed: false,
             speed_results: Vec::new(),
             speed_testing: false,
@@ -2159,7 +2161,7 @@ impl App {
             self.advice = None;
             return;
         };
-        let advice = scan::advise_proxy(&dir, self.legacy_native);
+        let advice = scan::advise_proxy(&dir);
         // 判出来了就把下拉框切到推荐项（用户之后仍可手动改）
         if !advice.undetermined {
             self.proxy = advice.recommended.clone();
@@ -2289,10 +2291,10 @@ impl App {
         ));
         s.push_str(&format!(
             "资产版本: {}\n",
-            if self.legacy_native {
-                "老版 native 包 archive/0.2.4（给 RTX 20 / GTX 16 系）"
+            if self.legacy_3101 {
+                "310.1 版（给 RTX 20 / GTX 16 系，带 SM75 内核）"
             } else {
-                "最新版（上游代理包）"
+                "最新版（上游 310.9 代理包）"
             }
         ));
         s.push_str("\n--- 最近的操作日志 ---\n");
@@ -2484,22 +2486,32 @@ impl App {
         }
     }
 
-    /// 切换资产版本：最新版（上游代理包）<-> 老版 native 包（archive/0.2.4）。
-    /// 两版同名文件的内容不同，指纹也不同，所以切换后点「下载 / 更新资产」会重新拉一份。
-    /// 代理入口名单两版不一样，切过去可能停在一个仓库里没有的名字上，顺手重新推断一次。
-    fn set_legacy_native(&mut self, on: bool) {
-        if self.legacy_native == on {
+    /// 切换程序本体：上游最新版（根目录，310.9 后端）<-> 310.1 版（带 SM75 内核的代理版）。
+    ///
+    /// 两版同名文件的内容不同，所以切换时必须把下载记录清掉。不能只靠指纹：
+    /// 探测落到镜像时指纹不可信，判定「已是最新」会退化成「比字节数」，
+    /// 那时就会拿旧记录把 310.9 的文件当成 310.1 的，**静默跳过下载**，用户以为切了其实没切。
+    /// 清掉记录不影响 DLSS 运行库（那两个是按本地文件签名判断的，不会重下）。
+    fn set_legacy_3101(&mut self, on: bool) {
+        if self.legacy_3101 == on {
             return;
         }
-        self.legacy_native = on;
+        self.legacy_3101 = on;
         self.save_config();
-        if !scan::proxy_candidates(on).contains(&self.proxy.as_str()) {
+        let mut st = update::load_state();
+        if !st.files.is_empty() {
+            st.files.clear();
+            if let Err(e) = update::save_state(&st) {
+                self.note(format!("清空下载记录失败（下一次下载可能不会重新拉）: {e}"));
+            }
+        }
+        if !scan::is_known_proxy(&self.proxy) {
             self.proxy = scan::PROXY_PRIORITY[0].to_owned();
         }
         self.redetect();
         self.status = if on {
             format!(
-                "已切到老版 native 包（{}）。点「下载 / 更新资产」重新下载（约 16 MB）。",
+                "已切到 {}（给 RTX 20 / GTX 16 系）。点「下载 / 更新资产」重新下载（约 18 MB）。",
                 update::LEGACY_PREFIX
             )
         } else {
@@ -2514,7 +2526,7 @@ impl App {
             asset_dir: util::load_config().asset_dir,
             allow_backup_source: self.use_backup,
             backup_prefix: self.backup_prefix.clone(),
-            legacy_native: self.legacy_native,
+            legacy_3101: self.legacy_3101,
         };
         if let Err(e) = util::save_config(&cfg) {
             self.note(format!("保存配置失败: {e}"));
@@ -2532,7 +2544,7 @@ impl App {
         cfg.asset_dir = Some(dir.clone());
         cfg.allow_backup_source = self.use_backup;
         cfg.backup_prefix = self.backup_prefix.clone();
-        cfg.legacy_native = self.legacy_native;
+        cfg.legacy_3101 = self.legacy_3101;
         if let Err(e) = util::save_config(&cfg) {
             self.status = format!("保存配置失败: {e}");
             return;
@@ -2594,7 +2606,7 @@ impl App {
     fn start_update_check(&mut self) {
         self.busy = true;
         self.status = "正在检查上游更新...".to_owned();
-        let legacy = self.legacy_native;
+        let legacy = self.legacy_3101;
         self.spawn(move |tx, ctx| {
             let res = (|| -> anyhow::Result<UpdateSummary> {
                 let c = update::client()?;
@@ -2604,9 +2616,9 @@ impl App {
                 // 六个文件各发一次 HEAD 到 raw.githubusercontent.com 拿内容指纹。
                 // 走的是 CDN，不占 api.github.com 那每小时 60 次的配额 ——
                 // 配额被共享出口 IP 吃光正是之前「检查更新 / 下载」失败的原因。
-                // 在用的那一版有哪些文件：新版（代理包）6 个入口，老版 native 5 个。
+                // 在用的那一版有哪些文件：6 个代理入口 + INI。
                 // 名单写死过一次，上游把 altnative/ 改名成 alternatives/ 之后就全 404 了。
-                let mut specs: Vec<String> = scan::proxy_candidates(legacy)
+                let mut specs: Vec<String> = scan::PROXY_PRIORITY
                     .iter()
                     .map(|p| update::proxy_repo_path(p, legacy).to_owned())
                     .collect();
@@ -2671,7 +2683,7 @@ impl App {
         let proxy = self.proxy.clone();
         let use_backup = self.use_backup && !self.backup_prefix.trim().is_empty();
         let prefix = self.backup_prefix.trim().to_owned();
-        let legacy = self.legacy_native;
+        let legacy = self.legacy_3101;
         let cancel = Arc::new(AtomicBool::new(false));
         self.cancel = Some(cancel.clone());
         self.busy = true;
@@ -3733,8 +3745,8 @@ impl eframe::App for App {
                         egui::ComboBox::from_id_salt("proxy-entry")
                             .selected_text(self.proxy.clone())
                             .show_ui(ui, |ui| {
-                                for p in scan::proxy_candidates(self.legacy_native) {
-                                    ui.selectable_value(&mut self.proxy, (*p).to_owned(), *p);
+                                for p in scan::PROXY_PRIORITY {
+                                    ui.selectable_value(&mut self.proxy, p.to_owned(), p);
                                 }
                             });
                     });
@@ -3762,17 +3774,17 @@ impl eframe::App for App {
                     }
 
                     // RTX 20 / GTX 16 系（SM75）：上游 0.3.0 改回代理模式后只面向 RTX 30 系，
-                    // 给这类用户一个切到老版 native 包的开关 —— 那一版仍然支持 SM75。
+                    // 给这类用户一个切到 310.1 版的开关 —— 上游新版（310.9）没打包 SM75 内核。
                     if self.gpu_route == scan::GpuRoute::Sm75 {
                         ui.add_space(2.0);
-                        if self.legacy_native {
-                            theme::badge(ui, "正在用老版 native 包", theme::WARN);
+                        if self.legacy_3101 {
+                            theme::badge(ui, "正在用 310.1 版", theme::WARN);
                             ui.label(theme::hint(
-                                "老版 native 包（archive/0.2.4）仍支持 RTX 20 / GTX 16 系，部署时会自动把 INI 的 Router 改成 SM75。",
+                                "310.1 版是代理模式里仍然带 SM75 内核的那一份，给 RTX 20 / GTX 16 系用；倍率上限是 4X（新版 310.9 是 6X）。",
                             ));
                             if theme::ghost_button(ui, "改回最新版（上游代理包）", !self.busy).clicked()
                             {
-                                self.set_legacy_native(false);
+                                self.set_legacy_3101(false);
                             }
                         } else {
                             ui.label(
@@ -3784,13 +3796,13 @@ impl eframe::App for App {
                             );
                             if theme::ghost_button(
                                 ui,
-                                "改用老版 native 包（支持 RTX 20 系）",
+                                "改用 310.1 版（支持 RTX 20 系）",
                                 !self.busy,
                             )
-                            .on_hover_text("下载上游归档的 0.2.4 native 版，约 16 MB；随时可以切回来")
+                            .on_hover_text("下载上游仓库里的 310.1 版程序本体，约 18 MB；随时可以切回最新版")
                             .clicked()
                             {
-                                self.set_legacy_native(true);
+                                self.set_legacy_3101(true);
                             }
                         }
                     }

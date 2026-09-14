@@ -131,11 +131,11 @@ pub struct AppConfig {
     /// 用户选定的下载源前缀。留空 = 自动（按实测速率挑最快的那个）。
     #[serde(default)]
     pub backup_prefix: String,
-    /// 是否使用老版 native 包（archive/0.2.4/）。
-    /// 上游 0.3.0 改回代理模式后只面向 RTX 30 系，RTX 20 / GTX 16 系（SM75）用户
-    /// 可以切到这里，换回仍然支持他们的 native 版。默认关。
+    /// 是否改用 310.1 版程序本体（310.1/）。
+    /// 上游最新版是 310.9 后端、没打包 SM75 内核，只面向 RTX 30 系；
+    /// RTX 20 / GTX 16 系（SM75）切到这里，换用带 SM75 内核的 310.1 版。默认关。
     #[serde(default)]
-    pub legacy_native: bool,
+    pub legacy_3101: bool,
 }
 
 impl Default for AppConfig {
@@ -144,7 +144,7 @@ impl Default for AppConfig {
             asset_dir: None,
             allow_backup_source: false,
             backup_prefix: String::new(),
-            legacy_native: false,
+            legacy_3101: false,
         }
     }
 }

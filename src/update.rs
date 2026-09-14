@@ -32,10 +32,15 @@ pub const REPO: &str = "sdli1995/dlssg_for_sm86";
 pub const BRANCH: &str = "main";
 pub const INI_REPO_PATH: &str = "dlssg_sm86.ini";
 
-/// 老版 native 包在仓库里的位置。
-/// 上游 0.3.0 把模式从 native 改回代理，native 版被挪到 archive/0.2.4/；
-/// 新版只面向 RTX 30 系（SM86），RTX 20 / GTX 16 系仍然要用 native 版。
-pub const LEGACY_PREFIX: &str = "archive/0.2.4/";
+/// 面向 RTX 20 / GTX 16 系（SM75）的那一版在仓库里的位置。
+///
+/// 上游 0.3.0 的根目录是 310.9 后端，DLL 里明写「The 310.9 backend has no SM75
+/// kernel family」—— 也就是新版根本没打包 SM75 内核，20 系跑不起来。
+/// 同一个仓库里 310.1/ 那一份用的是 310.1 后端，二进制里有 dlssg-310.1-d3d12-sm86+sm75
+/// 和 sm75_route_limits / sm75_slots 这些字样，即带 SM75 内核的代理版。
+/// INI 仍然用根目录那份：出厂 INI 自己写了「MaxGeneratedFrames 会被钳到内嵌运行库
+/// 支持的上限：310.9 是 6X、310.1 是 4X」，所以这份 INI 配 310.1 是作者预期内的用法。
+pub const LEGACY_PREFIX: &str = "310.1/";
 
 /// 代理入口 -> 仓库里的路径。
 ///
@@ -43,15 +48,16 @@ pub const LEGACY_PREFIX: &str = "archive/0.2.4/";
 /// （体积都不一样），所以必须下载对应那一个，不能拿 version.dll 重命名。
 ///
 /// 上游 0.3.0 把它们放在 alternatives/，去掉了 winhttp、新增 dbghelp 与 d3d12；
-/// 老版 native 包放在 archive/0.2.4/altnative/。
+/// 310.1/ 那一份的目录结构完全相同，只是程序本体换成了带 SM75 内核的版本。
 pub fn proxy_repo_path(proxy: &str, legacy: bool) -> &'static str {
     if legacy {
         return match proxy {
-            "winmm.dll" => "archive/0.2.4/altnative/winmm.dll",
-            "dinput8.dll" => "archive/0.2.4/altnative/dinput8.dll",
-            "winhttp.dll" => "archive/0.2.4/altnative/winhttp.dll",
-            "dxgi.dll" => "archive/0.2.4/altnative/dxgi.dll",
-            _ => "archive/0.2.4/version.dll",
+            "winmm.dll" => "310.1/alternatives/winmm.dll",
+            "dbghelp.dll" => "310.1/alternatives/dbghelp.dll",
+            "dinput8.dll" => "310.1/alternatives/dinput8.dll",
+            "dxgi.dll" => "310.1/alternatives/dxgi.dll",
+            "d3d12.dll" => "310.1/alternatives/d3d12.dll",
+            _ => "310.1/version.dll",
         };
     }
     match proxy {
@@ -64,13 +70,11 @@ pub fn proxy_repo_path(proxy: &str, legacy: bool) -> &'static str {
     }
 }
 
-/// INI 在仓库里的路径（老版 native 包的在 archive/0.2.4/ 下）。
-pub fn ini_repo_path(legacy: bool) -> &'static str {
-    if legacy {
-        "archive/0.2.4/dlssg_sm86.ini"
-    } else {
-        INI_REPO_PATH
-    }
+/// 要用的 INI 在仓库里的路径。
+/// 两个模式用的是同一份：310.1/ 目录里没有自带 INI，而根目录那份出厂 INI
+/// 本来就会按内嵌运行库的能力自己钳制倍率上限。
+pub fn ini_repo_path(_legacy: bool) -> &'static str {
+    INI_REPO_PATH
 }
 
 pub fn local_name(repo_path: &str) -> String {
@@ -800,7 +804,7 @@ pub struct IniPlan {
 }
 
 /// 按显卡路由准备要部署的 INI。
-/// RTX 30 系保持上游默认；RTX 20 / GTX 16 系要把 Router 改成 SM75（老版 native 包里才有这一项）。
+/// RTX 30 系保持上游默认；RTX 20 / GTX 16 系要把 Router 改成 SM75（只有带 Router 项的老 INI 才需要改）。
 /// 改写后写到单独的文件，上游原文件保持不动（用于比对哈希）。
 pub fn prepare_deploy_ini(route: GpuRoute, gpu_name: Option<&str>) -> Result<IniPlan> {
     let upstream = util::assets_dir()?.join(INI_REPO_PATH);
@@ -830,7 +834,7 @@ pub fn prepare_deploy_ini(route: GpuRoute, gpu_name: Option<&str>) -> Result<Ini
                 changes.push(format!(
                     "这份 INI 里没有 Router 项（上游 0.3.0 精简掉了），本次原样部署。\
                      你的显卡是 {}：新版上游只面向 RTX 30 系，帧生成可能不生效，\
-                     可以改用老版 native 包（仍支持 SM75）。",
+                     可以改用 310.1 版（带 SM75 内核）。",
                     gpu_name.unwrap_or("RTX 20 / GTX 16 系")
                 ));
                 text
