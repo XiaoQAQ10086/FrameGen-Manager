@@ -198,24 +198,64 @@ pub const RELEASES_URL: &str = "https://github.com/XiaoQAQ10086/FrameGen-Manager
 ///
 /// 前提：发布流程是「改版本号 -> 提交 -> 打标签 -> 发 Release」一条龙，
 /// 所以 main 上的版本号等于最新已发布版本。改流程的话这里要跟着改。
+///
+/// **为什么不只信第一个成功的源**：raw.githubusercontent.com 前面有 CDN 缓存，
+/// 仓库里刚改完 Cargo.toml 的那几分钟，缓存还在吐旧内容。实测发 0.4.0 时官方 raw
+/// 有约 3 分钟仍然说 0.3.0 —— 而官方恰好是优先源，一旦它「成功」返回就直接采信了，
+/// 于是还停在 0.3.0 的用户被告知「已是最新」，根本看不到更新提示。各家的缓存时机
+/// 不一样，所以这里改成**所有源都问、取最大的版本号**。
 pub fn fetch_latest_self_version(client: &reqwest::blocking::Client) -> Option<String> {
     let official = format!("https://raw.githubusercontent.com/{SELF_REPO}/main/Cargo.toml");
-    let ms = mirrors("");
-    let text = try_sources(&official, &ms, false, None, |url, _src| {
-        let resp = client
-            .get(url)
-            .timeout(Duration::from_secs(8))
-            .send()
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-        if !resp.status().is_success() {
-            bail!("HTTP {}", resp.status().as_u16());
-        }
-        resp.text().map_err(|e| anyhow::anyhow!("{e}"))
-    })
-    .ok()?;
+    let mut urls = vec![official.clone()];
+    for m in mirrors("") {
+        urls.push(format!("{m}{official}"));
+    }
 
-    // 只要 [package] 段里的 version。依赖那行的键名不是单独的 version
-    // （形如 eframe = { version = ... }），所以按「键名等于 version」匹配够准。
+    // 所有源**并发**问，取报出来的最大版本号。
+    // 并发是为了让总耗时约等于最慢的那一个请求，而不是几个请求相加。
+    let (tx, rx) = std::sync::mpsc::channel();
+    for url in urls {
+        let c = client.clone();
+        let tx = tx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(fetch_self_version_one(&c, &url));
+        });
+    }
+    // 把主线程手里这个发送端丢掉，rx.iter() 才会在那些线程都结束后收完
+    drop(tx);
+
+    pick_latest(rx.iter().flatten())
+}
+
+/// 从一组候选里挑出**最大**的版本号。解析不出来的直接忽略 ——
+/// 宁可什么都不提示，也不能因为一个乱七八糟的字符串就误报有新版本。
+pub fn pick_latest(versions: impl IntoIterator<Item = String>) -> Option<String> {
+    let mut best: Option<String> = None;
+    for v in versions {
+        if parse_version(&v).is_none() {
+            continue;
+        }
+        if best.as_ref().map(|b| is_newer(&v, b)).unwrap_or(true) {
+            best = Some(v);
+        }
+    }
+    best
+}
+
+/// 问一个源，拿它报的版本号。失败返回 None。
+fn fetch_self_version_one(client: &reqwest::blocking::Client, url: &str) -> Option<String> {
+    let resp = client.get(url).timeout(Duration::from_secs(8)).send().ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    parse_cargo_version(&resp.text().ok()?)
+}
+
+/// 从 Cargo.toml 文本里取 version 字段。
+///
+/// 只要单独的 version 键。依赖那行的键名不是单独的 version
+/// （形如 `eframe = { version = ... }`），所以按「键名等于 version」匹配够准。
+pub fn parse_cargo_version(text: &str) -> Option<String> {
     for line in text.lines() {
         let t = line.trim();
         let Some((k, v)) = t.split_once('=') else {
@@ -457,7 +497,7 @@ pub fn download_auto(
                     client, repo_path, dest, expect_etag, cancel, &official, &ms, prefer_mirror, 0,
                     verify, &too_slow, progress,
                 )
-                .map_err(|e2| anyhow::anyhow!("{e2}（不限速重试也没成功；先前：{e}）"))
+                .map_err(|e2| anyhow::anyhow!("{e2}（放宽速度要求后重试仍失败；先前：{e}）"))
             } else {
                 Err(e)
             }
@@ -890,7 +930,7 @@ pub fn source_label(prefix: &str) -> String {
 // ------------------------------------------------------------------ 看门狗
 
 /// 换源文案。上层靠这个前缀区分「这个源太慢」和「这个源坏了」，
-/// 因为「所有源都太慢」时要退回不限速再试一遍，不能让用户下不了。
+/// 因为「所有源都太慢」时要放宽速度要求再试一遍，不能让用户下不了。
 pub const TOO_SLOW_PREFIX: &str = "这个源太慢";
 
 /// 只对大文件开看门狗。581 字节的 ini 秒下完，判速没意义。
@@ -1125,10 +1165,10 @@ fn download_with_mirror(
     match run(min_kbps, &too_slow, progress) {
         Ok(v) => Ok(v),
         Err(e) => {
-            // 同 download_auto：全部太慢就退回不限速再走一遍
+            // 同 download_auto：所有源都太慢时就放宽速度要求再走一遍
             if min_kbps > 0 && too_slow.load(Ordering::Relaxed) {
                 run(0, &too_slow, progress)
-                    .map_err(|e2| anyhow::anyhow!("{e2}（不限速重试也没成功；先前：{e}）"))
+                    .map_err(|e2| anyhow::anyhow!("{e2}（放宽速度要求后重试仍失败；先前：{e}）"))
             } else {
                 Err(e)
             }

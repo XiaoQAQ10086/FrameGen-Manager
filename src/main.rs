@@ -456,6 +456,24 @@ fn selfupdatetest() {
         );
     }
 
+    println!("  多源取最大（绕开 CDN 缓存）：");
+    let pick_cases: [(&[&str], Option<&str>, &str); 4] = [
+        (&["0.3.0", "0.4.0", "0.2.0"], Some("0.4.0"), "取最大的那个"),
+        (&["0.4.0", "0.3.0"], Some("0.4.0"), "顺序不影响"),
+        (&["abc", "0.3.0"], Some("0.3.0"), "解析不出来的忽略掉"),
+        (&[], None, "一个都没有 -> 没有新版本"),
+    ];
+    for (list, want, label) in pick_cases {
+        let got = update::pick_latest(list.iter().map(|s| (*s).to_owned()));
+        let ok = got.as_deref() == want;
+        println!(
+            "    [{}] {label}（{:?} -> {:?}）",
+            if ok { "PASS" } else { "FAIL" },
+            list,
+            got
+        );
+    }
+
     println!("  实际查询：");
     match update::client().ok().and_then(|c| update::fetch_latest_self_version(&c)) {
         Some(v) => {
@@ -552,7 +570,7 @@ fn speedtest() {
 }
 
 /// 本地起一个 HTTP 服务，按 chunk/delay 的节奏往外吐 bytes 字节。
-/// 用来把「看门狗」和「不限速兜底」真跑一遍 —— 不依赖外网，结果可重复。
+/// 用来把「看门狗」和「放宽速度要求后的兜底重试」真跑一遍 —— 不依赖外网，结果可重复。
 fn spawn_http_server(bytes: u64, chunk: u64, delay_ms: u64) -> (u16, Arc<AtomicBool>) {
     use std::io::{Read as _, Write as _};
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("绑定本地端口失败");
@@ -709,7 +727,7 @@ fn sourcetest() {
     let _ = std::fs::remove_file(&d3);
     let u3 = format!("http://127.0.0.1:{big_port}/big");
     let r3 = update::download(&c, "big-test", &d3, &u3, None, &cancel, "本地快源", 0, &mut |_, _, _| {});
-    println!("-- min_kbps=0（不限速）--");
+    println!("-- min_kbps=0（不按速度挑源）--");
     ck(&mut fails, r3.is_ok(), "4 MB 的文件不被拦");
     ck(
         &mut fails,
@@ -717,8 +735,8 @@ fn sourcetest() {
         "大文件字节数正确",
     );
 
-    // 兜底两遍：第一遍太慢被标，第二遍不限速拿到
-    println!("-- 全部太慢 -> 不限速重试（download_auto 的兜底路径）--");
+    // 兜底两遍：第一遍太慢被标，第二遍不按速度挑源就拿到了
+    println!("-- 全部太慢 -> 放宽速度要求重试（download_auto 的兜底路径）--");
     let too_slow = AtomicBool::new(false);
     let (s2_port, s2_stop) = spawn_http_server(8 * 1024 * 1024, 32 * 1024, 200);
     let d4 = tmp.join("fgm-fallback-test.bin");
@@ -739,7 +757,7 @@ fn sourcetest() {
         &c, "fallback-test", &d4, None, &cancel, &ou, &[], true, 0, &|_| Ok(()), &too_slow,
         &mut |_, _, _| {},
     );
-    ck(&mut fails, p2.is_ok(), "第二遍：不限速重试拿到了文件");
+    ck(&mut fails, p2.is_ok(), "第二遍：放宽速度要求后拿到了文件");
 
     for s in [&slow_stop, &small_stop, &big_stop, &s2_stop, &ok_stop] {
         s.store(true, Ordering::Relaxed);
