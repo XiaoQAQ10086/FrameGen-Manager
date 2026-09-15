@@ -11,20 +11,14 @@ use std::path::{Path, PathBuf};
 
 use crate::util;
 
-/// 两个版本里出现过的所有代理入口名，同一时刻只应存在一个。
-/// 现用清单是 alternatives/ 下的 6 个（根目录和 310.1/ 同一套目录结构）；
-/// archive/0.2.4/altnative/ 里那份更老的归档包还用过 winhttp.dll。
-/// 这里取并集：判断「这个文件算不算代理入口」时两边的名字都得认，
-/// 否则用户从老版切到新版后，目录里残留的 winhttp.dll 会被当成第三方文件而拒绝处理。
-pub const PROXY_ENTRIES: [&str; 7] = [
-    "version.dll",
-    "winmm.dll",
-    "dbghelp.dll",
-    "dinput8.dll",
-    "dxgi.dll",
-    "d3d12.dll",
-    "winhttp.dll",
-];
+// 代理入口名单**只在 scan.rs 里硬编码一份**：`scan::PROXY_ALL` = 现用的 6 个
+// （alternatives/ 那一套）+ 老归档包才有的 winhttp.dll。这里换成部署侧习惯的名字引用它，
+// 免得两处各写一遍、以后上游改名时漏改一处。
+//
+// 为什么两个版本的名字都要认：用户从老版切到新版后，目录里残留的 winhttp.dll
+// 会被当成第三方文件而拒绝处理（同一时刻只应存在一个代理入口）。
+use crate::scan::PROXY_ALL as PROXY_ENTRIES;
+
 pub const INI_NAME: &str = "dlssg_sm86.ini";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -214,7 +208,7 @@ pub fn deploy(
     extra_proxies: &[String],
 ) -> Result<String> {
     if !target_dir.is_dir() {
-        bail!("目标目录不存在: {}", target_dir.display());
+        bail!("游戏目录不存在: {}", target_dir.display());
     }
     if !PROXY_ENTRIES.contains(&proxy) {
         bail!("不支持的代理入口: {}", proxy);

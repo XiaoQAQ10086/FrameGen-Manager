@@ -395,12 +395,14 @@ fn main() -> eframe::Result<()> {
         match update::download(
             &c,
             path,
-            &dest,
+            update::Sink {
+                dest: &dest,
+                cancel: &cancel,
+                progress: &mut |_, _, _| {},
+            },
             &url,
             Some(&remote.etag),
-            &cancel,
             update::DEFAULT_BACKUP_PREFIX,
-            &mut |_, _, _| {},
         ) {
             Ok(dl) => {
                 // 通过标准是「长度对得上」。有些镜像（比如现在的 gh-proxy.com）
@@ -711,9 +713,17 @@ fn speedtest() {
     let r = update::download_auto(
         &c,
         repo_path,
-        &dest,
+        update::Sink {
+            dest: &dest,
+            cancel: &cancel,
+            progress: &mut |got, _, _src| {
+                if got.saturating_sub(last) >= 4 * 1024 * 1024 {
+                    last = got;
+                    println!("      ... {} MB", got / (1024 * 1024));
+                }
+            },
+        },
         Some(&remote.etag),
-        &cancel,
         "",
         true,
         // 和界面里一样：代理 DLL 必须带本项目签名
@@ -723,12 +733,6 @@ fn speedtest() {
                 Ok(())
             } else {
                 Err(anyhow::anyhow!("签名校验失败，判定为「{}」", id.label()))
-            }
-        },
-        &mut |got, _, _src| {
-            if got.saturating_sub(last) >= 4 * 1024 * 1024 {
-                last = got;
-                println!("      ... {} MB", got / (1024 * 1024));
             }
         },
     );
@@ -835,6 +839,28 @@ fn ck(fails: &mut Vec<String>, ok: bool, what: &str) {
     }
 }
 
+/// **部署前的显卡闸门**：返回 Some(理由) = 禁止部署，None = 放行。
+///
+/// 抽成独立的纯函数是为了自测能直接断言 —— 「哪张卡能装、哪张不能」是用户最容易
+/// 被坑的一条规则（装了半天不生效）。do_deploy 直接用这里的文案定状态，
+/// 界面卡片另外写更短的一句（只说结论和颜色）。
+fn gpu_gate(route: scan::GpuRoute) -> Option<&'static str> {
+    match route {
+        scan::GpuRoute::Unsupported => {
+            Some("检测到非 NVIDIA 显卡，本 Mod 完全不适用（需要 NVIDIA 驱动接口）")
+        }
+        scan::GpuRoute::NotNeeded => {
+            Some("RTX 40/50 系原生支持 DLSS 帧生成，不需要装本 Mod")
+        }
+        // GTX 16 系和 RTX 20 系同为 Turing，但没有 Tensor Core ——
+        // DLSS 帧生成在硬件上就跑不了，换 310.1 版也没用，所以不是「提醒」而是禁止。
+        scan::GpuRoute::Gtx16 => {
+            Some("GTX 16 系没有 Tensor Core，DLSS 帧生成在硬件上就不支持（换成 310.1 版也没用）")
+        }
+        _ => None,
+    }
+}
+
 /// 选源 / 下载自测。
 fn sourcetest() {
     println!("===== 选源 + 下载 自测 =====");
@@ -885,12 +911,20 @@ fn sourcetest() {
     // 顺手记下进度回调里报给界面的那几段文字 —— 用户能不能看懂就靠它
     let mut notes: Vec<String> = Vec::new();
     let r1 = update::download(
-        &c, "slow-source-test", &d1, &u1, None, &cancel, "本地慢源",
-        &mut |_, _, note| {
-            if notes.last().map(|n| n != note).unwrap_or(true) {
-                notes.push(note.to_owned());
-            }
+        &c,
+        "slow-source-test",
+        update::Sink {
+            dest: &d1,
+            cancel: &cancel,
+            progress: &mut |_, _, note| {
+                if notes.last().map(|n| n != note).unwrap_or(true) {
+                    notes.push(note.to_owned());
+                }
+            },
         },
+        &u1,
+        None,
+        "本地慢源",
     );
     let el = t0.elapsed().as_secs_f64();
     let msg1 = match &r1 {
@@ -919,7 +953,18 @@ fn sourcetest() {
     let d2 = tmp.join("fgm-small-test.bin");
     let _ = std::fs::remove_file(&d2);
     let u2 = format!("http://127.0.0.1:{small_port}/small");
-    let r2 = update::download(&c, "small-test", &d2, &u2, None, &cancel, "本地小源", &mut |_, _, _| {});
+    let r2 = update::download(
+        &c,
+        "small-test",
+        update::Sink {
+            dest: &d2,
+            cancel: &cancel,
+            progress: &mut |_, _, _| {},
+        },
+        &u2,
+        None,
+        "本地小源",
+    );
     println!("-- 小文件 --");
     ck(&mut fails, r2.is_ok(), "512 KB 的文件正常下完");
     ck(
@@ -1053,7 +1098,9 @@ fn selftest() {
         hardware_id: "PCI-VEN-10DE".to_owned(),
         device_desc: None,
     };
-    let cases: [(&str, Vec<gpu::GpuAdapter>, Option<&str>, Option<&str>); 4] = [
+    // 自测用例表：(说明, 注册表枚举到的适配器, nvidia-smi 报的名字, 期望挑中的名字)
+    type GpuCase<'a> = (&'a str, Vec<gpu::GpuAdapter>, Option<&'a str>, Option<&'a str>);
+    let cases: [GpuCase<'_>; 4] = [
         (
             "能识别的 RTX 排在认不出来的 GT 1030 前面",
             vec![
@@ -1130,7 +1177,7 @@ fn selftest() {
             println!(
                 "  资产版本: {}",
                 if legacy {
-                    "310.1 版（给 RTX 20 / GTX 16 系）"
+                    "310.1 版（给 RTX 20 系）"
                 } else {
                     "最新版（上游 310.9 代理包）"
                 }
@@ -1200,7 +1247,7 @@ fn selftest() {
             .unwrap_or_else(|| g.install_dir.clone());
         let a = scan::advise_proxy(&target);
         println!(
-            "  [{}]\n       目标目录 = {}",
+            "  [{}]\n       游戏目录 = {}",
             g.name,
             target.display()
         );
@@ -1228,6 +1275,57 @@ fn selftest() {
 
     // 上游 0.3.0 换过文件名、路径和 README 写法，下面这两组断言就是防它再改一次
     let mut fails: Vec<String> = Vec::new();
+
+    println!("\n--- 显卡路由（哪张卡走哪条路）---");
+    for (name, want) in [
+        ("NVIDIA GeForce RTX 3050", scan::GpuRoute::Sm86),
+        ("NVIDIA GeForce RTX 3070 Ti", scan::GpuRoute::Sm86),
+        ("NVIDIA GeForce RTX 2080 SUPER", scan::GpuRoute::Sm75),
+        ("NVIDIA GeForce RTX 2060", scan::GpuRoute::Sm75),
+        ("NVIDIA GeForce GTX 1660 SUPER", scan::GpuRoute::Gtx16),
+        ("NVIDIA GeForce GTX 1650", scan::GpuRoute::Gtx16),
+        ("NVIDIA GeForce GTX 1630", scan::GpuRoute::Gtx16),
+        ("NVIDIA GeForce RTX 4070", scan::GpuRoute::NotNeeded),
+        ("AMD Radeon RX 6800 XT", scan::GpuRoute::Unsupported),
+        ("NVIDIA GeForce GT 1030", scan::GpuRoute::Unknown),
+    ] {
+        ck(
+            &mut fails,
+            scan::classify_gpu(name) == want,
+            &format!("{name} → {}", want.label()),
+        );
+    }
+    // GTX 16 系必须被挡在部署外面，而且绝不能和 RTX 20 系混成一条路 ——
+    // 混了的话界面会给出「改用 310.1 版」这个根本无效的建议。
+    ck(
+        &mut fails,
+        scan::classify_gpu("NVIDIA GeForce GTX 1660 Ti") == scan::GpuRoute::Gtx16,
+        "GTX 16 系单独成一路（不会被当成 RTX 20 系）",
+    );
+
+    println!("\n--- 部署闸门（哪张卡被拦住、哪张能装）---");
+    for route in [
+        scan::GpuRoute::Sm86,
+        scan::GpuRoute::Sm75,
+        scan::GpuRoute::Unknown,
+    ] {
+        ck(
+            &mut fails,
+            gpu_gate(route).is_none(),
+            &format!("{}：放行（不拦）", route.label()),
+        );
+    }
+    for (route, must_contain) in [
+        (scan::GpuRoute::Gtx16, "Tensor Core"),
+        (scan::GpuRoute::NotNeeded, "40/50"),
+        (scan::GpuRoute::Unsupported, "非 NVIDIA"),
+    ] {
+        ck(
+            &mut fails,
+            gpu_gate(route).map(|w| w.contains(must_contain)).unwrap_or(false),
+            &format!("{}：禁止部署", route.label()),
+        );
+    }
 
     println!("\n--- 上游版本号解析（新旧两种写法都要认）---");
     let cases: [(&str, Option<&str>); 4] = [
@@ -1754,13 +1852,15 @@ fn canceltest() {
     let r = update::download_auto(
         &c,
         update::INI_REPO_PATH,
-        &dest,
+        update::Sink {
+            dest: &dest,
+            cancel: &cancel,
+            progress: &mut |_, _, _| {},
+        },
         Some(&remote.etag),
-        &cancel,
         "",
         false,
         &|_p| Ok(()),
-        &mut |_, _, _| {},
     );
 
     let msg = match &r {
@@ -1826,17 +1926,19 @@ fn downloadtest() {
     match update::download_auto(
         &c,
         repo_path,
-        &dest,
+        update::Sink {
+            dest: &dest,
+            cancel: &cancel,
+            progress: &mut |got, total, _src| {
+                if total > 0 && got >= total {
+                    println!("  已下载 {got} / {total} 字节");
+                }
+            },
+        },
         Some(&remote.etag),
-        &cancel,
         "",
         false,
         &|_p| Ok(()),
-        &mut |got, total, _src| {
-            if total > 0 && got >= total {
-                println!("  已下载 {got} / {total} 字节");
-            }
-        },
     ) {
         Ok(dl) => {
             let data = std::fs::read(&dest).unwrap_or_default();
@@ -2163,7 +2265,7 @@ fn deploytest() {
 
     // ---- 已装过本项目：允许覆盖（这是「判断用户是否手动装过」的核心行为）----
     println!("
--- 目标目录已有本项目文件 --");
+-- 游戏目录已有本项目文件 --");
     let ours_src: Option<PathBuf> = [
         r"D:\Epic Game\HogwartsLegacy\Phoenix\Binaries\Win64\version.dll",
         r"E:\SteamLibrary\steamapps\common\PUBG\TslGame\Binaries\Win64\version.dll",
@@ -2351,7 +2453,7 @@ struct GameRow {
     manual: bool,
 }
 
-/// 选中游戏后「飞向目标目录」的那张小卡片。
+/// 选中游戏后「飞向游戏目录」的那张小卡片。
 ///
 /// 只在动画的这 0.45 秒里请求重绘，动画结束就停止 —— 不做常驻动画。
 struct FlyAnim {
@@ -2501,7 +2603,7 @@ struct App {
 
     /// 正在飞的选中动画
     fly: Option<FlyAnim>,
-    /// 「目标目录」卡片这一帧的矩形（动画要飞过去）
+    /// 「游戏目录」卡片这一帧的矩形（动画要飞过去）
     target_card_rect: Option<egui::Rect>,
     /// 目标卡片高亮到什么时候（飞行动画落地后闪一下）
     flash_until: Option<std::time::Instant>,
@@ -2541,7 +2643,7 @@ struct App {
     spoof_pending: Option<gpu::Op>,
     /// 驱动过旧时点「部署」需要再确认一次
     confirm_old_driver: bool,
-    /// 目标目录里有「本项目的另一个代理入口」时，先弹窗问一句。
+    /// 游戏目录里有「本项目的另一个代理入口」时，先弹窗问一句。
     /// Some 里是要问用户是否移除的那些文件名。
     asked_extra_proxies: Option<Vec<String>>,
 
@@ -2568,7 +2670,7 @@ struct App {
     cancel: Option<Arc<AtomicBool>>,
     use_backup: bool,
     backup_prefix: String,
-    /// 是否使用 310.1 版程序本体（310.1/）—— RTX 20 / GTX 16 系（SM75）用得上
+    /// 是否使用 310.1 版程序本体（310.1/）—— RTX 20 系（SM75）用得上
     legacy_3101: bool,
     download_failed: bool,
     /// 测速结果，界面按它列候选源
@@ -2858,7 +2960,7 @@ impl App {
         self.persist_library();
     }
 
-    /// 让被选中的那张卡片飞向「目标目录」卡片。
+    /// 让被选中的那张卡片飞向「游戏目录」卡片。
     /// 目标卡片这一帧已经画过了（右侧面板先于中央列表绘制），所以矩形是新鲜的。
     fn start_fly(&mut self, from: egui::Rect, label: String, color: egui::Color32) {
         let Some(to) = self.target_card_rect else {
@@ -3034,7 +3136,7 @@ impl App {
         s.push_str(&format!(
             "资产版本: {}\n",
             if self.legacy_3101 {
-                "310.1 版（给 RTX 20 / GTX 16 系，带 SM75 内核）"
+                "310.1 版（给 RTX 20 系，带 SM75 内核）"
             } else {
                 "最新版（上游 310.9 代理包）"
             }
@@ -3346,7 +3448,7 @@ impl App {
         self.redetect();
         self.status = if on {
             format!(
-                "已切到 {}（给 RTX 20 / GTX 16 系）。点「下载 / 更新资产」重新下载（约 18 MB）。",
+                "已切到 {}（给 RTX 20 系）。点「下载 / 更新资产」重新下载（约 18 MB）。",
                 update::LEGACY_PREFIX
             )
         } else {
@@ -3719,33 +3821,35 @@ impl App {
                     let dl = update::download_auto(
                         &c,
                         &it.path,
-                        &it.dest,
+                        update::Sink {
+                            dest: &it.dest,
+                            cancel: &cancel,
+                            progress: &mut move |got, len, src| {
+                                let denom = if len > 0 { len } else { expect };
+                                // 进度按「总字节」算，不是当前这个文件的百分比 ——
+                                // 否则每换一个文件进度条就回零。
+                                let f = if total > 0 {
+                                    ((base + got) as f64 / total as f64).min(1.0) as f32
+                                } else {
+                                    0.0
+                                };
+                                let _ = tx2.send(Msg::Progress(
+                                    format!(
+                                        "{step_text} 下载 {label} {} / {} · {}",
+                                        util::format_bytes(got),
+                                        util::format_bytes(denom),
+                                        src
+                                    ),
+                                    f,
+                                    total,
+                                ));
+                                ctx2.request_repaint();
+                            },
+                        },
                         Some(&it.etag),
-                        &cancel,
                         &prefix,
                         is_dll,
                         &verifier,
-                        &mut move |got, len, src| {
-                            let denom = if len > 0 { len } else { expect };
-                            // 进度按「总字节」算，不是当前这个文件的百分比 ——
-                            // 否则每换一个文件进度条就回零。
-                            let f = if total > 0 {
-                                ((base + got) as f64 / total as f64).min(1.0) as f32
-                            } else {
-                                0.0
-                            };
-                            let _ = tx2.send(Msg::Progress(
-                                format!(
-                                    "{step_text} 下载 {label} {} / {} · {}",
-                                    util::format_bytes(got),
-                                    util::format_bytes(denom),
-                                    src
-                                ),
-                                f,
-                                total,
-                            ));
-                            ctx2.request_repaint();
-                        },
                     )?;
 
                     done += dl.bytes;
@@ -3891,20 +3995,15 @@ impl App {
             return;
         };
 
-        // 显卡闸门
-        match self.gpu_route {
-            scan::GpuRoute::Unsupported => {
-                self.status =
-                    "已阻止部署：检测到非 NVIDIA 显卡，本 Mod 完全不适用（需要 NVIDIA 驱动接口）"
-                        .to_owned();
-                return;
-            }
-            scan::GpuRoute::NotNeeded => {
-                self.status =
-                    "已阻止部署：RTX 40/50 系原生支持 DLSS 帧生成，不需要装本 Mod".to_owned();
-                return;
-            }
-            _ => {}
+        // 显卡闸门（规则与文案见 gpu_gate，自测里有断言）
+        if let Some(why) = gpu_gate(self.gpu_route) {
+            self.status = format!("已阻止部署：{why}");
+            log::line(&format!(
+                "已阻止部署：{why}（路由 {}，显卡 {:?}）",
+                self.gpu_route.label(),
+                self.gpu_name
+            ));
+            return;
         }
 
         // 反作弊闸门：检出内核级时**先弹窗问一句**，而不是直接拦死。
@@ -4213,9 +4312,9 @@ impl eframe::App for App {
                 ui.add_space(10.0);
                 ui.spacing_mut().item_spacing = egui::vec2(8.0, 10.0);
 
-                // --- 目标目录
+                // --- 游戏目录
                 let (_, target_rect) = theme::card_rect(ui, |ui| {
-                    theme::card_title(ui, "目标目录");
+                    theme::card_title(ui, "游戏目录");
                     let path = self.game_dir.clone();
                     ui.label(match &path {
                         Some(p) => theme::path_text(p.display().to_string()),
@@ -4283,6 +4382,7 @@ impl eframe::App for App {
                             let (txt, col) = match self.gpu_route {
                                 scan::GpuRoute::Sm86 => ("SM86 路由", theme::OK),
                                 scan::GpuRoute::Sm75 => ("需改 SM75", theme::WARN),
+                                scan::GpuRoute::Gtx16 => ("不支持", theme::DANGER),
                                 scan::GpuRoute::NotNeeded => ("不需要本 Mod", theme::WARN),
                                 scan::GpuRoute::Unsupported => ("不适用", theme::DANGER),
                                 scan::GpuRoute::Unknown => ("未识别", theme::NEUTRAL),
@@ -4812,17 +4912,26 @@ impl eframe::App for App {
                                     .color(theme::WARN),
                             );
                         }
+                        scan::GpuRoute::Gtx16 => {
+                            ui.label(
+                                egui::RichText::new(
+                                    "GTX 16 系（1650 / 1660 / 1630）没有 Tensor Core，DLSS 帧生成在硬件上就不支持，已禁止部署。",
+                                )
+                                .size(12.0)
+                                .color(theme::DANGER),
+                            );
+                        }
                         _ => {}
                     }
 
-                    // RTX 20 / GTX 16 系（SM75）：上游 0.3.0 改回代理模式后只面向 RTX 30 系，
+                    // RTX 20 系（SM75）：上游 0.3.0 改回代理模式后只面向 RTX 30 系，
                     // 给这类用户一个切到 310.1 版的开关 —— 上游新版（310.9）没打包 SM75 内核。
                     if self.gpu_route == scan::GpuRoute::Sm75 {
                         ui.add_space(2.0);
                         if self.legacy_3101 {
                             theme::badge(ui, "正在用 310.1 版", theme::WARN);
                             ui.label(theme::hint(
-                                "310.1 版是代理模式里仍然带 SM75 内核的那一份，给 RTX 20 / GTX 16 系用；倍率上限是 4X（新版 310.9 是 6X）。",
+                                "310.1 版是代理模式里仍然带 SM75 内核的那一份，给 RTX 20 系用；倍率上限是 4X（新版 310.9 是 6X）。",
                             ));
                             if theme::ghost_button(ui, "改回最新版（上游代理包）", !self.busy).clicked()
                             {
@@ -4831,7 +4940,7 @@ impl eframe::App for App {
                         } else {
                             ui.label(
                                 egui::RichText::new(
-                                    "你的显卡是 RTX 20 / GTX 16 系（Turing / SM75）。上游 0.3.0 改回代理模式后只面向 RTX 30 系，装了很可能不生效。",
+                                    "你的显卡是 RTX 20 系（Turing / SM75）。上游 0.3.0 改回代理模式后只面向 RTX 30 系，装了很可能不生效。",
                                 )
                                 .size(11.5)
                                 .color(theme::WARN),
@@ -4964,7 +5073,7 @@ impl eframe::App for App {
                     }
                 });
 
-                // --- 显卡名称伪装（高级 · 谨慎）
+                // --- 显卡名称伪装（谨慎）
                 theme::card(ui, |ui| {
                     ui.horizontal(|ui| {
                         let (rect, _) =
@@ -4972,7 +5081,7 @@ impl eframe::App for App {
                         ui.painter()
                             .rect_filled(rect, egui::CornerRadius::same(1), theme::WARN);
                         ui.label(
-                            egui::RichText::new("显卡名称伪装（高级 · 谨慎）")
+                            egui::RichText::new("显卡名称伪装（谨慎）")
                                 .size(14.0)
                                 .color(theme::TEXT)
                                 .strong(),
@@ -5177,8 +5286,7 @@ impl eframe::App for App {
                         }
                     });
                     ui.label(theme::hint(format!(
-                        "日志：{}　目录里只留两个文件：framegen.log（本次运行）和 framegen.prev.log（上一次运行）。\
-                         里面有本地路径和用户名，发给别人前先看一眼。",
+                        "日志：{}　目录里只留两个文件：framegen.log（本次运行）和 framegen.prev.log（上一次运行）。",
                         log::path()
                             .map(|p| p.display().to_string())
                             .unwrap_or_else(|| "程序同级的 logs 目录".to_owned())
@@ -5260,7 +5368,7 @@ impl eframe::App for App {
                 return;
             }
 
-            // 选中的那个游戏要飞向「目标目录」卡片，所以把名字和颜色一起记下来。
+            // 选中的那个游戏要飞向「游戏目录」卡片，所以把名字和颜色一起记下来。
             // 起飞矩形要等卡片画完才有（card_rect 的返回值），所以单独存一个。
             let mut pick: Option<(PathBuf, String, egui::Color32)> = None;
             let mut pick_rect: Option<egui::Rect> = None;
@@ -5544,7 +5652,7 @@ impl eframe::App for App {
                 .show(&ctx, |ui| {
                     ui.set_max_width(470.0);
                     ui.label(
-                        egui::RichText::new(format!("目标目录里还有本项目的 {list}。"))
+                        egui::RichText::new(format!("游戏目录里还有本项目的 {list}。"))
                             .size(13.0)
                             .color(theme::WARN)
                             .strong(),
@@ -5781,7 +5889,7 @@ impl eframe::App for App {
             }
         }
 
-        // ---------------- 选中动画：卡片从游戏库飞向「目标目录」
+        // ---------------- 选中动画：卡片从游戏库飞向「游戏目录」
         self.draw_fly_and_flash();
     }
 }

@@ -123,7 +123,7 @@ archive/0.2.4/，仓库根目录现在就是新版。这一版变了五处，每
 * **最新版**（默认）：仓库根目录 + alternatives/，后端是 310.9，面向 RTX 30 系。
 * **310.1 版**：310.1/ + 310.1/alternatives/，后端是 310.1 —— 二进制里带
 dlssg-310.1-d3d12-sm86+sm75、sm75_route_limits、sm75_slots，即**带 SM75 内核**，
-给 RTX 20 / GTX 16 系用。INI 仍然用根目录那份（出厂 INI 自己会按内嵌运行库钳倍率：
+给 RTX 20 系用。INI 仍然用根目录那份（出厂 INI 自己会按内嵌运行库钳倍率：
 310.9 钳到 6X、310.1 钳到 4X）。入口是「部署」卡片里给 SM75 机器显示的按钮，
 状态存在配置的 `legacy_3101`。
 
@@ -131,8 +131,14 @@ dlssg-310.1-d3d12-sm86+sm75、sm75_route_limits、sm75_slots，即**带 SM75 内
 "The 310.9 backend has no SM75 kernel family; use Router=Auto or SM86"，
 310.1 那份没有这句话，而且文件大 1.4 MB（正好多一个内核族）。
 
+**GTX 16 系单独成一条路（`GpuRoute::Gtx16`）并且禁止部署**：1630 / 1650 / 1660 和
+RTX 20 系同为 Turing，但**没有 Tensor Core**，DLSS 帧生成在硬件上就跑不了 ——
+换 310.1 版也没用。所以它**不能**落到 `GpuRoute::Sm75`：那会给出「改用 310.1 版」
+这个根本无效的建议。`scan::classify_gpu()` 里 GTX 16 的判断必须排在 RTX 20 前面。
+
 路径由 `update::proxy_repo_path(proxy, legacy)` 和 `update::ini_repo_path(legacy)` 统一决定，
-入口名单只有一份 `scan::PROXY_PRIORITY`（两个版本的目录结构相同）—— 要改只动这几处，
+入口名单只有一份 `scan::PROXY_ALL`（`PROXY_PRIORITY` / `PROXY_HISTORIC` 是它的两个视图，
+  两个版本的目录结构相同）—— 要改只动这几处，
 别再散落硬编码（0.7.0 那种写死名单的写法正是这次集体 404 的原因）。
 老名字（winhttp.dll）留在 `scan::PROXY_HISTORIC` 里，只用于「这算不算代理入口」的判断。
 
@@ -569,9 +575,16 @@ Win10 用 `ms-settings:display-advancedgraphics`。
 
 ## 数据存放策略
 
-assets / backups / 配置文件都优先放在 **exe 同级**（便携，解压即用，拷走就带走全部状态），
-该目录不可写时才回退 %APPDATA%。可写性判断走 `util::is_writable()` —— 真去写一个探针
-文件，而不是只看只读属性，因为 ACL 挡住的写操作从只读属性上看不出来。
+assets / backups / 配置文件 / **下载记录**（`assets\update_state.json`）都优先放在
+**exe 同级**（便携，解压即用，拷走就带走全部状态），该目录不可写时才回退 %APPDATA%。
+可写性判断走 `util::is_writable()` —— 真去写一个探针文件，而不是只看只读属性，
+因为 ACL 挡住的写操作从只读属性上看不出来。
+
+唯一的例外是 `source_speed.json`（各镜像的实测速率）：它反映的是**用户自己的线路**，
+换台机器就没有意义了，所以固定留在 %APPDATA%。
+早先下载记录也固定写在 %APPDATA%，那会导致「文件都在、记录找不到 → 重下 17~19 MB
+代理 DLL」，已改成跟着资产走；`update::load_state()` 会从两个老位置
+（FrameGen-Manager / DLSSG-Manager）读一次并迁过来，老文件不删。
 
 早期版本把备份放在 `%APPDATA%\FrameGen-Manager\backups`，现在由
 `util::migrate_backups()` 在 `main()` 开头做一次性搬迁：只在「新位置为空」且

@@ -44,6 +44,13 @@ pub fn app_data_dir() -> Result<PathBuf> {
     Ok(d)
 }
 
+/// 老版本的 %APPDATA% 目录名 —— 程序还叫 DLSSG-Manager 的那段时间用的是它。
+/// 只用于一次性的兼容读取（升级上来时把老记录/老备份认出来），不往里写新东西。
+pub fn legacy_app_data_dir() -> Option<PathBuf> {
+    let base = directories::BaseDirs::new()?;
+    Some(base.data_dir().join("DLSSG-Manager"))
+}
+
 pub fn backups_dir() -> Result<PathBuf> {
     let d = default_backups_dir();
     std::fs::create_dir_all(&d).with_context(|| format!("创建备份目录失败: {}", d.display()))?;
@@ -120,7 +127,7 @@ fn do_migrate_backups() -> Option<String> {
 const CONFIG_NAME: &str = "framegen-manager.json";
 
 /// 应用配置。默认放在 exe 同级（便携，解压即用）；exe 同级不可写时回退 %APPDATA%。
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AppConfig {
     /// 用户自定义的资产目录。None 表示用默认位置。
     #[serde(default)]
@@ -133,21 +140,11 @@ pub struct AppConfig {
     pub backup_prefix: String,
     /// 是否改用 310.1 版程序本体（310.1/）。
     /// 上游最新版是 310.9 后端、没打包 SM75 内核，只面向 RTX 30 系；
-    /// RTX 20 / GTX 16 系（SM75）切到这里，换用带 SM75 内核的 310.1 版。默认关。
+    /// RTX 20 系（SM75）切到这里，换用带 SM75 内核的 310.1 版。默认关。
     #[serde(default)]
     pub legacy_3101: bool,
 }
 
-impl Default for AppConfig {
-    fn default() -> Self {
-        Self {
-            asset_dir: None,
-            allow_backup_source: false,
-            backup_prefix: String::new(),
-            legacy_3101: false,
-        }
-    }
-}
 
 pub fn exe_dir() -> Option<PathBuf> {
     std::env::current_exe()

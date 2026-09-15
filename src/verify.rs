@@ -23,7 +23,8 @@ use windows_sys::Win32::Security::Cryptography::{
     CMSG_SIGNER_INFO, CMSG_SIGNER_INFO_PARAM, HCERTSTORE, PKCS_7_ASN_ENCODING, X509_ASN_ENCODING,
 };
 use windows_sys::Win32::Security::WinTrust::{
-    WinVerifyTrust, WINTRUST_ACTION_GENERIC_VERIFY_V2, WINTRUST_DATA, WINTRUST_FILE_INFO,
+    WinVerifyTrust, WINTRUST_ACTION_GENERIC_VERIFY_V2, WINTRUST_DATA, WINTRUST_DATA_0,
+    WINTRUST_FILE_INFO,
     WTD_CACHE_ONLY_URL_RETRIEVAL, WTD_CHOICE_FILE, WTD_DISABLE_MD2_MD4, WTD_REVOKE_NONE,
     WTD_STATEACTION_CLOSE, WTD_STATEACTION_VERIFY, WTD_UI_NONE,
 };
@@ -150,19 +151,23 @@ fn wide(path: &Path) -> Vec<u16> {
 fn winverify(path: &Path) -> SigState {
     unsafe {
         let wpath = wide(path);
-        let mut file_info = WINTRUST_FILE_INFO::default();
-        file_info.cbStruct = std::mem::size_of::<WINTRUST_FILE_INFO>() as u32;
-        file_info.pcwszFilePath = wpath.as_ptr();
+        let mut file_info = WINTRUST_FILE_INFO {
+            cbStruct: std::mem::size_of::<WINTRUST_FILE_INFO>() as u32,
+            pcwszFilePath: wpath.as_ptr(),
+            ..Default::default()
+        };
 
-        let mut data = WINTRUST_DATA::default();
-        data.cbStruct = std::mem::size_of::<WINTRUST_DATA>() as u32;
-        data.dwUIChoice = WTD_UI_NONE;
-        data.fdwRevocationChecks = WTD_REVOKE_NONE;
-        data.dwUnionChoice = WTD_CHOICE_FILE;
-        data.Anonymous.pFile = &mut file_info;
-        data.dwStateAction = WTD_STATEACTION_VERIFY;
-        // 不联网吊销检查（离线也要能用），并且禁掉早就废弃的 MD2/MD4
-        data.dwProvFlags = WTD_CACHE_ONLY_URL_RETRIEVAL | WTD_DISABLE_MD2_MD4;
+        let mut data = WINTRUST_DATA {
+            cbStruct: std::mem::size_of::<WINTRUST_DATA>() as u32,
+            dwUIChoice: WTD_UI_NONE,
+            fdwRevocationChecks: WTD_REVOKE_NONE,
+            dwUnionChoice: WTD_CHOICE_FILE,
+            Anonymous: WINTRUST_DATA_0 { pFile: &mut file_info },
+            dwStateAction: WTD_STATEACTION_VERIFY,
+            // 不联网吊销检查（离线也要能用），并且禁掉早就废弃的 MD2/MD4
+            dwProvFlags: WTD_CACHE_ONLY_URL_RETRIEVAL | WTD_DISABLE_MD2_MD4,
+            ..Default::default()
+        };
 
         let mut action = WINTRUST_ACTION_GENERIC_VERIFY_V2;
         let status = WinVerifyTrust(
@@ -257,9 +262,11 @@ fn signer_cert(path: &Path) -> Result<(String, String)> {
         let si = &*(buf.as_ptr() as *const CMSG_SIGNER_INFO);
 
         // 2. 用 Issuer + SerialNumber 在证书库里定位那张证书
-        let mut want = CERT_INFO::default();
-        want.Issuer = si.Issuer;
-        want.SerialNumber = si.SerialNumber;
+        let want = CERT_INFO {
+            Issuer: si.Issuer,
+            SerialNumber: si.SerialNumber,
+            ..Default::default()
+        };
         let cert = CertFindCertificateInStore(
             store,
             X509_ASN_ENCODING | PKCS_7_ASN_ENCODING,

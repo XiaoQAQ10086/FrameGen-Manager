@@ -19,18 +19,8 @@ use crate::update;
 use crate::util;
 use crate::verify;
 
-/// 代理入口的文件名（和上游 alternatives/ 里的一致）
-pub const PROXY_NAMES: [&str; 7] = [
-    "version.dll",
-    "winmm.dll",
-    "dbghelp.dll",
-    "dinput8.dll",
-    "dxgi.dll",
-    "d3d12.dll",
-    "winhttp.dll",
-];
-/// 配置文件的名字
-pub const INI_NAME: &str = "dlssg_sm86.ini";
+/// 配置文件的名字（和仓库里那份同名 —— 名字只在 update::INI_REPO_PATH 定义一次）
+pub const INI_NAME: &str = update::INI_REPO_PATH;
 /// 两个 DLSS 运行库
 pub const RUNTIME_NAMES: [&str; 2] = ["nvngx_dlssg.dll", "nvngx_dlss.dll"];
 
@@ -112,7 +102,8 @@ fn basename_lower(name: &str) -> String {
 }
 
 fn kind_of(base: &str) -> Option<Kind> {
-    if PROXY_NAMES.contains(&base) {
+    // 代理入口名单只在 scan.rs 里硬编码（scan::PROXY_ALL），这里问它
+    if crate::scan::is_known_proxy(base) {
         Some(Kind::Proxy)
     } else if base == INI_NAME {
         Some(Kind::Ini)

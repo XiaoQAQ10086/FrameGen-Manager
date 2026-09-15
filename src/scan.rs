@@ -578,7 +578,6 @@ fn rd_u32(d: &[u8], o: usize) -> u32 {
     u32::from_le_bytes([d[o], d[o + 1], d[o + 2], d[o + 3]])
 }
 
-/// 解析 PE 导入表，返回被导入的 DLL 名（全小写）。任何异常一律返回空表，不 panic。
 // ---------------------------------------------------------------- WeGame
 
 /// WeGame 把「每个游戏装在哪」记在注册表的这些根下面，一个游戏一个子键。
@@ -608,7 +607,7 @@ pub fn wegame_value_is_name_like(name: &str) -> bool {
 pub fn wegame_name_from_key(key: &str) -> String {
     let s = key.trim().trim_end_matches(')');
     let mut out = s;
-    if let Some(i) = s.rfind(|c: char| c == '(' || c == '_' || c == '-') {
+    if let Some(i) = s.rfind(['(', '_', '-']) {
         let tail = s[i + 1..].trim();
         if !tail.is_empty() && tail.chars().all(|c| c.is_ascii_digit()) {
             out = s[..i].trim_end();
@@ -648,6 +647,7 @@ pub fn wegame_installed() -> bool {
 /// **判定故意非常保守**，两个原因：
 ///   1. 这个注册表布局没有官方文档，是从社区资料推断的；
 ///   2. 开发机上没装 WeGame，**没法在真实环境验证**（其他平台都是拿真实机器验过的）。
+///
 /// 所以只把「里面真能找到游戏可执行文件的目录」当成一条记录 —— 宁可漏报，也不列一堆
 /// 垃圾让用户困惑。扫不到不影响使用：界面上还能用「选择目录」手动指到渲染 EXE 的文件夹。
 pub fn scan_wegame() -> Vec<GameEntry> {
@@ -789,6 +789,7 @@ fn wegame_install_bases() -> Vec<PathBuf> {
     out
 }
 
+/// 解析 PE 导入表，返回被导入的 DLL 名（全小写）。任何异常一律返回空表，不 panic。
 pub fn pe_imports(path: &Path) -> Vec<String> {
     let Ok(file) = std::fs::File::open(path) else {
         return Vec::new();
@@ -1060,22 +1061,38 @@ pub fn identify_dll(path: &Path) -> FileIdentity {
 
 // ---------------------------------------------------------------- 代理入口推断
 
-/// 当前版（上游 0.3.0 代理模式）支持的代理入口，按上游推荐顺序排列。
+/// **所有代理入口名字 —— 全项目只有这一处硬编码。**
+///
+/// 顺序 = 上游推荐顺序：前 6 个是 0.3.0 alternatives/ 下现用的入口，
+/// 最后一个是上游历史上用过、现在只剩归档包（archive/0.2.4/altnative/）里才有的名字。
+/// 别处（deploy / importer / 界面）一律引用这里，免得上游改名时漏改一处。
 /// version.dll 是上游默认；dbghelp / d3d12 是 0.3.0 新增的，winhttp 已被上游删掉。
 /// 根目录（310.9）和 310.1/ 两个版本的目录结构一样，所以清单是同一份。
-pub const PROXY_PRIORITY: [&str; 6] = [
+pub const PROXY_ALL: [&str; 7] = [
     "version.dll",
     "winmm.dll",
     "dbghelp.dll",
     "dinput8.dll",
     "dxgi.dll",
     "d3d12.dll",
+    "winhttp.dll",
 ];
 
-/// 上游历史上用过、现在只剩归档包（archive/0.2.4/altnative/）里才有的入口名。
+/// 当前版支持的代理入口，按上游推荐顺序 —— 就是 PROXY_ALL 的前 6 个。
+/// （下标只能逐个写死：常量里不能做切片，`&ARR[..n]` 要用还没稳定的 Index trait。）
+pub const PROXY_PRIORITY: [&str; 6] = [
+    PROXY_ALL[0],
+    PROXY_ALL[1],
+    PROXY_ALL[2],
+    PROXY_ALL[3],
+    PROXY_ALL[4],
+    PROXY_ALL[5],
+];
+
+/// 上游历史上用过的入口名（现在只有老归档包里才有）。
 /// 判断「要不要拒绝覆盖」「要不要清理多余代理」时老名字也得认，
 /// 否则用户从老版切过来时，目录里残留的 winhttp.dll 会被当成第三方文件。
-pub const PROXY_HISTORIC: [&str; 1] = ["winhttp.dll"];
+pub const PROXY_HISTORIC: [&str; 1] = [PROXY_ALL[6]];
 
 /// 某个文件名是不是代理入口（现用清单 + 历史上的名字）。
 pub fn is_known_proxy(name: &str) -> bool {
@@ -1251,8 +1268,11 @@ pub fn advise_proxy(target_dir: &Path) -> ProxyAdvice {
 pub enum GpuRoute {
     /// RTX 30 系：保持上游默认 Router=SM86
     Sm86,
-    /// RTX 20 系 / GTX 16 系：必须改成 Router=SM75
+    /// RTX 20 系：必须改成 Router=SM75
     Sm75,
+    /// GTX 16 系：和 RTX 20 系同是 Turing，但**没有 Tensor Core** —— DLSS 全系功能在
+    /// 硬件上就跑不了，换哪个版本都没用。单独一条路，并且禁止部署。
+    Gtx16,
     /// RTX 40 / 50 系：原生支持帧生成，不需要本 Mod
     NotNeeded,
     /// AMD / Intel / 核显：不适用
@@ -1265,7 +1285,8 @@ impl GpuRoute {
     pub fn label(self) -> &'static str {
         match self {
             GpuRoute::Sm86 => "RTX 30 系 (SM86)",
-            GpuRoute::Sm75 => "RTX 20 / GTX 16 系 (SM75)",
+            GpuRoute::Sm75 => "RTX 20 系 (SM75)",
+            GpuRoute::Gtx16 => "GTX 16 系（无 Tensor Core）",
             GpuRoute::NotNeeded => "RTX 40 / 50 系",
             GpuRoute::Unsupported => "非 NVIDIA 显卡",
             GpuRoute::Unknown => "未能识别",
@@ -1304,6 +1325,7 @@ pub fn pick_gpu_name(
 /// 而那个键下面可能有：
 ///   * 旧显卡留下的**幽灵条目**（换过卡就会有）；
 ///   * 被别的工具改过的值（网上"解锁帧生成"的教程就会改 DriverDesc）。
+///
 /// 于是同一个用户会出现「这次识别成 1030、退出再进又变成 40 系」—— 因为每次谁先被
 /// 枚举到不一定一样。而 40 系的名字会让路由判定变成「不需要本 Mod」，直接禁止部署，
 /// 3050 的用户会莫名其妙被拦。
@@ -1327,8 +1349,13 @@ pub fn classify_gpu(name: &str) -> GpuRoute {
     if n.contains("RTX 30") {
         return GpuRoute::Sm86;
     }
-    // RTX 20 系与 GTX 16 系同为 Turing，走 SM75
-    if n.contains("RTX 20") || n.contains("GTX 16") {
+    // GTX 16 系（1630 / 1650 / 1660）和 RTX 20 系同为 Turing，但**没有 Tensor Core**：
+    // DLSS 帧生成在硬件上就跑不了，换 310.1 版也没用。必须单独判出来，不能落到 Sm75 ——
+    // 否则界面会给出「改用 310.1 版」这种根本无效的建议。
+    if n.contains("GTX 16") {
+        return GpuRoute::Gtx16;
+    }
+    if n.contains("RTX 20") {
         return GpuRoute::Sm75;
     }
     GpuRoute::Unknown

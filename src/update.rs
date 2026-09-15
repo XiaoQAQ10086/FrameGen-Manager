@@ -32,7 +32,7 @@ pub const REPO: &str = "sdli1995/dlssg_for_sm86";
 pub const BRANCH: &str = "main";
 pub const INI_REPO_PATH: &str = "dlssg_sm86.ini";
 
-/// 面向 RTX 20 / GTX 16 系（SM75）的那一版在仓库里的位置。
+/// 面向 RTX 20 系（SM75）的那一版在仓库里的位置。
 ///
 /// 上游 0.3.0 的根目录是 310.9 后端，DLL 里明写「The 310.9 backend has no SM75
 /// kernel family」—— 也就是新版根本没打包 SM75 内核，20 系跑不起来。
@@ -171,9 +171,9 @@ fn cancelled(cancel: Option<&AtomicBool>) -> bool {
     cancel.map(|c| c.load(Ordering::Relaxed)).unwrap_or(false)
 }
 
-/// 原来这里记的是「每个主机上次哪个候选**成功**了」，现在换成了记**实测速率**
-/// （见下面的 SourceSpeeds）。区别很重要：镜像的快慢是按用户线路和时间变的，
-/// 「上次能连上」不代表「这次够快」，而慢源不换掉就是用户抱怨的那个问题。
+// 原来这里记的是「每个主机上次哪个候选**成功**了」，现在换成了记**实测速率**
+// （见下面的 SourceSpeeds）。区别很重要：镜像的快慢是按用户线路和时间变的，
+// 「上次能连上」不代表「这次够快」，而慢源不换掉就是用户抱怨的那个问题。
 
 /// 按候选顺序依次尝试，第一个成功的胜出。
 ///
@@ -550,6 +550,19 @@ pub fn local_is_current(
         .unwrap_or(false)
 }
 
+/// 一次下载的「写到哪、谁能叫停、进度报给谁」。
+///
+/// 捆成一个结构体的唯一原因是**别再让参数表无节制地长下去** ——
+/// download / download_auto 本来要传 8~9 个参数，多一个少一个都容易传错位置。
+pub struct Sink<'a> {
+    /// 最终落盘位置（下载过程中写的是 .part，成功后原子替换）
+    pub dest: &'a Path,
+    /// 用户随时可以点取消
+    pub cancel: &'a AtomicBool,
+    /// 进度回调：(已下字节, 总字节[0 = 未知], 正在用哪个源)
+    pub progress: &'a mut dyn FnMut(u64, u64, &str),
+}
+
 /// 自动选源下载一个仓库文件。这就是界面上「下载 / 更新资产」走的路径，
 /// 不用用户再手点「改用备用源」。
 ///
@@ -561,43 +574,35 @@ pub fn local_is_current(
 ///   ETag，比对能真正生效。ini 没有签名，只能靠这个。
 ///
 /// `verify` 失败时返回 Err 就会自动换下一个源重试。
+///
+/// 原来是「download_auto -> download_pass -> download」三层，中间那层只被这里
+/// 用过一次，已经并进来；换源顺序仍然只看「这个源能不能把文件给全」，不看速度。
 pub fn download_auto(
     client: &reqwest::blocking::Client,
     repo_path: &str,
-    dest: &Path,
+    sink: Sink<'_>,
     expect_etag: Option<&str>,
-    cancel: &AtomicBool,
     custom_prefix: &str,
     prefer_mirror: bool,
     verify: &dyn Fn(&Path) -> Result<()>,
-    progress: &mut dyn FnMut(u64, u64, &str),
 ) -> Result<Downloaded> {
     let official = official_url(repo_path);
     let ms = mirrors(custom_prefix);
-    // 换源只看「这个源能不能把文件给全」，不看速度：慢源照样让它慢慢下完。
-    download_pass(
-        client, repo_path, dest, expect_etag, cancel, &official, &ms, prefer_mirror, verify,
-        progress,
-    )
-}
-
-/// 按候选顺序走一遍：一个源下不下来就换下一个。
-#[allow(clippy::too_many_arguments)]
-pub fn download_pass(
-    client: &reqwest::blocking::Client,
-    repo_path: &str,
-    dest: &Path,
-    expect_etag: Option<&str>,
-    cancel: &AtomicBool,
-    official: &str,
-    ms: &[String],
-    prefer_mirror: bool,
-    verify: &dyn Fn(&Path) -> Result<()>,
-    progress: &mut dyn FnMut(u64, u64, &str),
-) -> Result<Downloaded> {
-    try_sources(official, ms, prefer_mirror, Some(cancel), |url, src| {
+    let (dest, cancel) = (sink.dest, sink.cancel);
+    try_sources(&official, &ms, prefer_mirror, Some(cancel), |url, src| {
         let t0 = Instant::now();
-        let r = download(client, repo_path, dest, url, expect_etag, cancel, src, progress);
+        let r = download(
+            client,
+            repo_path,
+            Sink {
+                dest,
+                cancel,
+                progress: &mut *sink.progress,
+            },
+            url,
+            expect_etag,
+            src,
+        );
         let secs = t0.elapsed().as_secs_f64();
         match r {
             Ok(dl) => {
@@ -638,14 +643,17 @@ pub struct Downloaded {
     pub etag: Option<String>,
 }
 
-/// 下载并校验。
+/// 下载并校验。**官方源、镜像、运行库 zip 都走这一条**（download_raw 已并进来）。
 ///
 /// - url 由调用方决定（官方源或备用源）
-/// - cancel 置位时立刻中断，且磁盘上不留任何残留
+/// - sink.cancel 置位时立刻中断，且磁盘上不留任何残留
 ///
 /// 校验方式（不再依赖 GitHub API）：
-///   1. 先 HEAD 拿到内容指纹（ETag），下载后用**响应里的 ETag** 和它比对；
-///   2. 再比对 Content-Length，防止被截断。
+///   1. expect_etag 有值时，把**响应里的 ETag** 和它比对；
+///   2. 再比对 Content-Length，防止被截断（两种情况下都生效）。
+///
+/// expect_etag 传 None 表示「这一份没有可信的官方指纹可比」—— 运行库 zip 走的是
+/// Release 直链，没有 GitHub 的 ETag 可对，解压后靠 NVIDIA 签名兜底。
 ///
 /// 说明：raw.githubusercontent.com 的 ETag 是 GitHub 自己的内容哈希（不是 SHA-256，
 /// 本地算不出来），所以这里比的是「两次请求说的是不是同一份内容」。
@@ -653,14 +661,13 @@ pub struct Downloaded {
 pub fn download(
     client: &reqwest::blocking::Client,
     repo_path: &str,
-    dest: &Path,
+    sink: Sink<'_>,
     url: &str,
     expect_etag: Option<&str>,
-    cancel: &AtomicBool,
     // 正在用的是哪个源（空串 = 官方源），跟着进度一起报给界面
     source: &str,
-    progress: &mut dyn FnMut(u64, u64, &str),
 ) -> Result<Downloaded> {
+    let Sink { dest, cancel, progress } = sink;
     let tmp = part_path(dest);
     let _ = std::fs::remove_file(&tmp);
 
@@ -740,16 +747,55 @@ fn record_download_speed(source: &str, bytes: u64, secs: f64) {
     record_speed(source, (bytes as f64 / secs / 1024.0) as u64);
 }
 
+/// 下载记录放在**资产目录里**（`assets\update_state.json`），和资产同一个家。
+///
+/// 老版本固定写在 %APPDATA% 下（程序还叫 DLSSG-Manager 时是那个文件夹，后来是
+/// FrameGen-Manager），和资产分了家：用户把整个文件夹
+/// 拷到另一台机器（或清了 %APPDATA%），文件明明都在，工具却查不到记录，会被判定成
+/// 「需要下载」而白下 17~19 MB 的代理 DLL —— 这正是和「解压即用」冲突的地方。
+/// 现在记录跟着资产走（config / logs / game_library 本来就在程序同级）。
 fn state_path() -> Result<PathBuf> {
-    Ok(util::app_data_dir()?.join("update_state.json"))
+    Ok(util::assets_dir()?.join("update_state.json"))
+}
+
+/// 老位置，只用于一次性的兼容读取（见 load_state）。
+/// 两个都认：改名前后 %APPDATA% 下的文件夹名不一样（FrameGen-Manager / DLSSG-Manager）。
+fn legacy_state_paths() -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    if let Ok(d) = util::app_data_dir() {
+        out.push(d.join("update_state.json"));
+    }
+    if let Some(d) = util::legacy_app_data_dir() {
+        out.push(d.join("update_state.json"));
+    }
+    out
+}
+
+fn read_state(p: &Path) -> Option<UpdateState> {
+    std::fs::read_to_string(p)
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
 }
 
 pub fn load_state() -> UpdateState {
-    state_path()
-        .ok()
-        .and_then(|p| std::fs::read_to_string(p).ok())
-        .and_then(|t| serde_json::from_str(&t).ok())
-        .unwrap_or_default()
+    if let Ok(p) = state_path() {
+        if let Some(st) = read_state(&p) {
+            return st;
+        }
+    }
+    // 老版本留下的记录：读出来顺手迁到新位置。用户升级上来不该因为「记录换了地方」
+    // 就重新下载一遍资产。老文件不删 —— 万一用户想退回去用老版本，那边还能用。
+    for old in legacy_state_paths() {
+        if let Some(st) = read_state(&old) {
+            let _ = save_state(&st);
+            crate::log::line(&format!(
+                "下载记录已从 {} 迁到资产目录（记录跟着资产走，换机器不用重下）",
+                old.display()
+            ));
+            return st;
+        }
+    }
+    UpdateState::default()
 }
 
 pub fn save_state(state: &UpdateState) -> Result<()> {
@@ -815,7 +861,7 @@ pub struct IniPlan {
 }
 
 /// 按显卡路由准备要部署的 INI。
-/// RTX 30 系保持上游默认；RTX 20 / GTX 16 系要把 Router 改成 SM75（只有带 Router 项的老 INI 才需要改）。
+/// RTX 30 系保持上游默认；RTX 20 系要把 Router 改成 SM75（只有带 Router 项的老 INI 才需要改）。
 /// 改写后写到单独的文件，上游原文件保持不动（用于比对哈希）。
 pub fn prepare_deploy_ini(route: GpuRoute, gpu_name: Option<&str>) -> Result<IniPlan> {
     let upstream = util::assets_dir()?.join(INI_REPO_PATH);
@@ -844,7 +890,7 @@ pub fn prepare_deploy_ini_files(
                     changes.push(format!(
                         "Router：上游默认 {} → 改为 SM75。原因：本机显卡是 {}，属于 Turing / SM75 架构，走 SM86 路由不会生效。",
                         if before.is_empty() { "未读到".to_owned() } else { before },
-                        gpu_name.unwrap_or("RTX 20 / GTX 16 系")
+                        gpu_name.unwrap_or("RTX 20 系")
                     ));
                 }
                 patched
@@ -857,7 +903,7 @@ pub fn prepare_deploy_ini_files(
                     "这份 INI 里没有 Router 项（上游 0.3.0 精简掉了），本次原样部署。\
                      你的显卡是 {}：新版上游只面向 RTX 30 系，帧生成可能不生效，\
                      可以改用 310.1 版（带 SM75 内核）。",
-                    gpu_name.unwrap_or("RTX 20 / GTX 16 系")
+                    gpu_name.unwrap_or("RTX 20 系")
                 ));
                 text
             }
@@ -881,29 +927,30 @@ pub fn prepare_deploy_ini_files(
 
 /// 内置镜像，按**实测速度**从快到慢排。
 ///
-/// 2026-09 本机实测（拉 raw 上的 version.dll，每次 8 MB 样本，跑两轮）：
-///   gh-proxy.com   3.9 ~ 5.2 MB/s
-///   ghfast.top     0.5 ~ 0.9 MB/s
-///   ghproxy.net    0.02 ~ 0.16 MB/s   <- 原来内置的是它，慢到基本不可用
-///   raw 官方直连   0.00 ~ 0.06 MB/s   <- 基本不通
-/// 换成 gh-proxy.com 之后，48 MB 资产从十几分钟降到十几秒。
-pub const MIRRORS: [&str; 14] = [
+/// 2026-09 本机实测（拉 raw 上的 version.dll，每次 512 KB 样本，多轮）：
+///   ghfile.geekertao.top   约 0.4 MB/s
+///   ghfast.top             约 0.2 MB/s
+///   gh-proxy.cn            约 0.07 MB/s
+///   gh.xxooo.cf            约 0.06 MB/s
+///   ghproxy.net            0.02 ~ 0.16 MB/s
+///   raw 官方直连           0.00 ~ 0.06 MB/s   <- 基本不通
+/// gh-proxy.com 曾是本机最快的（3.9 ~ 5.2 MB/s），后来对本机开始返回 403，
+/// 但别人线路仍然可用，所以留着 —— download_auto 会挨个换源，不通就跳过。
+///
+/// **只留实测打得通的源。** 第二轮试过的 ghproxy.cfd / ghps.cc /
+/// ghproxy.cdn.9i0i.com / ghp.icu / gh-proxy.top / ghproxy.homeboyc.cn /
+/// gh.jasonzeng.dev / mirror.ghproxy.com 全部连不上，已删掉：留着的死源只会在
+/// 官方源也失败时挨个白等一次连接超时，纯粹拖慢用户。
+/// 用户仍可在界面上自己填源（一行一个），见 split_custom_sources。
+pub const MIRRORS: [&str; 6] = [
     // 第一轮实测活下来的
     "https://gh-proxy.com/",
     "https://ghfast.top/",
     "https://ghfile.geekertao.top/",
     "https://ghproxy.net/",
-    // 第二轮候选
-    "https://ghproxy.cfd/",
-    "https://ghps.cc/",
+    // 第二轮候选里活下来的两个
     "https://gh.xxooo.cf/",
-    "https://ghproxy.cdn.9i0i.com/",
     "https://gh-proxy.cn/",
-    "https://ghp.icu/",
-    "https://gh-proxy.top/",
-    "https://ghproxy.homeboyc.cn/",
-    "https://gh.jasonzeng.dev/",
-    "https://mirror.ghproxy.com/",
 ];
 
 /// 默认备用源（= 最快的那个镜像）。界面上「当前备用源」显示的就是它。
@@ -1036,8 +1083,8 @@ pub fn rank_by_scores(items: &[(String, Option<u64>)]) -> Vec<String> {
             None => unknown.push(m.clone()),
         }
     }
-    good.sort_by(|a, b| b.0.cmp(&a.0));
-    slow.sort_by(|a, b| b.0.cmp(&a.0));
+    good.sort_by_key(|a| std::cmp::Reverse(a.0));
+    slow.sort_by_key(|a| std::cmp::Reverse(a.0));
     let mut out: Vec<String> = good.into_iter().map(|(_, m)| m).collect();
     out.extend(unknown);
     out.extend(slow.into_iter().map(|(_, m)| m));
@@ -1183,62 +1230,6 @@ pub fn find_release_zip(
     bail!("在 {repo} 里找不到 tag 以 {prefix} 开头的 release 资产")
 }
 
-/// 下载任意 URL 到文件（第三方 release 资产没有 git blob sha 可对，所以单独一个函数）。
-pub fn download_raw(
-    client: &reqwest::blocking::Client,
-    url: &str,
-    dest: &Path,
-    cancel: &AtomicBool,
-    // 同 download()：正在用的是哪个源，跟着进度一起报给界面
-    source: &str,
-    progress: &mut dyn FnMut(u64, u64, &str),
-) -> Result<u64> {
-    let tmp = part_path(dest);
-    let _ = std::fs::remove_file(&tmp);
-
-    let mut resp = client
-        .get(url)
-        .send()
-        .map_err(|e| anyhow::anyhow!(friendly_error(&e)))?;
-    let status = resp.status();
-    if !status.is_success() {
-        bail!("下载返回 HTTP {}", status.as_u16());
-    }
-    let total = resp.content_length().filter(|n| *n > 0).unwrap_or(0);
-
-    let mut buf: Vec<u8> = Vec::with_capacity(total as usize);
-    let mut chunk = vec![0u8; 64 * 1024];
-    let mut got: u64 = 0;
-    // 只记总耗时，供下完后记录实测速率用 —— 不再按速度拦任何东西。
-    let t0 = Instant::now();
-    // 进度回调里那第三段文字在这里算一次 —— 别每 64 KB 都新分配一个 String
-    let tag = format!("经 {}", source_label(source));
-    loop {
-        if cancel.load(Ordering::Relaxed) {
-            let _ = std::fs::remove_file(&tmp);
-            bail!("{}", CANCELLED_MSG);
-        }
-        let n = resp
-            .read(&mut chunk)
-            .map_err(|e| anyhow::anyhow!("下载中断：{}", e))?;
-        if n == 0 {
-            break;
-        }
-        buf.extend_from_slice(&chunk[..n]);
-        got += n as u64;
-        progress(got, total, &tag);
-    }
-
-    if let Some(parent) = dest.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(&tmp, &buf)?;
-    util::atomic_replace(&tmp, dest)?;
-    util::clear_motw(dest);
-    record_download_speed(source, got, t0.elapsed().as_secs_f64());
-    Ok(buf.len() as u64)
-}
-
 /// HEAD 任意 URL，拿 (大小, ETag)。发布资产也有 Content-Length，够界面显示用了。
 /// 同样先官方后镜像，失败返回 None（只是显示不出大小，不影响下载）。
 pub fn probe_url(client: &reqwest::blocking::Client, url: &str) -> Option<(u64, String)> {
@@ -1270,21 +1261,36 @@ fn download_with_mirror(
     progress: &mut dyn FnMut(u64, u64, &str),
 ) -> Result<u64> {
     let ms = mirrors("");
+    // 报错/日志里用来称呼这个文件（比如 nvngx_dlssg_310.9.1.zip）
+    let label = dest.file_name().and_then(|n| n.to_str()).unwrap_or("运行库");
     // 依次试每个镜像，最后兜底官方源。只看能不能下完，不看速度 ——
     // 慢源就让它慢慢下，只有用户点取消或者源彻底不动才算数。
     try_sources(official, &ms, true, Some(cancel), |url, src| {
         progress(0, 0, src);
         let t0 = Instant::now();
-        match download_raw(client, url, dest, cancel, src, progress) {
-            Ok(n) => {
+        // 走的是同一条下载路径，只是没有可信的官方指纹可比（expect_etag = None）；
+        // 内容真实性靠解压后的 NVIDIA 签名兜底，长度校验照样生效。
+        match download(
+            client,
+            label,
+            Sink {
+                dest,
+                cancel,
+                progress: &mut *progress,
+            },
+            url,
+            None,
+            src,
+        ) {
+            Ok(dl) => {
                 crate::log::line(&format!(
                     "下载成功 {} <- {}  {} 字节  {:.1}s",
                     dest.display(),
                     source_label(src),
-                    n,
+                    dl.bytes,
                     t0.elapsed().as_secs_f64()
                 ));
-                Ok(n)
+                Ok(dl.bytes)
             }
             Err(e) => {
                 crate::log::line(&format!(
@@ -1633,7 +1639,6 @@ pub fn ensure_dlss_runtime(
             frac(done),
         );
 
-        let got_bytes: u64;
         let direct = {
             let mut relay = |got: u64, len: u64, src: &str| {
                 let t = if len > 0 { len } else { step.size };
@@ -1651,8 +1656,8 @@ pub fn ensure_dlss_runtime(
             download_with_mirror(client, &step.url, &zip_path, cancel, &mut relay)
         };
 
-        match direct {
-            Ok(n) => got_bytes = n,
+        let got_bytes: u64 = match direct {
+            Ok(n) => n,
             Err(e) => {
                 // 直链彻底失败才回退去问 releases API：作者删包 / 改名时会走到这里
                 let asset = find_release_zip(client, DLSS_REPO, prefix, tag).map_err(|e2| {
@@ -1678,10 +1683,9 @@ pub fn ensure_dlss_runtime(
                         frac(done + got),
                     );
                 };
-                got_bytes =
-                    download_with_mirror(client, &asset.url, &zip_path, cancel, &mut relay)?;
+                download_with_mirror(client, &asset.url, &zip_path, cancel, &mut relay)?
             }
-        }
+        };
         done += got_bytes;
 
         progress(
