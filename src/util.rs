@@ -138,13 +138,24 @@ pub struct AppConfig {
     /// 用户选定的下载源前缀。留空 = 自动（按实测速率挑最快的那个）。
     #[serde(default)]
     pub backup_prefix: String,
-    /// 是否改用 310.1 版程序本体（310.1/）。
-    /// 上游最新版是 310.9 后端、没打包 SM75 内核，只面向 RTX 30 系；
-    /// RTX 20 系（SM75）切到这里，换用带 SM75 内核的 310.1 版。默认关。
-    #[serde(default)]
-    pub legacy_3101: bool,
 }
 
+
+/// 老配置里有没有「legacy_3101: true」（一次性迁移用）。
+///
+/// 以前可以切到上游的 310.1 版给 RTX 20 系用；上游 0.3.1 起 20/30 系用同一套文件，
+/// 那个开关删掉了。但**曾经切过的用户**本地那份 version.dll 是老的：探测落到镜像时
+/// 指纹不可信，「已是最新」的判定会退化成「比字节数」，旧文件正好和旧记录对得上，
+/// 于是静默跳过下载 —— 用户以为升级了，其实还是老版本。所以启动时看一次老配置。
+pub fn config_had_legacy_3101() -> bool {
+    let Ok(text) = std::fs::read_to_string(config_path()) else {
+        return false;
+    };
+    serde_json::from_str::<serde_json::Value>(&text)
+        .ok()
+        .and_then(|v| v.get("legacy_3101").and_then(|x| x.as_bool()))
+        .unwrap_or(false)
+}
 
 pub fn exe_dir() -> Option<PathBuf> {
     std::env::current_exe()

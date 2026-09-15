@@ -24,7 +24,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use crate::scan::{self, GpuRoute};
+use crate::scan;
 use crate::util;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -32,34 +32,17 @@ pub const REPO: &str = "sdli1995/dlssg_for_sm86";
 pub const BRANCH: &str = "main";
 pub const INI_REPO_PATH: &str = "dlssg_sm86.ini";
 
-/// 面向 RTX 20 系（SM75）的那一版在仓库里的位置。
-///
-/// 上游 0.3.0 的根目录是 310.9 后端，DLL 里明写「The 310.9 backend has no SM75
-/// kernel family」—— 也就是新版根本没打包 SM75 内核，20 系跑不起来。
-/// 同一个仓库里 310.1/ 那一份用的是 310.1 后端，二进制里有 dlssg-310.1-d3d12-sm86+sm75
-/// 和 sm75_route_limits / sm75_slots 这些字样，即带 SM75 内核的代理版。
-/// INI 仍然用根目录那份：出厂 INI 自己写了「MaxGeneratedFrames 会被钳到内嵌运行库
-/// 支持的上限：310.9 是 6X、310.1 是 4X」，所以这份 INI 配 310.1 是作者预期内的用法。
-pub const LEGACY_PREFIX: &str = "310.1/";
-
 /// 代理入口 -> 仓库里的路径。
 ///
 /// 关键：备用入口不是 version.dll 改个名，而是导出名不同的独立二进制
 /// （体积都不一样），所以必须下载对应那一个，不能拿 version.dll 重命名。
 ///
-/// 上游 0.3.0 把它们放在 alternatives/，去掉了 winhttp、新增 dbghelp 与 d3d12；
-/// 310.1/ 那一份的目录结构完全相同，只是程序本体换成了带 SM75 内核的版本。
-pub fn proxy_repo_path(proxy: &str, legacy: bool) -> &'static str {
-    if legacy {
-        return match proxy {
-            "winmm.dll" => "310.1/alternatives/winmm.dll",
-            "dbghelp.dll" => "310.1/alternatives/dbghelp.dll",
-            "dinput8.dll" => "310.1/alternatives/dinput8.dll",
-            "dxgi.dll" => "310.1/alternatives/dxgi.dll",
-            "d3d12.dll" => "310.1/alternatives/d3d12.dll",
-            _ => "310.1/version.dll",
-        };
-    }
+/// 上游 0.3.0 把它们放在 alternatives/（去掉 winhttp、新增 dbghelp 与 d3d12），0.3.1 不变。
+///
+/// 仓库里还有一个 310.1/ 目录 —— 那是**上游自己的老版本**，我们不再使用：
+/// 0.3.1 起根目录这一套文件 20 系（SM75）和 30 系（SM86）都能用，出厂 INI
+/// 不需要改任何键（内核族按物理显卡自动选，见上游 README「0.3.1」一节）。
+pub fn proxy_repo_path(proxy: &str) -> &'static str {
     match proxy {
         "winmm.dll" => "alternatives/winmm.dll",
         "dbghelp.dll" => "alternatives/dbghelp.dll",
@@ -68,13 +51,6 @@ pub fn proxy_repo_path(proxy: &str, legacy: bool) -> &'static str {
         "d3d12.dll" => "alternatives/d3d12.dll",
         _ => "version.dll",
     }
-}
-
-/// 要用的 INI 在仓库里的路径。
-/// 两个模式用的是同一份：310.1/ 目录里没有自带 INI，而根目录那份出厂 INI
-/// 本来就会按内嵌运行库的能力自己钳制倍率上限。
-pub fn ini_repo_path(_legacy: bool) -> &'static str {
-    INI_REPO_PATH
 }
 
 pub fn local_name(repo_path: &str) -> String {
@@ -807,117 +783,26 @@ pub fn asset_path(name: &str) -> Result<PathBuf> {
     Ok(util::assets_dir()?.join(name))
 }
 
-// ---------------------------------------------------------------- 按显卡改写 INI
-
-/// 读 INI 里某个键的值（忽略注释行）
-fn ini_get(text: &str, key: &str) -> Option<String> {
-    for line in text.lines() {
-        let t = line.trim();
-        if t.starts_with(';') || t.starts_with('#') {
-            continue;
-        }
-        if let Some(rest) = t.strip_prefix(key) {
-            if let Some(v) = rest.strip_prefix('=') {
-                return Some(v.trim().to_owned());
-            }
-        }
+/// 清空下载记录（返回清掉了几条）。
+///
+/// 一次性迁移用：老版本可以切到 310.1 版，那些用户本地那份 version.dll 是旧的。
+/// 探测落到镜像时指纹不可信，判定会退化成「记录里的字节数 == 远端字节数」——
+/// 旧记录和旧文件对得上，于是**静默跳过下载**，用户以为升级了其实还是老版本。
+/// 所以启动时把记录清一次，逼它重新下一份正确的。
+pub fn clear_download_records() -> usize {
+    let mut st = load_state();
+    let n = st.files.len();
+    if n > 0 {
+        st.files.clear();
+        let _ = save_state(&st);
     }
-    None
+    n
 }
 
-/// 改写 INI 里某个键的值，保留其它内容和注释。找不到该键返回 None。
-fn ini_set(text: &str, key: &str, value: &str) -> Option<String> {
-    let mut found = false;
-    let mut out = String::with_capacity(text.len());
-    for line in text.split_inclusive('\n') {
-        let t = line.trim();
-        if !t.starts_with(';') && !t.starts_with('#') {
-            if let Some(rest) = t.strip_prefix(key) {
-                if rest.strip_prefix('=').is_some() {
-                    out.push_str(&format!("{}={}", key, value));
-                    if line.ends_with('\n') {
-                        out.push('\n');
-                    }
-                    found = true;
-                    continue;
-                }
-            }
-        }
-        out.push_str(line);
-    }
-    if found {
-        Some(out)
-    } else {
-        None
-    }
-}
-
-/// 部署用的 INI 计划
-pub struct IniPlan {
-    /// 实际要部署的文件（可能是改写过的副本）
-    pub path: PathBuf,
-    /// 人类可读的修改说明；空表示和上游原文件一致
-    pub changes: Vec<String>,
-}
-
-/// 按显卡路由准备要部署的 INI。
-/// RTX 30 系保持上游默认；RTX 20 系要把 Router 改成 SM75（只有带 Router 项的老 INI 才需要改）。
-/// 改写后写到单独的文件，上游原文件保持不动（用于比对哈希）。
-pub fn prepare_deploy_ini(route: GpuRoute, gpu_name: Option<&str>) -> Result<IniPlan> {
-    let upstream = util::assets_dir()?.join(INI_REPO_PATH);
-    let dest = util::assets_dir()?.join("dlssg_sm86.deploy.ini");
-    prepare_deploy_ini_files(&upstream, &dest, route, gpu_name)
-}
-
-/// 指定输入 / 输出路径的版本。抽出来是为了自测：测试不该依赖「用户有没有下载过资产」。
-pub fn prepare_deploy_ini_files(
-    upstream: &Path,
-    dest: &Path,
-    route: GpuRoute,
-    gpu_name: Option<&str>,
-) -> Result<IniPlan> {
-    if !upstream.is_file() {
-        bail!("还没有下载 {}, 请先点「下载 / 更新资产」", INI_REPO_PATH);
-    }
-    let text = std::fs::read_to_string(upstream).context("读取 INI 失败")?;
-
-    let mut changes = Vec::new();
-    let out_text = if route == GpuRoute::Sm75 {
-        match ini_set(&text, "Router", "SM75") {
-            Some(patched) => {
-                let before = ini_get(&text, "Router").unwrap_or_default();
-                if before != "SM75" {
-                    changes.push(format!(
-                        "Router：上游默认 {} → 改为 SM75。原因：本机显卡是 {}，属于 Turing / SM75 架构，走 SM86 路由不会生效。",
-                        if before.is_empty() { "未读到".to_owned() } else { before },
-                        gpu_name.unwrap_or("RTX 20 系")
-                    ));
-                }
-                patched
-            }
-            None => {
-                // 上游 0.3.0 的代理版把 INI 精简了，里面已经没有 Router 项
-                // （路由改由 DLL 自己判断）。这里必须原样部署而不是报错 ——
-                // 以前直接失败，等于把 RTX 20 用户挡在部署按钮外面。
-                changes.push(format!(
-                    "这份 INI 里没有 Router 项（上游 0.3.0 精简掉了），本次原样部署。\
-                     你的显卡是 {}：新版上游只面向 RTX 30 系，帧生成可能不生效，\
-                     可以改用 310.1 版（带 SM75 内核）。",
-                    gpu_name.unwrap_or("RTX 20 系")
-                ));
-                text
-            }
-        }
-    } else {
-        text
-    };
-
-    std::fs::write(dest, &out_text).context("写入部署用 INI 失败")?;
-    Ok(IniPlan {
-        path: dest.to_path_buf(),
-        changes,
-    })
-}
+// （这里原来有一段「按显卡改写 INI」的代码：给 RTX 20 系把 Router 改成 SM75。
+//  上游 0.3.1 起不需要了 —— 根目录这一套文件 20/30 系通用，出厂 INI 一个键都不用改，
+//  所以整个子系统（ini_get / ini_set / IniPlan / prepare_deploy_ini*）都删掉了，
+//  部署时直接用资产目录里那份原文件。）
 
 // ---------------------------------------------------------------- 第三方 DLSS 运行库
 //
@@ -1121,7 +1006,7 @@ pub const DLSS_RUNTIME: [(&str, &str, &str, &str, &str); 2] = [
 
 /// 部署时怎么处理两个 DLSS 运行库。
 ///
-/// 上游 0.3.0 的说明里只要求「代理 DLL + INI」（运行库、模型、后端都内嵌在代理里），
+/// 上游（0.3.0 起）的说明里只要求「代理 DLL + INI」（运行库、模型、后端都内嵌在代理里），
 /// 而**很多游戏目录本来就带着自己的** nvngx_dlssg.dll / nvngx_dlss.dll（和游戏自己的
 /// DLSS / Streamline 版本配套）。无条件覆盖它们会出事：实测有用户「工具部署后帧生成
 /// 不生效，手动只放代理 + INI 却正常」。所以规则是：**已有的不动，缺的才补**。

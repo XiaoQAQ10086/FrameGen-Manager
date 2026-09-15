@@ -61,23 +61,22 @@ pub struct Staged {
 }
 
 /// 压缩包里的是「哪一版」—— 只看路径就能看出来，上游的布局是固定的：
-///   * archive/0.2.4/…  —— 老的 native 包（0.2.4），归档用
-///   * 310.1/…          —— 给 RTX 20 系用的那一版
-///   * 其它（根目录）    —— 当前最新版（310.9）
+///   * archive/…        —— 老的归档包（0.1.0 / 0.2.4），归档用
+///   * 310.1/…          —— 上游自己的老版本目录（0.3.1 起 20/30 系都用根目录那份了）
+///   * 其它（根目录）    —— 当前最新版
 ///
-/// 返回 0 = 当前在用的那一版（优先），1 = 另一版，2 = 归档老版。
+/// 返回 0 = 最新版（优先），1 = 老版本目录，2 = 归档老版。
 /// 它只用来在**同名文件有多个副本**时挑哪个，不拿来拒绝任何文件。
-pub fn build_rank(path: &str, legacy: bool) -> u8 {
+pub fn build_rank(path: &str) -> u8 {
     let p = path.replace('\\', "/").to_lowercase();
     if p.contains("archive/") {
-        // 上游源码 zip 里同时有根目录、310.1/ 和 archive/0.2.4/ 三套同名文件，
         // 归档那套一定是最差的（那张证书是老的，别让它顶掉新文件）
         return 2;
     }
-    if p.contains("310.1/") == legacy {
-        0
-    } else {
+    if p.contains("310.1/") {
         1
+    } else {
+        0
     }
 }
 
@@ -85,11 +84,11 @@ pub fn build_rank(path: &str, legacy: bool) -> u8 {
 pub fn build_label(path: &str) -> &'static str {
     let p = path.replace('\\', "/").to_lowercase();
     if p.contains("archive/") {
-        "归档的老版 native 包（0.2.4）"
+        "归档的老包"
     } else if p.contains("310.1/") {
-        "310.1 版（给 RTX 20 系）"
+        "上游的 310.1 老版本目录"
     } else {
-        "当前最新版（310.9）"
+        "当前最新版"
     }
 }
 
@@ -193,11 +192,10 @@ fn classify(kind: Kind, name: String, tmp: PathBuf, from: String) -> Result<Stag
 /// 从用户选的一个或多个 zip 里找出所有认得的文件，解到 work_dir 并逐个校验。
 ///
 /// 只支持 zip：以前也支持直接选一个解压好的文件夹，那个入口已经删掉。
-/// legacy = 当前在用的是不是 310.1 版；上游源码 zip 里同时有根目录、310.1/ 和 archive/
-/// 三套同名文件，靠它决定优先取哪一套。
+/// 上游源码 zip 里同时有根目录、310.1/ 和 archive/ 三套同名文件，
+/// 按路径排优先级（见 build_rank）：根目录那份最新，优先取它。
 pub fn stage(
     paths: &[PathBuf],
-    legacy: bool,
     work_dir: &Path,
     cancel: &AtomicBool,
     // 进度回调：(给用户看的一句话, 0.0~1.0 的完成度)。以前没有完成度，
@@ -256,7 +254,7 @@ pub fn stage(
                 continue;
             }
             match classify(kind, base, tmp.clone(), pack.clone()) {
-                Ok(st) => cands.push((build_rank(&meta.name, legacy), meta.name.clone(), st)),
+                Ok(st) => cands.push((build_rank(&meta.name), meta.name.clone(), st)),
                 Err(e) => {
                     let _ = std::fs::remove_file(&tmp);
                     progress(format!("{} 处理失败，已跳过：{e}", meta.name), frac);
@@ -300,10 +298,9 @@ pub fn stage(
             // 所以降级成「让用户确认一句」，并把原因说清楚
             st.trusted = false;
             st.note = format!(
-                "{}。注意：这个文件来自{}，而你当前用的是{} —— 继续导入会用它覆盖资产里的同名文件",
+                "{}。注意：这个文件来自{}，而不是最新版 —— 继续导入会用它覆盖资产里的同名文件",
                 st.note,
-                build_label(&path),
-                if legacy { "310.1 版" } else { "当前最新版（310.9）" }
+                build_label(&path)
             );
         }
         out.push(st);

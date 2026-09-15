@@ -118,29 +118,38 @@ archive/0.2.4/，仓库根目录现在就是新版。这一版变了五处，每
 | INI | 有 Router / KernelImage / HardwareBilinear | 精简成 5 段约 2 KB，没有 Router | SM75 改写抛错，RTX 20 用户部署直接失败 |
 | README 版本号 | "# DLSSG Native 0.2.4" | "# DLSSG for SM86（Proxy）- 0.3.0 版本" | 界面「上游版本」显示未知 |
 
-因此代码里现在有两套「资产版本」：
+### 0.3.1：20 系和 30 系共用同一套文件（因此删掉了「版本切换」）
 
-* **最新版**（默认）：仓库根目录 + alternatives/，后端是 310.9，面向 RTX 30 系。
-* **310.1 版**：310.1/ + 310.1/alternatives/，后端是 310.1 —— 二进制里带
-dlssg-310.1-d3d12-sm86+sm75、sm75_route_limits、sm75_slots，即**带 SM75 内核**，
-给 RTX 20 系用。INI 仍然用根目录那份（出厂 INI 自己会按内嵌运行库钳倍率：
-310.9 钳到 6X、310.1 钳到 4X）。入口是「部署」卡片里给 SM75 机器显示的按钮，
-状态存在配置的 `legacy_3101`。
+上游 0.3.1（2026-09-15）把 RTX 20 系（Turing / SM75）救回来了：根目录那份 `version.dll`
++ 出厂 `dlssg_sm86.ini` **两种卡都能用，一个键都不用改**（内核族按物理显卡自动选）。
+上游 README 也写明：0.3.0 在任何 RTX 20 上都开不了帧生成（它向 NGX 报告的架构不是真实
+架构，核心直接拒绝，issue #491 / #492）。
 
-判断依据（翻的是程序本体里的字符串，不是猜的）：根目录那份写着
-"The 310.9 backend has no SM75 kernel family; use Router=Auto or SM86"，
-310.1 那份没有这句话，而且文件大 1.4 MB（正好多一个内核族）。
+于是本工具**删掉**了这些（老代码里那套「给 20 系切 310.1 版」的做法全部作废）：
 
-**GTX 16 系单独成一条路（`GpuRoute::Gtx16`）并且禁止部署**：1630 / 1650 / 1660 和
-RTX 20 系同为 Turing，但**没有 Tensor Core**，DLSS 帧生成在硬件上就跑不了 ——
-换 310.1 版也没用。所以它**不能**落到 `GpuRoute::Sm75`：那会给出「改用 310.1 版」
-这个根本无效的建议。`scan::classify_gpu()` 里 GTX 16 的判断必须排在 RTX 20 前面。
+* 配置里的 `legacy_3101` 开关、`310.1/` 那套下载路径（`LEGACY_PREFIX`、
+  `proxy_repo_path` 的第二个参数、`ini_repo_path`）
+* 「部署」卡片里给 SM75 机器显示的「改用 310.1 版」按钮，以及 `GpuRoute::Sm75` 的特殊处理
+  （这条路由还在，只用来显示「SM75 路由」和在闸门上区分型号）
+* **按显卡改写 INI 的整个子系统**（`ini_get` / `ini_set` / `IniPlan` / `prepare_deploy_ini*`）：
+  出厂 INI 一个键都不用改，部署时直接复制资产里那份原文件
+* 导入压缩包时「按在用的版本挑哪一套同名文件」：现在只按路径排序，
+  根目录最新版（0）> `310.1/` 老目录（1）> `archive/` 归档包（2），见 `importer::build_rank`
 
-路径由 `update::proxy_repo_path(proxy, legacy)` 和 `update::ini_repo_path(legacy)` 统一决定，
-入口名单只有一份 `scan::PROXY_ALL`（`PROXY_PRIORITY` / `PROXY_HISTORIC` 是它的两个视图，
-  两个版本的目录结构相同）—— 要改只动这几处，
-别再散落硬编码（0.7.0 那种写死名单的写法正是这次集体 404 的原因）。
-老名字（winhttp.dll）留在 `scan::PROXY_HISTORIC` 里，只用于「这算不算代理入口」的判断。
+**一次性迁移**：曾经切到 310.1 版的用户，本地那份 `version.dll` 是旧的。探测落到镜像时
+指纹不可信，「已是最新」的判定会退化成「比字节数」，旧文件正好和旧记录对得上 → 静默跳过
+下载。所以启动时读一次老配置（`util::config_had_legacy_3101()`），读到就
+`update::clear_download_records()` 清空下载记录，逼它重下一份正确的。
+
+路径统一由 `update::proxy_repo_path(proxy)` 决定，入口名单只有一份 `scan::PROXY_ALL`
+（`PROXY_PRIORITY` / `PROXY_HISTORIC` 是它的两个视图）—— 要改只动这几处，别再散落硬编码
+（0.7.0 那种写死名单的写法正是那次集体 404 的原因）。老名字（winhttp.dll）留在
+`scan::PROXY_HISTORIC` 里，只用于「这算不算代理入口」的判断。
+
+**GTX 16 系仍然单独成一条路（`GpuRoute::Gtx16`）并且禁止部署**：1630 / 1650 / 1660 同样
+没有 Tensor Core，DLSS 帧生成在硬件上就跑不了，换哪个版本都没用。它**不能**落到
+`GpuRoute::Sm75`，否则界面会给出一条根本无效的建议。`scan::classify_gpu()` 里 GTX 16 的
+判断必须排在 RTX 20 前面。
 
 版本号解析（`update::extract_version`）先按 "Native " 锚点找，找不到再取首行第一个
 「带小数点的数字」，两种写法都能认；`--selftest` 里有这两种格式的断言。
@@ -159,7 +168,7 @@ RTX 20 系同为 Turing，但**没有 Tensor Core**，DLSS 帧生成在硬件上
 2. 排除被第三方占用的入口
 3. 按导入表匹配，优先级见 scan::PROXY_PRIORITY：
    version -> winmm -> dbghelp -> dinput8 -> dxgi -> d3d12
-   （310.1 版的目录结构相同，所以两个版本共用这一份清单）
+   （0.3.1 起 20 / 30 系共用这一份清单，不再区分版本）
 4. 都判不出来就用上游默认 version.dll，并在界面上明确说明「未能自动判定」
 
 PE 解析是**随机读取**的：先读头部拿节表，再按节表把 RVA 换算成文件偏移 seek 过去读。
@@ -314,7 +323,7 @@ game_library.json（和配置文件放一起，便携版就在 exe 旁边）：�
 
 ### 手动导入（网盘救急）与严格签名校验
 
-**为什么要有**：镜像和 raw 全慢到不可用时（实测有 0.02 MB/s 的），程序自己下不动 84 MB 资产。
+**为什么要有**：镜像和 raw 全慢到不可用时（实测有 0.02 MB/s 的），程序自己下不动约 95 MB 资产。
 所以给一条绕开网络的路：用户拿 zip，程序负责解压 + 校验 + 落位。
 
 * `importer::stage()` —— 用 `update::zip_list()` / `zip_extract_to()` **流式**解

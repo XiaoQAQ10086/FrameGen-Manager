@@ -200,12 +200,7 @@ fn main() -> eframe::Result<()> {
         let work = std::env::temp_dir().join("fgm-import-selftest");
         let _ = std::fs::remove_dir_all(&work);
         let cancel = AtomicBool::new(false);
-        let legacy = util::load_config().legacy_3101;
-        println!(
-            "  当前在用的版本 = {}",
-            if legacy { "310.1 版（RTX 20 系）" } else { "最新版（310.9）" }
-        );
-        match importer::stage(&paths, legacy, &work, &cancel, |m, f| {
+        match importer::stage(&paths, &work, &cancel, |m, f| {
             println!("  [{:>3.0}%] {m}", f * 100.0)
         }) {
             Ok((items, notes)) => {
@@ -694,10 +689,8 @@ fn speedtest() {
             return;
         }
     };
-    // 跟随配置里选的版本，命令行才能把两种版本都端到端跑一遍
-    let legacy = util::load_config().legacy_3101;
-    let repo_path = update::proxy_repo_path("version.dll", legacy);
-    println!("  资产版本 = {}", if legacy { "310.1（RTX 20 系）" } else { "最新版 310.9" });
+    // 20 系和 30 系用的是同一套文件（上游 0.3.1 起），没有第二个版本要跑
+    let repo_path = update::proxy_repo_path("version.dll");
     let remote = match update::probe_remote(&c, repo_path) {
         Ok(r) => r,
         Err(e) => {
@@ -865,9 +858,9 @@ fn gpu_gate(route: scan::GpuRoute) -> Option<&'static str> {
             Some("RTX 40/50 系原生支持 DLSS 帧生成，不需要装本 Mod")
         }
         // GTX 16 系和 RTX 20 系同为 Turing，但没有 Tensor Core ——
-        // DLSS 帧生成在硬件上就跑不了，换 310.1 版也没用，所以不是「提醒」而是禁止。
+        // DLSS 帧生成在硬件上就跑不了，换哪个版本都没用，所以不是「提醒」而是禁止。
         scan::GpuRoute::Gtx16 => {
-            Some("GTX 16 系没有 Tensor Core，DLSS 帧生成在硬件上就不支持（换成 310.1 版也没用）")
+            Some("GTX 16 系没有 Tensor Core，DLSS 帧生成在硬件上就不支持（换哪个版本都没用）")
         }
         _ => None,
     }
@@ -1184,21 +1177,13 @@ fn selftest() {
             println!("  README 版本: {:?}", update::fetch_version(&c));
             let st = update::load_state();
             // 和界面里一样：每个文件发一次 HEAD 拿 ETag，一次 API 都不调。
-            // 名单跟着「在用的那一版」走 —— 上游 0.3.0 把 altnative/ 改成了 alternatives/。
-            let legacy = util::load_config().legacy_3101;
-            println!(
-                "  资产版本: {}",
-                if legacy {
-                    "310.1 版（给 RTX 20 系）"
-                } else {
-                    "最新版（上游 310.9 代理包）"
-                }
-            );
+            // 名单：6 个代理入口 + 出厂 INI，都在仓库根目录那一套里（20/30 系通用）。
+            // 上游 0.3.0 把 altnative/ 改成了 alternatives/，所以路径都从这里取。
             let mut specs: Vec<String> = scan::PROXY_PRIORITY
                 .iter()
-                .map(|p| update::proxy_repo_path(p, legacy).to_owned())
+                .map(|p| update::proxy_repo_path(p).to_owned())
                 .collect();
-            specs.push(update::ini_repo_path(legacy).to_owned());
+            specs.push(update::INI_REPO_PATH.to_owned());
             println!("  逐个 HEAD 取内容指纹（0 次 API 调用）：");
             // 这一段以前要 15 秒以上：release 直链是 github.com，第一次探测会先干等
             // 连接超时才轮到镜像。现在直链探测改镜像优先，连接超时也从 15s 收到 8s。
@@ -1310,6 +1295,92 @@ fn selftest() {
         ),
     }
 
+    println!("\n--- 资产清单（启动就有，不联网）---");
+    let local_rows = App::local_asset_rows();
+    ck(
+        &mut fails,
+        local_rows.len() == 9,
+        "清单 9 行：6 个代理入口 + INI + 2 个运行库",
+    );
+    ck(
+        &mut fails,
+        local_rows.iter().filter(|r| r.group == "核心 Mod").count() == 7
+            && local_rows.iter().filter(|r| r.group == "DLSS 运行库").count() == 2,
+        "清单分组：核心 Mod 7 行、运行库 2 行",
+    );
+    ck(
+        &mut fails,
+        local_rows.iter().all(|r| r.remote_etag.is_none()),
+        "本地清单不带上游指纹（不会误报「有更新」）",
+    );
+    ck(
+        &mut fails,
+        local_rows.iter().filter(|r| r.runtime_file.is_some()).count() == 2,
+        "两个运行库走签名判断（runtime_file 标记）",
+    );
+
+    // 资产行状态规则（用户报过两条：导入后仍显示「有更新」、徽章版本号不更新）
+    let row_of = |label: &str, remote_bytes: u64, checked: bool| AssetRow {
+        group: "核心 Mod",
+        label: label.to_owned(),
+        detail: String::new(),
+        bytes: remote_bytes,
+        remote_etag: Some("deadbeef".to_owned()),
+        remote_etag_trusted: true,
+        runtime_file: None,
+        remote_checked: checked,
+    };
+    let rec_of = |bytes: u64, imported: bool, etag: &str| update::LocalFile {
+        blob_sha: String::new(),
+        etag: etag.to_owned(),
+        sha256: String::new(),
+        bytes,
+        downloaded_at: String::new(),
+        imported,
+    };
+    ck(
+        &mut fails,
+        App::asset_state_of(
+            Some(100),
+            Some(&rec_of(100, true, "")),
+            &row_of("version.dll", 100, true),
+        ) == AssetState::Ready,
+        "手动导入 + 和上游一样大 → 已就绪（不再误报「有更新」）",
+    );
+    ck(
+        &mut fails,
+        App::asset_state_of(
+            Some(90),
+            Some(&rec_of(90, true, "")),
+            &row_of("version.dll", 100, true),
+        ) == AssetState::Outdated,
+        "手动导入 + 和上游大小不同 → 有更新（导入了旧版就该提示重下）",
+    );
+    ck(
+        &mut fails,
+        App::asset_state_of(Some(100), None, &row_of("version.dll", 100, true))
+            == AssetState::Outdated,
+        "文件在但没有下载记录 → 有更新（按需要下载处理）",
+    );
+    ck(
+        &mut fails,
+        App::asset_state_of(
+            None,
+            Some(&rec_of(100, true, "")),
+            &row_of("version.dll", 100, true),
+        ) == AssetState::Missing,
+        "文件不在 → 未下载",
+    );
+    ck(
+        &mut fails,
+        App::asset_state_of(
+            Some(100),
+            Some(&rec_of(100, false, "deadbeef")),
+            &row_of("version.dll", 100, true),
+        ) == AssetState::Ready,
+        "下载来的文件 + 指纹一致 → 已就绪",
+    );
+
     println!("\n--- 显卡路由（哪张卡走哪条路）---");
     for (name, want) in [
         ("NVIDIA GeForce RTX 3050", scan::GpuRoute::Sm86),
@@ -1330,7 +1401,7 @@ fn selftest() {
         );
     }
     // GTX 16 系必须被挡在部署外面，而且绝不能和 RTX 20 系混成一条路 ——
-    // 混了的话界面会给出「改用 310.1 版」这个根本无效的建议。
+    // 混了的话界面会给出一条根本无效的建议。
     ck(
         &mut fails,
         scan::classify_gpu("NVIDIA GeForce GTX 1660 Ti") == scan::GpuRoute::Gtx16,
@@ -1377,36 +1448,27 @@ fn selftest() {
         );
     }
 
-    println!("\n--- 仓库路径（最新版 / 给 RTX 20 系的 310.1 版）---");
+    println!("\n--- 仓库路径（20/30 系同一套文件）---");
     ck(
         &mut fails,
-        update::proxy_repo_path("version.dll", false) == "version.dll",
-        "新版 version.dll 在仓库根目录",
+        update::proxy_repo_path("version.dll") == "version.dll",
+        "默认入口 version.dll 在仓库根目录",
     );
     ck(
         &mut fails,
-        update::proxy_repo_path("winmm.dll", false) == "alternatives/winmm.dll",
-        "新版备用入口在 alternatives/（以前叫 altnative/）",
+        update::proxy_repo_path("winmm.dll") == "alternatives/winmm.dll",
+        "备用入口在 alternatives/（以前叫 altnative/）",
     );
     ck(
         &mut fails,
-        update::proxy_repo_path("dbghelp.dll", false) == "alternatives/dbghelp.dll",
-        "新版新增的 dbghelp 也能找到",
+        update::proxy_repo_path("dbghelp.dll") == "alternatives/dbghelp.dll"
+            && update::proxy_repo_path("d3d12.dll") == "alternatives/d3d12.dll",
+        "0.3.0 新增的 dbghelp / d3d12 也能找到",
     );
     ck(
         &mut fails,
-        update::proxy_repo_path("version.dll", true) == "310.1/version.dll",
-        "RTX 20 系用的 310.1 版在 310.1/ 下",
-    );
-    ck(
-        &mut fails,
-        update::proxy_repo_path("dbghelp.dll", true) == "310.1/alternatives/dbghelp.dll",
-        "310.1 版的备用入口在 310.1/alternatives/",
-    );
-    ck(
-        &mut fails,
-        update::ini_repo_path(true) == "dlssg_sm86.ini",
-        "310.1 版也配根目录那份出厂 INI",
+        update::INI_REPO_PATH == "dlssg_sm86.ini",
+        "配置就是根目录那份出厂 INI（20/30 系通用，不需要改写）",
     );
     ck(
         &mut fails,
@@ -1424,79 +1486,8 @@ fn selftest() {
         "DLSS 运行库不算代理入口",
     );
 
-    println!("\n--- INI 改写（SM75 路由）---");
-    // 用临时文件造两种 INI：带 Router 的老版、没有 Router 的新版。
-    // 不依赖 assets 目录里有没有下载过东西，结果可重复。
-    {
-        let dir = std::env::temp_dir().join("fgm-ini-selftest");
-        let _ = std::fs::remove_dir_all(&dir);
-        let _ = std::fs::create_dir_all(&dir);
-
-        let old_ini = dir.join("old.ini");
-        std::fs::write(
-            &old_ini,
-            "; Native 0.2.4\n[Compatibility]\nRouter=SM86\nKernelImage=PTX\n",
-        )
-        .unwrap();
-        let old_out = dir.join("old-out.ini");
-        let ok = update::prepare_deploy_ini_files(
-            &old_ini,
-            &old_out,
-            scan::GpuRoute::Sm75,
-            Some("NVIDIA GeForce RTX 2080"),
-        );
-        let patched = ok
-            .as_ref()
-            .ok()
-            .and_then(|_| std::fs::read_to_string(&old_out).ok())
-            .unwrap_or_default();
-        ck(
-            &mut fails,
-            patched.contains("Router=SM75"),
-            "带 Router 的老 INI：会被改成 SM75",
-        );
-        if let Ok(p) = &ok {
-            for c in &p.changes {
-                println!("  改动说明: {c}");
-            }
-        }
-
-        // 上游 0.3.0 的 INI 里已经没有 Router 项了（路由改由 DLL 自己判断）。
-        // 以前这里直接报错并中止部署，等于把 RTX 20 用户挡在门外。
-        let new_ini = dir.join("new.ini");
-        std::fs::write(&new_ini, "; slim 0.3.0\n[Compatibility]\nPreset=Auto\n").unwrap();
-        let new_out = dir.join("new-out.ini");
-        let r = update::prepare_deploy_ini_files(
-            &new_ini,
-            &new_out,
-            scan::GpuRoute::Sm75,
-            Some("NVIDIA GeForce RTX 2080"),
-        );
-        ck(
-            &mut fails,
-            r.is_ok(),
-            "没有 Router 的 INI：SM75 部署不再失败（原样部署）",
-        );
-        ck(
-            &mut fails,
-            std::fs::read_to_string(&new_out)
-                .map(|t| t.contains("Preset=Auto"))
-                .unwrap_or(false),
-            "原样部署的文件内容和上游一致",
-        );
-        if let Ok(p) = &r {
-            for c in &p.changes {
-                println!("  改动说明: {c}");
-            }
-        }
-
-        // 顺带看看真实资产目录里的那份（只显示，不做断言）
-        match update::prepare_deploy_ini(scan::GpuRoute::Sm75, Some("NVIDIA GeForce RTX 2080")) {
-            Ok(p) => println!("  真实 assets 里的 INI：生成 {}", p.path.display()),
-            Err(e) => println!("  真实 assets 里没有可用的 INI：{e}"),
-        }
-        let _ = std::fs::remove_dir_all(&dir);
-    }
+    // （这里原来有一组「SM75 改写 INI」的自测。上游 0.3.1 起 20/30 系共用同一份
+    //  出厂 INI、一个键都不用改，所以整个改写子系统连同这些断言都删掉了。）
 
     println!("\n--- 部署时的 DLSS 运行库处理（已有的不覆盖）---");
     {
@@ -1671,21 +1662,20 @@ fn selftest() {
             update::normalize_source("随便写点什么").is_none(),
             "不像网址的输入被当成「自动」",
         );
-        // 上游源码 zip 里同时有根目录、310.1/、archive/0.2.4/ 三套同名文件：
-        // 同名时只留当前在用的那一版（0 最好），否则用户会被三份一样的东西搞晕，
+        // 上游源码 zip 里同时有根目录、310.1/、archive/ 三套同名文件：
+        // 同名时只留最新那一套（0 最好），否则用户会被几份一样的东西搞晕，
         // 而且老版文件会顶掉新版（这正是用户遇到的「官方文件被提示非法」）。
         ck(
             &mut fails,
-            importer::build_rank("dlssg_sm86.ini", false) == 0
-                && importer::build_rank("310.1/version.dll", false) == 1
-                && importer::build_rank("archive/0.2.4/version.dll", false) == 2,
-            "最新版模式：根目录优先 > 310.1/ > 归档老版",
+            importer::build_rank("dlssg_sm86.ini") == 0
+                && importer::build_rank("310.1/version.dll") == 1
+                && importer::build_rank("archive/0.2.4/version.dll") == 2,
+            "导入排序：根目录最新版 > 310.1/ 老目录 > 归档老包",
         );
         ck(
             &mut fails,
-            importer::build_rank("310.1/version.dll", true) == 0
-                && importer::build_rank("version.dll", true) == 1,
-            "310.1 模式：310.1/ 里的优先",
+            importer::build_rank("archive/0.1.0/version.dll") == 2,
+            "archive/0.1.0 同样算归档老包",
         );
         ck(
             &mut fails,
@@ -2566,6 +2556,9 @@ struct AssetRow {
     remote_etag_trusted: bool,
     /// DLSS 运行库：本地文件名，靠签名判断在不在
     runtime_file: Option<String>,
+    /// 这一行是不是带着「检查更新」拿到的**上游**信息。
+    /// false = 只有本地信息（启动时那份），此时大小只在下面的说明里写一次。
+    remote_checked: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -2675,9 +2668,6 @@ struct App {
     spoof_pending: Option<gpu::Op>,
     /// 驱动过旧时点「部署」需要再确认一次
     confirm_old_driver: bool,
-    /// 游戏目录里有「本项目的另一个代理入口」时，先弹窗问一句。
-    /// Some 里是要问用户是否移除的那些文件名。
-    asked_extra_proxies: Option<Vec<String>>,
 
     // ---- 反作弊：不再直接拦死，改成弹窗问一句（用户明确要求"可以直接继续"）
     /// Some 时显示确认弹窗，里面是检出明细
@@ -2685,7 +2675,6 @@ struct App {
     /// 用户这次选择了「仍要部署」。只对本次生效，部署完就清掉。
     allow_kernel_ac: bool,
     /// 用户在「另一个代理」弹窗里定下来的选择，等真正部署时用
-    deploy_extras: Vec<String>,
 
     // ---- 硬件加速 GPU 计划（DLSS 帧生成的系统前提，只读 + 跳转，绝不写注册表）
     hags: gpu::HagsState,
@@ -2702,8 +2691,6 @@ struct App {
     cancel: Option<Arc<AtomicBool>>,
     use_backup: bool,
     backup_prefix: String,
-    /// 是否使用 310.1 版程序本体（310.1/）—— RTX 20 系（SM75）用得上
-    legacy_3101: bool,
     download_failed: bool,
     /// 测速结果，界面按它列候选源
     speed_results: Vec<update::SourceSpeed>,
@@ -2713,8 +2700,6 @@ struct App {
     dl_total: u64,
     dl_done: u64,
 
-    // ---- 本次部署对 INI 的改动说明
-    ini_changes: Vec<String>,
     /// 本次部署「跳过 / 说明」的几条（比如游戏目录已有运行库，用游戏自带那份）
     deploy_notes: Vec<String>,
 
@@ -2749,6 +2734,19 @@ impl App {
         if let Some(m) = migrated {
             boot_notes.push(m);
         }
+        // 老版本可以切到上游的 310.1 版；0.3.1 起 20/30 系用同一套文件，不再区分。
+        // 曾经切过的用户本地那份是旧的：探测落到镜像时指纹不可信，「已是最新」的判定
+        // 会退化成比字节数，旧文件正好和旧记录对得上 → 静默跳过下载。清一次记录。
+        if util::config_had_legacy_3101() {
+            let n = update::clear_download_records();
+            boot_notes.push(format!(
+                "已改为统一的资产版本（上游 0.3.1 起 20 / 30 系同一套文件），清掉 {n} 条旧下载记录：请点「下载 / 更新资产」重新下一次"
+            ));
+            // 把配置里那行旧字段顺手写掉（新结构里已经没有 legacy_3101 了）
+            if let Err(e) = util::save_config(&cfg) {
+                boot_notes.push(format!("保存配置失败: {e}"));
+            }
+        }
         let boot_status = if boot_notes.is_empty() {
             "就绪".to_owned()
         } else {
@@ -2779,7 +2777,11 @@ impl App {
             flash_until: None,
             deploy_state: deploy::DeployState::NotDeployed,
             update_state: update::load_state(),
-            update_summary: None,
+            // 清单启动就有（只读本地文件、不联网）：文件状态不用等「检查更新」才看得见
+            update_summary: Some(UpdateSummary {
+                version: None,
+                rows: App::local_asset_rows(),
+            }),
             status: boot_status,
             progress: None,
             busy: false,
@@ -2799,11 +2801,9 @@ impl App {
             spoof_ack: false,
             spoof_pending: None,
             confirm_old_driver: false,
-            asked_extra_proxies: None,
-            kernel_ac_pending: None,
+                kernel_ac_pending: None,
             allow_kernel_ac: false,
-            deploy_extras: Vec::new(),
-            hags_fake: match std::env::var("DLSSG_FAKE_HAGS").ok().as_deref() {
+                hags_fake: match std::env::var("DLSSG_FAKE_HAGS").ok().as_deref() {
                 Some("on") | Some("2") => Some(gpu::HagsState::Enabled),
                 Some("off") | Some("1") => Some(gpu::HagsState::Disabled),
                 Some("unknown") | Some("0") => Some(gpu::HagsState::Unknown),
@@ -2829,14 +2829,12 @@ impl App {
             } else {
                 cfg.backup_prefix
             },
-            legacy_3101: cfg.legacy_3101,
             download_failed: false,
             speed_results: Vec::new(),
             speed_testing: false,
             dl_started: None,
             dl_total: 0,
             dl_done: 0,
-            ini_changes: Vec::new(),
             deploy_notes: Vec::new(),
             icon_textures: HashMap::new(),
         };
@@ -3061,6 +3059,88 @@ impl App {
         });
     }
 
+    /// 启动时用的「只有本地信息」的资产清单：**一个网络请求都不发**。
+    ///
+    /// 文件名和大小本地就能拿到，所以清单不必等「检查更新」——那一步只是去上游拿
+    /// 内容指纹，用来判断「有没有更新」。这里生成的行和检查更新后的行一一对应
+    /// （6 个代理入口 + INI + 2 个运行库），只把每行的说明换成「本地 X MB」。
+    ///
+    /// 说明：6 个代理入口是**六选一**（真正部署的是「部署」卡片里选中的那个），
+    /// 但清单照旧全列出来 —— 用户能看到备用入口在不在本地。
+    fn local_asset_rows() -> Vec<AssetRow> {
+        let assets = util::assets_dir().ok();
+        let local_size = |name: &str| -> u64 {
+            assets
+                .as_deref()
+                .map(|d| d.join(name))
+                .and_then(|p| std::fs::metadata(p).ok())
+                .map(|m| m.len())
+                .unwrap_or(0)
+        };
+        let mut rows: Vec<AssetRow> = Vec::new();
+        let mut specs: Vec<String> = scan::PROXY_PRIORITY
+            .iter()
+            .map(|p| update::proxy_repo_path(p).to_owned())
+            .collect();
+        specs.push(update::INI_REPO_PATH.to_owned());
+        for path in specs {
+            let label = update::local_name(&path);
+            let size = local_size(&label);
+            rows.push(AssetRow {
+                group: "核心 Mod",
+                detail: if size > 0 {
+                    format!("本地 {}", util::format_bytes(size))
+                } else {
+                    String::new()
+                },
+                label,
+                bytes: size,
+                remote_etag: None,
+                remote_etag_trusted: false,
+                runtime_file: None,
+                remote_checked: false,
+            });
+        }
+        for (_prefix, _tag, _zip, dll_name, _label) in update::DLSS_RUNTIME {
+            let size = local_size(dll_name);
+            rows.push(AssetRow {
+                group: "DLSS 运行库",
+                detail: if size > 0 {
+                    format!("本地 {}", util::format_bytes(size))
+                } else {
+                    String::new()
+                },
+                label: dll_name.to_owned(),
+                bytes: size,
+                remote_etag: None,
+                remote_etag_trusted: false,
+                runtime_file: Some(dll_name.to_owned()),
+                remote_checked: false,
+            });
+        }
+        rows
+    }
+
+    /// 清单现在是不是「只有本地信息」的那一份。
+    /// 检查更新过的代理 / INI 行都带着上游指纹，靠这个区分。
+    fn rows_are_local_only(&self) -> bool {
+        self.update_summary
+            .as_ref()
+            .map(|s| s.rows.iter().all(|r| r.remote_etag.is_none()))
+            .unwrap_or(true)
+    }
+
+    /// 文件变了（下载完 / 导入完 / 切版本 / 换资产目录）之后，刷新清单里的本地大小。
+    /// **已经做过检查更新的那份不动** —— 它带着上游指纹，重建成本地版会把「有更新」抹掉。
+    fn refresh_asset_rows(&mut self) {
+        if self.rows_are_local_only() {
+            self.update_summary = Some(UpdateSummary {
+                version: None,
+                rows: App::local_asset_rows(),
+            });
+        }
+    }
+
     /// 资产当前状态。**只看本地文件 + 下载记录，不查网络。**
     ///
     /// assets 目录由调用方解析一次传进来，避免每一行都去读配置文件。
@@ -3069,12 +3149,11 @@ impl App {
     /// update_state.json 里的下载记录，用户把资产文件删光之后，
     /// 界面照样显示「已就绪」—— 记录还在，文件早就没了。
     fn asset_state(&self, assets: Option<&Path>, row: &AssetRow) -> AssetState {
-        let local = assets.map(|d| d.join(&row.label));
-
+        // DLSS 运行库单独判：靠 NVIDIA 签名，不看下载记录
         if row.runtime_file.is_some() {
-            let ok = local
-                .as_deref()
-                .map(|p| p.is_file() && scan::identify_dll(p) == scan::FileIdentity::Nvidia)
+            let ok = assets
+                .map(|d| d.join(&row.label))
+                .map(|p| p.is_file() && scan::identify_dll(&p) == scan::FileIdentity::Nvidia)
                 .unwrap_or(false);
             return if ok {
                 AssetState::Ready
@@ -3082,21 +3161,43 @@ impl App {
                 AssetState::Missing
             };
         }
+        // 其余的行：把「本地文件多大」取出来，交给下面那个纯函数判
+        let local_size = assets
+            .map(|d| d.join(&row.label))
+            .filter(|p| p.is_file())
+            .and_then(|p| std::fs::metadata(p).ok())
+            .map(|m| m.len());
+        App::asset_state_of(local_size, self.update_state.files.get(&row.label), row)
+    }
 
-        let Some(p) = local else {
+    /// 一行资产的状态规则（纯函数，方便自测 —— 「导入的文件不该被误报有更新」就是一条规则）。
+    ///
+    /// local_size = None 表示文件不在。
+    fn asset_state_of(
+        local_size: Option<u64>,
+        rec: Option<&update::LocalFile>,
+        row: &AssetRow,
+    ) -> AssetState {
+        let Some(size) = local_size else {
             return AssetState::Missing;
         };
-        if !p.is_file() {
-            return AssetState::Missing;
-        }
-        let Some(rec) = self.update_state.files.get(&row.label) else {
+        let Some(rec) = rec else {
             // 文件在，但不是本工具下的（用户自己拷进来的）：版本说不清，按需要下载处理
             return AssetState::Outdated;
         };
         // 大小和下载记录对不上 = 被改过，或者当初没下完
-        let size = std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0);
         if rec.bytes > 0 && size != rec.bytes {
             return AssetState::Outdated;
+        }
+        // **手动导入的文件没有官方指纹**（etag 是空的）—— 拿它去比指纹只会永远报
+        // 「有更新」，用户明明导入的就是最新版（实测踩到过）。
+        // 这里改成比大小：做过「检查更新」就知道上游多大，一样 → 就绪；
+        // 不一样（比如导入了旧版）→ 有更新，提示该重下。没查过上游大小就按就绪算。
+        if rec.imported || rec.etag.is_empty() {
+            if row.remote_checked && row.bytes > 0 && size != row.bytes {
+                return AssetState::Outdated;
+            }
+            return AssetState::Ready;
         }
         // 指纹只有官方源给的才可信。探测落到镜像时指纹和官方对不上，
         // 拿它判「有更新」会导致同一个文件每次都被标成需要下载 —— 也就是
@@ -3164,14 +3265,6 @@ impl App {
         s.push_str(&format!(
             "下载源: 指定={:?}（下载中不按速度换源，慢源也让它下完）\n",
             self.backup_prefix
-        ));
-        s.push_str(&format!(
-            "资产版本: {}\n",
-            if self.legacy_3101 {
-                "310.1 版（给 RTX 20 系，带 SM75 内核）"
-            } else {
-                "最新版（上游 310.9 代理包）"
-            }
         ));
         s.push_str("\n--- 最近的操作日志 ---\n");
         let tail: Vec<&String> = self.logs.iter().rev().take(30).collect();
@@ -3285,6 +3378,7 @@ impl App {
                 // 「…正在找需要的 ...」，看着像还在读包（用户报的就是这个）
                 self.finish_busy("导入完成");
                 self.update_state = update::load_state();
+                self.refresh_asset_rows();
                 for line in report.lines() {
                     if !line.trim().is_empty() {
                         self.note(line.to_owned());
@@ -3294,8 +3388,20 @@ impl App {
             }
             Msg::UpdateChecked(s) => {
                 self.status = "更新检查完成".to_owned();
-                self.update_summary = Some(s);
+                // 先从磁盘读一遍（可能被别的进程改过），再把这次检查到的上游版本写回缓存：
+                // 顶部那个「上游 x.y.z」徽章读的就是 update_state.json 里的版本，
+                // 不写回去它就要等到点一次「下载 / 更新资产」才更新 ——
+                // 用户实测「卡片显示 0.3.1、徽章还是 0.3.0」就是这么来的。
                 self.update_state = update::load_state();
+                if let Some(v) = s.version.clone() {
+                    if self.update_state.version.as_deref() != Some(v.as_str()) {
+                        self.update_state.version = Some(v);
+                        if let Err(e) = update::save_state(&self.update_state) {
+                            self.note(format!("保存上游版本号失败: {e}"));
+                        }
+                    }
+                }
+                self.update_summary = Some(s);
                 self.busy = false;
             }
             Msg::Progress(text, f, total) => {
@@ -3351,13 +3457,13 @@ impl App {
                 self.download_failed = false;
                 self.dl_started = None;
                 self.refresh();
+                self.refresh_asset_rows();
                 // 部署完，如果硬件加速明确是关着的，提示一次（「未知」不提示，
                 // 否则 Win11 那些本来就开着的用户每次部署都会被骚扰）
                 if self.deploy_in_flight {
                     self.deploy_in_flight = false;
                     // 只对本次生效的开关，部署完就复位
                     self.allow_kernel_ac = false;
-                    self.deploy_extras.clear();
                     if self.hags == gpu::HagsState::Disabled {
                         self.hags_prompt = true;
                     }
@@ -3444,47 +3550,11 @@ impl App {
         }
     }
 
-    /// 切换程序本体：上游最新版（根目录，310.9 后端）<-> 310.1 版（带 SM75 内核的代理版）。
-    ///
-    /// 两版同名文件的内容不同，所以切换时必须把下载记录清掉。不能只靠指纹：
-    /// 探测落到镜像时指纹不可信，判定「已是最新」会退化成「比字节数」，
-    /// 那时就会拿旧记录把 310.9 的文件当成 310.1 的，**静默跳过下载**，用户以为切了其实没切。
-    /// 清掉记录不影响 DLSS 运行库（那两个是按本地文件签名判断的，不会重下）。
-    fn set_legacy_3101(&mut self, on: bool) {
-        if self.legacy_3101 == on {
-            return;
-        }
-        self.legacy_3101 = on;
-        self.save_config();
-        let mut st = update::load_state();
-        if !st.files.is_empty() {
-            st.files.clear();
-            if let Err(e) = update::save_state(&st) {
-                self.note(format!("清空下载记录失败（下一次下载可能不会重新拉）: {e}"));
-            }
-        }
-        if !scan::is_known_proxy(&self.proxy) {
-            self.proxy = scan::PROXY_PRIORITY[0].to_owned();
-        }
-        self.redetect();
-        self.status = if on {
-            format!(
-                "已切到 {}（给 RTX 20 系）。点「下载 / 更新资产」重新下载（约 18 MB）。",
-                update::LEGACY_PREFIX
-            )
-        } else {
-            "已切回最新版。点「下载 / 更新资产」重新下载（约 17 MB）。".to_owned()
-        };
-        let s = self.status.clone();
-        self.note(s);
-    }
-
     fn save_config(&mut self) {
         let cfg = util::AppConfig {
             asset_dir: util::load_config().asset_dir,
             allow_backup_source: self.use_backup,
             backup_prefix: self.backup_prefix.clone(),
-            legacy_3101: self.legacy_3101,
         };
         if let Err(e) = util::save_config(&cfg) {
             self.note(format!("保存配置失败: {e}"));
@@ -3502,7 +3572,6 @@ impl App {
         cfg.asset_dir = Some(dir.clone());
         cfg.allow_backup_source = self.use_backup;
         cfg.backup_prefix = self.backup_prefix.clone();
-        cfg.legacy_3101 = self.legacy_3101;
         if let Err(e) = util::save_config(&cfg) {
             self.status = format!("保存配置失败: {e}");
             return;
@@ -3519,11 +3588,11 @@ impl App {
                 self.note(format!("旧资产目录仍保留在 {}，需要的话请手动处理。", o.display()));
             }
         }
+        self.refresh_asset_rows();
     }
 
     // ---- 后台任务
 
-    /// 手动导入：选中 zip（可多选）→ 后台解包 + 逐个校验。
     /// 后台任务收尾：状态栏、忙碌标记、进度条、取消句柄一次收干净。
     ///
     /// 以前这几件事在每个 Msg 分支里各写一遍，结果手动导入那条路漏了清进度条 ——
@@ -3537,6 +3606,7 @@ impl App {
         self.cancel = None;
     }
 
+    /// 手动导入：选中 zip（可多选）→ 后台解包 + 逐个校验。
     fn start_import(&mut self, paths: Vec<PathBuf>) {
         if paths.is_empty() {
             return;
@@ -3556,10 +3626,9 @@ impl App {
         self.progress = None;
         self.status = "正在读取压缩包并校验（大包要几秒）...".to_owned();
         self.note(format!("开始手动导入：{} 个来源", paths.len()));
-        let legacy = self.legacy_3101;
         self.spawn(move |tx, ctx| {
             let ptx = tx.clone();
-            let r = importer::stage(&paths, legacy, &work, &cancel, move |m, f| {
+            let r = importer::stage(&paths, &work, &cancel, move |m, f| {
                 // total 传 0：导入没有「字节总数」可言，进度条用 f 走
                 let _ = ptx.send(Msg::Progress(m, f, 0));
             });
@@ -3659,7 +3728,6 @@ impl App {
     fn start_update_check(&mut self) {
         self.busy = true;
         self.status = "正在检查上游更新...".to_owned();
-        let legacy = self.legacy_3101;
         self.spawn(move |tx, ctx| {
             let res = (|| -> anyhow::Result<UpdateSummary> {
                 let c = update::client()?;
@@ -3673,9 +3741,9 @@ impl App {
                 // 名单写死过一次，上游把 altnative/ 改名成 alternatives/ 之后就全 404 了。
                 let mut specs: Vec<String> = scan::PROXY_PRIORITY
                     .iter()
-                    .map(|p| update::proxy_repo_path(p, legacy).to_owned())
+                    .map(|p| update::proxy_repo_path(p).to_owned())
                     .collect();
-                specs.push(update::ini_repo_path(legacy).to_owned());
+                specs.push(update::INI_REPO_PATH.to_owned());
                 let mut first_err: Option<String> = None;
                 for path in specs {
                     match update::probe_remote(&c, &path) {
@@ -3692,6 +3760,7 @@ impl App {
                                 remote_etag_trusted: r.etag_trusted,
                                 remote_etag: Some(r.etag),
                                 runtime_file: None,
+                                remote_checked: true,
                             });
                         }
                         Err(e) => {
@@ -3720,6 +3789,7 @@ impl App {
                         remote_etag_trusted: false,
                         remote_etag: None,
                         runtime_file: Some(dll_name.to_owned()),
+                        remote_checked: true,
                     });
                 }
                 Ok(UpdateSummary { version, rows })
@@ -3736,7 +3806,6 @@ impl App {
         let proxy = self.proxy.clone();
         let use_backup = self.use_backup && !self.backup_prefix.trim().is_empty();
         let prefix = self.backup_prefix.trim().to_owned();
-        let legacy = self.legacy_3101;
         let cancel = Arc::new(AtomicBool::new(false));
         self.cancel = Some(cancel.clone());
         self.busy = true;
@@ -3770,8 +3839,8 @@ impl App {
                 }
 
                 let specs = [
-                    update::proxy_repo_path(&proxy, legacy).to_owned(),
-                    update::ini_repo_path(legacy).to_owned(),
+                    update::proxy_repo_path(&proxy).to_owned(),
+                    update::INI_REPO_PATH.to_owned(),
                 ];
                 let mut items: Vec<Item> = Vec::new();
                 let mut skipped = 0usize;
@@ -4010,20 +4079,22 @@ impl App {
             self.confirm_old_driver = true;
             return;
         }
-        // 上游要求「每次只保留本项目的一个代理」。如果目标目录里还躺着本项目的
-        // 另一个入口（比如用户手动装过），本工具没有记录可查、也不会自动清 ——
-        // 那就先问一句，别让用户以为部署成功了却有两个代理在打架。
+        // 目录里还有本项目的另一个代理入口时**不再弹窗打断**：上游 0.3.1 起多个代理
+        // 同时存在是安全的（游戏加载到的那个生效，其余的只把导出转发给系统 DLL），
+        // 所以这里只在日志/状态里提一句，让用户知道目录里有这么个文件。
         if let Some(dir) = self.game_dir.clone() {
             let extras = deploy::find_extra_own_proxies(&dir, &self.proxy);
             if !extras.is_empty() {
-                self.asked_extra_proxies = Some(extras);
-                return;
+                self.note(format!(
+                    "目录里还有本项目的另一个代理入口：{} —— 上游 0.3.1 起多个代理不会冲突，本次不动它",
+                    extras.join("、")
+                ));
             }
         }
-        self.do_deploy(Vec::new());
+        self.do_deploy();
     }
 
-    fn do_deploy(&mut self, remove_extra: Vec<String>) {
+    fn do_deploy(&mut self) {
         let Some(dir) = self.game_dir.clone() else {
             self.status = "请先选择游戏目录".to_owned();
             return;
@@ -4047,7 +4118,6 @@ impl App {
         let blocked = ac.is_blocked();
         if blocked && !self.allow_kernel_ac {
             self.ac_target = Some(ac.clone());
-            self.deploy_extras = remove_extra;
             self.kernel_ac_pending = Some(ac);
             return;
         }
@@ -4065,7 +4135,7 @@ impl App {
 
         // 两个 DLSS 运行库：**游戏目录已有的不动，缺的才补**。
         //
-        // 上游 0.3.0 只要求放「代理 DLL + INI」（运行库/模型/后端都内嵌在代理里），
+        // 上游（0.3.0 起）只要求放「代理 DLL + INI」（运行库/模型/后端都内嵌在代理里），
         // 而很多游戏目录本来就带自己的 nvngx_dlssg.dll / nvngx_dlss.dll（和游戏自己的
         // DLSS 版本配套）。以前无条件覆盖，用户实测「工具部署不生效、手动只放两个文件
         // 反而正常」—— 所以现在已有的一律不碰，用完提醒一句。
@@ -4095,22 +4165,24 @@ impl App {
         }
         self.deploy_notes = notes;
 
-        // 按显卡准备要部署的 INI（可能被改写过）
-        let plan = match update::prepare_deploy_ini(self.gpu_route, self.gpu_name.as_deref()) {
-            Ok(p) => p,
-            Err(e) => {
-                self.status = format!("准备 INI 失败: {e}");
-                return;
-            }
-        };
-        self.ini_changes = plan.changes.clone();
-        files.push(deploy::DeployFile::new(deploy::INI_NAME, plan.path.clone()));
+        // INI 直接用资产目录里那份原文件：上游 0.3.1 起 20/30 系通用，
+        // 出厂 INI 一个键都不需要改（这里以前会给 RTX 20 系改写 Router=SM75）
+        let ini = update::asset_path(update::INI_REPO_PATH).unwrap_or_default();
+        if !ini.is_file() {
+            self.status = format!(
+                "缺少 {}，请先点「下载 / 更新资产」",
+                update::INI_REPO_PATH
+            );
+            return;
+        }
+        files.push(deploy::DeployFile::new(deploy::INI_NAME, ini));
 
         self.busy = true;
         self.deploy_in_flight = true;
         self.status = "正在部署...".to_owned();
         self.spawn(move |tx, ctx| {
-            let r = deploy::deploy(&dir, &proxy, &files, &remove_extra);
+            // 第四个参数是「要移除的多余代理」：上游 0.3.1 起多个代理无害，恒传空
+            let r = deploy::deploy(&dir, &proxy, &files, &Vec::new());
             // 「部署成功却显示非本工具部署」这类投诉，看这一行就能定论：
             // 备份记录（manifest）到底写没写进去、能不能读回来。
             match &r {
@@ -4415,7 +4487,7 @@ impl eframe::App for App {
                         Some(n) => {
                             let (txt, col) = match self.gpu_route {
                                 scan::GpuRoute::Sm86 => ("SM86 路由", theme::OK),
-                                scan::GpuRoute::Sm75 => ("需改 SM75", theme::WARN),
+                                scan::GpuRoute::Sm75 => ("SM75 路由", theme::OK),
                                 scan::GpuRoute::Gtx16 => ("不支持", theme::DANGER),
                                 scan::GpuRoute::NotNeeded => ("不需要本 Mod", theme::WARN),
                                 scan::GpuRoute::Unsupported => ("不适用", theme::DANGER),
@@ -4624,7 +4696,7 @@ impl eframe::App for App {
                         "上游没有 GitHub Releases，版本以 main 分支文件的 git blob sha 为准。",
                     ));
 
-                    // 下载 / 取消
+                    // 下载 / 取消 + 检查更新 + 手动导入，挤在一行里
                     ui.horizontal(|ui| {
                         if self.cancel.is_some() {
                             if theme::danger_button(ui, "取消下载", true).clicked() {
@@ -4636,10 +4708,8 @@ impl eframe::App for App {
                         if theme::ghost_button(ui, "检查更新", !self.busy).clicked() {
                             self.start_update_check();
                         }
-                    });
-                    // 网络实在下不动时的后路：网盘/U 盘拿到的 zip，在这里选它就行。
-                    // 程序自己解压、递归找需要的文件、逐个校验，用户不用管目录结构。
-                    ui.horizontal(|ui| {
+                        // 网络实在下不动时的后路：网盘 / U 盘拿到的 zip，在这里选它就行。
+                        // 程序自己解压、找需要的文件、逐个校验，用户不用管目录结构。
                         if theme::ghost_button(ui, "导入压缩包…", !self.busy)
                             .on_hover_text(
                                 "选中从网盘 / U 盘拿到的 zip（可多选，上游源码包 + 运行库包一起选）",
@@ -4658,6 +4728,74 @@ impl eframe::App for App {
                             ui.add(egui::Spinner::new().size(12.0));
                         }
                     });
+
+                    // 资产清单：按「核心 Mod / DLSS 运行库」分组显示。
+                    //
+                    // 启动时就用本地信息建好（App::local_asset_rows，**不联网**），所以不用等
+                    // 「检查更新」才看得见；那一步只是补上上游内容指纹，用来判断「有没有更新」。
+                    if let Some(s) = self.update_summary.clone() {
+                        // 资产目录只解析一次，别在每一行里重复读配置文件
+                        let assets = util::assets_dir().ok();
+                        ui.add_space(2.0);
+                        if let Some(v) = &s.version {
+                            ui.label(theme::hint(format!("上游版本 {v}")));
+                        }
+                        for group in ["核心 Mod", "DLSS 运行库"] {
+                            let group_rows: Vec<AssetRow> = s
+                                .rows
+                                .iter()
+                                .filter(|r| r.group == group)
+                                .cloned()
+                                .collect();
+                            if group_rows.is_empty() {
+                                continue;
+                            }
+                            ui.add_space(3.0);
+                            ui.label(
+                                egui::RichText::new(group)
+                                    .size(11.5)
+                                    .color(theme::TEXT)
+                                    .strong(),
+                            );
+                            for row in group_rows {
+                                let st = self.asset_state(assets.as_deref(), &row);
+                                // 没查过上游时 row.bytes 就是本地大小；文件不在时写「尚未下载」，
+                                // 别显示成「0 B」。远端大小没探到时回退到本地大小。
+                                let shown = if row.bytes > 0 {
+                                    row.bytes
+                                } else {
+                                    assets
+                                        .as_deref()
+                                        .map(|d| d.join(&row.label))
+                                        .and_then(|p| std::fs::metadata(p).ok())
+                                        .map(|m| m.len())
+                                        .unwrap_or(0)
+                                };
+                                let size = if shown > 0 {
+                                    util::format_bytes(shown)
+                                } else {
+                                    "尚未下载".to_owned()
+                                };
+                                // 只有本地信息时，大小写在下面那行说明里就够了，别在这儿写两遍
+                                let name_line = if row.remote_checked || shown == 0 {
+                                    format!("{}  ·  {}", row.label, size)
+                                } else {
+                                    row.label.clone()
+                                };
+                                ui.horizontal(|ui| {
+                                    theme::badge(ui, st.label(), st.color());
+                                    ui.label(theme::hint(name_line));
+                                });
+                                if !row.detail.trim().is_empty() {
+                                    ui.label(
+                                        egui::RichText::new(format!("     {}", row.detail))
+                                            .size(10.5)
+                                            .color(theme::TEXT_MUTED),
+                                    );
+                                }
+                            }
+                        }
+                    }
 
                     // ---- 下载源：先测速，再把结果摆出来让用户自己挑最快的
                     ui.add_space(4.0);
@@ -4805,49 +4943,6 @@ impl eframe::App for App {
                         ui.label(theme::hint(format!("当前备用源：{}", self.backup_prefix)));
                     }
 
-                    // 资产清单：按「核心 Mod / DLSS 运行库」分组显示
-                    if let Some(s) = self.update_summary.clone() {
-                        // 资产目录只解析一次，别在每一行里重复读配置文件
-                        let assets = util::assets_dir().ok();
-                        ui.add_space(2.0);
-                        if let Some(v) = &s.version {
-                            ui.label(theme::hint(format!("上游版本 {v}")));
-                        }
-                        for group in ["核心 Mod", "DLSS 运行库"] {
-                            let group_rows: Vec<AssetRow> = s
-                                .rows
-                                .iter()
-                                .filter(|r| r.group == group)
-                                .cloned()
-                                .collect();
-                            if group_rows.is_empty() {
-                                continue;
-                            }
-                            ui.add_space(3.0);
-                            ui.label(
-                                egui::RichText::new(group)
-                                    .size(11.5)
-                                    .color(theme::TEXT)
-                                    .strong(),
-                            );
-                            for row in group_rows {
-                                let st = self.asset_state(assets.as_deref(), &row);
-                                ui.horizontal(|ui| {
-                                    theme::badge(ui, st.label(), st.color());
-                                    ui.label(theme::hint(format!(
-                                        "{}  ·  {}",
-                                        row.label,
-                                        util::format_bytes(row.bytes)
-                                    )));
-                                });
-                                ui.label(
-                                    egui::RichText::new(format!("     {}", row.detail))
-                                        .size(10.5)
-                                        .color(theme::TEXT_MUTED),
-                                );
-                            }
-                        }
-                    }
                 });
 
                 // --- 部署
@@ -4897,46 +4992,12 @@ impl eframe::App for App {
                         _ => {}
                     }
 
-                    // RTX 20 系（SM75）：上游 0.3.0 改回代理模式后只面向 RTX 30 系，
-                    // 给这类用户一个切到 310.1 版的开关 —— 上游新版（310.9）没打包 SM75 内核。
+                    // 20 系和 30 系用的是同一套文件（上游 0.3.1 起），所以这里不再有
+                    // 「改用 310.1 版」的开关，也不需要给 INI 做任何改写。
                     if self.gpu_route == scan::GpuRoute::Sm75 {
-                        ui.add_space(2.0);
-                        if self.legacy_3101 {
-                            theme::badge(ui, "正在用 310.1 版", theme::WARN);
-                            ui.label(theme::hint(
-                                "310.1 版是代理模式里仍然带 SM75 内核的那一份，给 RTX 20 系用；倍率上限是 4X（新版 310.9 是 6X）。",
-                            ));
-                            if theme::ghost_button(ui, "改回最新版（上游代理包）", !self.busy).clicked()
-                            {
-                                self.set_legacy_3101(false);
-                            }
-                        } else {
-                            ui.label(
-                                egui::RichText::new(
-                                    "你的显卡是 RTX 20 系（Turing / SM75）。上游 0.3.0 改回代理模式后只面向 RTX 30 系，装了很可能不生效。",
-                                )
-                                .size(11.5)
-                                .color(theme::WARN),
-                            );
-                            if theme::ghost_button(
-                                ui,
-                                "改用 310.1 版（支持 RTX 20 系）",
-                                !self.busy,
-                            )
-                            .on_hover_text("下载上游仓库里的 310.1 版程序本体，约 18 MB；随时可以切回最新版")
-                            .clicked()
-                            {
-                                self.set_legacy_3101(true);
-                            }
-                        }
-                    }
-                    // 部署后展示实际改动
-                    for c in &self.ini_changes {
-                        ui.label(
-                            egui::RichText::new(format!("⚠ {c}"))
-                                .size(11.5)
-                                .color(theme::WARN),
-                        );
+                        ui.label(theme::hint(
+                            "你的显卡是 RTX 20 系（Turing / SM75）：上游 0.3.1 起同一套文件就能用，出厂 INI 不用改任何键。",
+                        ));
                     }
                     // 部署时「跳过 / 说明」的几条（例如游戏目录已有运行库）
                     for n in &self.deploy_notes {
@@ -4992,6 +5053,24 @@ impl eframe::App for App {
                             .clicked()
                         {
                             self.start_restore();
+                        }
+                        // 帧生成不生效时最有用的一步：看游戏那边写的日志。
+                        // 上游 0.3.1 的 [Logging] Level=2 会写明被哪一道闸门挡住
+                        // （硬件加速 GPU 计划 / 驱动版本 / 显卡能力查询）。
+                        let log_dir = self
+                            .game_dir
+                            .as_deref()
+                            .map(|d| d.join("dlssg_sm86").join("logs"));
+                        let has_logs = log_dir.as_deref().map(|p| p.is_dir()).unwrap_or(false);
+                        if theme::ghost_button(ui, "打开日志", has_logs)
+                            .on_hover_text(
+                                "打开游戏目录里的 dlssg_sm86\\logs。要让日志写细一点：把部署进去的 dlssg_sm86.ini 里 [Logging] Level 改成 2，再进游戏跑一次。",
+                            )
+                            .clicked()
+                        {
+                            if let Some(p) = &log_dir {
+                                open_in_explorer(p);
+                            }
                         }
                     });
 
@@ -5603,57 +5682,12 @@ impl eframe::App for App {
                 });
             if go {
                 self.confirm_old_driver = false;
-                self.do_deploy(Vec::new());
+                self.do_deploy();
             } else if close {
                 self.confirm_old_driver = false;
                 if let Err(e) = util::open_url(gpu::DRIVER_URL) {
                     self.status = format!("打开驱动下载页失败: {e}");
                 }
-            }
-        }
-
-        // ---------------- 目录里还有另一个本项目代理时的确认
-        if let Some(extras) = self.asked_extra_proxies.clone() {
-            let ctx = self.ctx.clone();
-            let list = extras.join("、");
-            let mut go = false;
-            let mut keep = false;
-            egui::Window::new("目录里还有另一个代理入口")
-                .collapsible(false)
-                .resizable(false)
-                .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
-                .show(&ctx, |ui| {
-                    ui.set_max_width(470.0);
-                    ui.label(
-                        egui::RichText::new(format!("游戏目录里还有本项目的 {list}。"))
-                            .size(13.0)
-                            .color(theme::WARN)
-                            .strong(),
-                    );
-                    ui.add_space(6.0);
-                    ui.label(
-                        "上游要求「每次只保留本项目的一个代理」。同时存在两个时，游戏加载哪一个是没准的 —— 可能用的还是旧的那个，看起来就像部署没生效。",
-                    );
-                    ui.add_space(4.0);
-                    ui.label(theme::hint(
-                        "移除前会先把原文件备份下来，之后点「还原」可以恢复。",
-                    ));
-                    ui.add_space(8.0);
-                    ui.horizontal(|ui| {
-                        if theme::primary_button(ui, "移除并继续部署", true).clicked() {
-                            go = true;
-                        }
-                        if theme::ghost_button(ui, "保留并继续", true).clicked() {
-                            keep = true;
-                        }
-                    });
-                });
-            if go {
-                self.asked_extra_proxies = None;
-                self.do_deploy(extras);
-            } else if keep {
-                self.asked_extra_proxies = None;
-                self.do_deploy(Vec::new());
             }
         }
 
@@ -5707,12 +5741,10 @@ impl eframe::App for App {
                     "⚠ 用户确认在内核级反作弊（{}）的情况下继续部署，风险自负",
                     names.join("、")
                 ));
-                let extras = self.deploy_extras.clone();
-                self.do_deploy(extras);
+                self.do_deploy();
             } else if cancel {
                 self.kernel_ac_pending = None;
                 self.allow_kernel_ac = false;
-                self.deploy_extras.clear();
                 self.status = "已取消部署".to_owned();
                 log::line("用户在内核级反作弊确认弹窗里选择了取消");
             }

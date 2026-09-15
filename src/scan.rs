@@ -937,8 +937,8 @@ where
 //
 // 两个签名者都是本项目的，取决于上游用的是哪一版：
 //   "DLSSG Native Project" —— 0.2.4 native 包（现在是 archive/0.2.4/）
-//   "DLSSG for SM86"       —— 0.3.0 代理包（仓库根目录，现在对外发布的那一版）
-// 上游 0.3.0 换证书时如果只认旧名字，所有下载都会被自己拒掉。
+//   "DLSSG for SM86"       —— 上游代理包（仓库根目录，现在对外发布的那一套）
+// 上游换证书时如果只认旧名字，所有下载都会被自己拒掉。
 //
 // 注意：这里是在证书数据里找已知字符串，不做完整签名链校验。
 // 对本项目够用 —— 自签证书本来就不受 Windows 信任，验链没有意义。
@@ -976,7 +976,7 @@ impl FileIdentity {
 
 /// 0.2.4 native 包的签名者
 const SIGNER_THIS_PROJECT: &str = "DLSSG Native Project";
-/// 0.3.0 代理包的签名者（CN 全名 "DLSSG for SM86 (self-signed)"）
+/// 上游代理包的签名者（CN 全名 "DLSSG for SM86 (self-signed)"）
 const SIGNER_THIS_PROJECT_PROXY: &str = "DLSSG for SM86";
 const SIGNER_NVIDIA: &str = "NVIDIA Corporation";
 
@@ -1063,11 +1063,11 @@ pub fn identify_dll(path: &Path) -> FileIdentity {
 
 /// **所有代理入口名字 —— 全项目只有这一处硬编码。**
 ///
-/// 顺序 = 上游推荐顺序：前 6 个是 0.3.0 alternatives/ 下现用的入口，
+/// 顺序 = 上游推荐顺序：前 6 个是 alternatives/ 下现用的入口，
 /// 最后一个是上游历史上用过、现在只剩归档包（archive/0.2.4/altnative/）里才有的名字。
 /// 别处（deploy / importer / 界面）一律引用这里，免得上游改名时漏改一处。
 /// version.dll 是上游默认；dbghelp / d3d12 是 0.3.0 新增的，winhttp 已被上游删掉。
-/// 根目录（310.9）和 310.1/ 两个版本的目录结构一样，所以清单是同一份。
+/// 0.3.1 起 20 系和 30 系用同一套文件，所以只有这一份清单。
 pub const PROXY_ALL: [&str; 7] = [
     "version.dll",
     "winmm.dll",
@@ -1350,8 +1350,8 @@ pub fn classify_gpu(name: &str) -> GpuRoute {
         return GpuRoute::Sm86;
     }
     // GTX 16 系（1630 / 1650 / 1660）和 RTX 20 系同为 Turing，但**没有 Tensor Core**：
-    // DLSS 帧生成在硬件上就跑不了，换 310.1 版也没用。必须单独判出来，不能落到 Sm75 ——
-    // 否则界面会给出「改用 310.1 版」这种根本无效的建议。
+    // DLSS 帧生成在硬件上就跑不了，换哪个版本都没用。必须单独判出来，不能落到 Sm75 ——
+    // 否则界面会给出一条根本无效的建议。
     if n.contains("GTX 16") {
         return GpuRoute::Gtx16;
     }

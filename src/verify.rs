@@ -29,7 +29,7 @@ use windows_sys::Win32::Security::WinTrust::{
     WTD_STATEACTION_CLOSE, WTD_STATEACTION_VERIFY, WTD_UI_NONE,
 };
 
-/// 作者自签证书的 SHA-1 指纹（0.3.0 代理包，"DLSSG for SM86"）。
+/// 作者自签证书的 SHA-1 指纹（上游代理包 0.3.0 起，"DLSSG for SM86"）。
 pub const AUTHOR_CERT_PROXY: &str = "85BA66762F851E49148D706915D09026281418E6";
 
 /// 作者自签证书的 SHA-1 指纹（0.2.4 native 包，"DLSSG Native Project"）。

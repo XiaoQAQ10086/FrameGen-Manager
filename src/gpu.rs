@@ -23,8 +23,11 @@ use winreg::RegKey;
 // ---------------------------------------------------------------- 常量
 
 /// 帧生成建议的最低 NVIDIA 驱动版本。
-pub const MIN_FG_DRIVER: (u32, u32) = (591, 86);
-pub const MIN_FG_DRIVER_TEXT: &str = "591.86";
+///
+/// 上游 0.3.1 的说明：建议 R580 以上，最低约 R555（更旧的驱动会自动改用 PTX，
+/// 只在首次加载多一次 JIT），591.86 与 610.74 实测可用。这里按**最低**报，别吓人。
+pub const MIN_FG_DRIVER: (u32, u32) = (555, 0);
+pub const MIN_FG_DRIVER_TEXT: &str = "555.0（R555）";
 /// 官方驱动下载页
 pub const DRIVER_URL: &str = "https://www.nvidia.cn/geforce/drivers/";
 
