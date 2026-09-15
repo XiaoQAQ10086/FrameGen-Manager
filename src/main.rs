@@ -1366,6 +1366,38 @@ fn selftest() {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    println!("\n--- 部署时的 DLSS 运行库处理（已有的不覆盖）---");
+    {
+        let dir = std::env::temp_dir().join("fgm-runtime-plan-selftest");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+
+        let (have, need) = update::runtime_deploy_plan(&dir);
+        ck(
+            &mut fails,
+            have.is_empty() && need.len() == 2,
+            "游戏目录里两个都没有 → 两个都补",
+        );
+
+        std::fs::write(dir.join("nvngx_dlssg.dll"), b"x").unwrap();
+        let (have, need) = update::runtime_deploy_plan(&dir);
+        ck(
+            &mut fails,
+            have == vec!["nvngx_dlssg.dll"] && need == vec!["nvngx_dlss.dll"],
+            "已有帧生成运行库 → 只补超分那个",
+        );
+
+        std::fs::write(dir.join("nvngx_dlss.dll"), b"x").unwrap();
+        let (have, need) = update::runtime_deploy_plan(&dir);
+        ck(
+            &mut fails,
+            have.len() == 2 && need.is_empty(),
+            "两个都有 → 一个都不动（不覆盖游戏自带的，这是用户反馈的那条）",
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     println!("\n--- 日志滚动（目录里只留两个文件）---");
     {
         let dir = std::env::temp_dir().join("fgm-log-selftest");
@@ -2549,6 +2581,8 @@ struct App {
 
     // ---- 本次部署对 INI 的改动说明
     ini_changes: Vec<String>,
+    /// 本次部署「跳过 / 说明」的几条（比如游戏目录已有运行库，用游戏自带那份）
+    deploy_notes: Vec<String>,
 
     // ---- 游戏图标纹理缓存，key = 安装目录
     icon_textures: HashMap<String, egui::TextureHandle>,
@@ -2669,6 +2703,7 @@ impl App {
             dl_total: 0,
             dl_done: 0,
             ini_changes: Vec::new(),
+            deploy_notes: Vec::new(),
             icon_textures: HashMap::new(),
         };
         // 上次扫过的游戏库直接摆出来，不用用户再点一次「扫描」
@@ -3175,7 +3210,12 @@ impl App {
             }
             Msg::Done(m) => {
                 self.note(m.clone());
-                self.status = m;
+                // 部署完顺带把「游戏目录已有运行库」这类说明摆在状态栏里，用户一眼能看到
+                self.status = if self.deploy_in_flight && !self.deploy_notes.is_empty() {
+                    format!("{m}（{}）", self.deploy_notes.join("；"))
+                } else {
+                    m
+                };
                 self.busy = false;
                 self.progress = None;
                 self.cancel = None;
@@ -3890,16 +3930,37 @@ impl App {
             return;
         }
 
-        // 两个 DLSS 运行库也是必需文件（很多游戏缺了就不生效）
+        // 两个 DLSS 运行库：**游戏目录已有的不动，缺的才补**。
+        //
+        // 上游 0.3.0 只要求放「代理 DLL + INI」（运行库/模型/后端都内嵌在代理里），
+        // 而很多游戏目录本来就带自己的 nvngx_dlssg.dll / nvngx_dlss.dll（和游戏自己的
+        // DLSS 版本配套）。以前无条件覆盖，用户实测「工具部署不生效、手动只放两个文件
+        // 反而正常」—— 所以现在已有的一律不碰，用完提醒一句。
         let mut files = vec![deploy::DeployFile::new(&proxy, dll.clone())];
-        for (_prefix, _tag, _zip, dll_name, label) in update::DLSS_RUNTIME {
+        let mut notes: Vec<String> = Vec::new();
+        let (have, need) = update::runtime_deploy_plan(&dir);
+        for dll_name in &have {
+            notes.push(format!(
+                "游戏目录已有 {dll_name}，用游戏自带的那份（不覆盖）"
+            ));
+        }
+        for dll_name in &need {
             let p = update::asset_path(dll_name).unwrap_or_default();
             if !p.is_file() {
+                let label = update::DLSS_RUNTIME
+                    .iter()
+                    .find(|(_, _, _, n, _)| n == dll_name)
+                    .map(|(_, _, _, _, l)| *l)
+                    .unwrap_or("DLSS 运行库");
                 self.status = format!("缺少 {label}（{dll_name}），请先点「下载 / 更新资产」");
                 return;
             }
             files.push(deploy::DeployFile::new(dll_name, p));
         }
+        for n in &notes {
+            self.note(n.clone());
+        }
+        self.deploy_notes = notes;
 
         // 按显卡准备要部署的 INI（可能被改写过）
         let plan = match update::prepare_deploy_ini(self.gpu_route, self.gpu_name.as_deref()) {
@@ -3941,6 +4002,8 @@ impl App {
             self.status = "请先选择游戏目录".to_owned();
             return;
         };
+        // 上一次部署留下的说明（比如「游戏目录已有运行库」）到这里就不适用了
+        self.deploy_notes.clear();
         self.busy = true;
         self.status = "正在还原...".to_owned();
         self.spawn(move |tx, ctx| {
@@ -4793,6 +4856,10 @@ impl eframe::App for App {
                                 .color(theme::WARN),
                         );
                     }
+                    // 部署时「跳过 / 说明」的几条（例如游戏目录已有运行库）
+                    for n in &self.deploy_notes {
+                        ui.label(theme::hint(n.clone()));
+                    }
 
                     // 缺资产提示
                     let has_asset = util::assets_dir()
@@ -4850,7 +4917,7 @@ impl eframe::App for App {
                     match &self.deploy_state {
                         deploy::DeployState::Deployed { .. } => {
                             ui.label(theme::hint(
-                                "「还原」= 撤回本工具部署的全部 4 个文件（代理 DLL + INI + 两个 DLSS 运行库），并恢复部署前备份的原文件。不是只删 version.dll。",
+                                "「还原」= 撤回本工具部署的文件（代理 DLL + INI，以及当时补上的 DLSS 运行库），并恢复部署前备份的原文件。不是只删 version.dll。",
                             ));
                         }
                         deploy::DeployState::ManuallyInstalled { .. } => {
@@ -5110,7 +5177,8 @@ impl eframe::App for App {
                         }
                     });
                     ui.label(theme::hint(format!(
-                        "日志：{}　每次启动一个文件，最多保留 10 个。里面有本地路径和用户名，发给别人前先看一眼。",
+                        "日志：{}　目录里只留两个文件：framegen.log（本次运行）和 framegen.prev.log（上一次运行）。\
+                         里面有本地路径和用户名，发给别人前先看一眼。",
                         log::path()
                             .map(|p| p.display().to_string())
                             .unwrap_or_else(|| "程序同级的 logs 目录".to_owned())

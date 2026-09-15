@@ -1083,6 +1083,27 @@ pub const DLSS_RUNTIME: [(&str, &str, &str, &str, &str); 2] = [
     ),
 ];
 
+/// 部署时怎么处理两个 DLSS 运行库。
+///
+/// 上游 0.3.0 的说明里只要求「代理 DLL + INI」（运行库、模型、后端都内嵌在代理里），
+/// 而**很多游戏目录本来就带着自己的** nvngx_dlssg.dll / nvngx_dlss.dll（和游戏自己的
+/// DLSS / Streamline 版本配套）。无条件覆盖它们会出事：实测有用户「工具部署后帧生成
+/// 不生效，手动只放代理 + INI 却正常」。所以规则是：**已有的不动，缺的才补**。
+///
+/// 返回 (游戏目录里已有的名字, 缺的、需要补的名字)。
+pub fn runtime_deploy_plan(target_dir: &Path) -> (Vec<&'static str>, Vec<&'static str>) {
+    let mut have = Vec::new();
+    let mut need = Vec::new();
+    for (_prefix, _tag, _zip, dll_name, _label) in DLSS_RUNTIME {
+        if target_dir.join(dll_name).is_file() {
+            have.push(dll_name);
+        } else {
+            need.push(dll_name);
+        }
+    }
+    (have, need)
+}
+
 /// release 资产的直链。github.com 直连不通时，调用方会在前面拼镜像前缀。
 pub fn release_url(tag: &str, asset_name: &str) -> String {
     format!("https://github.com/{DLSS_REPO}/releases/download/{tag}/{asset_name}")

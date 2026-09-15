@@ -152,8 +152,13 @@ dlssg-310.1-d3d12-sm86+sm75 和 sm75_route_limits / sm75_slots），是给 RTX 2
 
 ## 关于 DLSS 运行库的来源
 
-很多游戏目录里没有 nvngx_dlssg.dll / nvngx_dlss.dll，只放前两个文件是不生效的，
-所以本工具会一并下载部署这两个运行库（DLSS FG 310.9.1 / DLSS SR 310.9.1）。
+上游 0.3.0 的说明里只需要放「代理 DLL + INI」（运行库、模型、后端都内嵌在代理里），
+但**有些**游戏目录确实没有 nvngx_dlssg.dll / nvngx_dlss.dll，那种情况下只放前两个文件是不生效的。
+
+所以本工具的行为是：**游戏目录缺哪个才补哪个**（用 310.9.1 那两份），
+**已经有了就一个都不动** —— 很多游戏自带的和它自己的 DLSS 版本是配套的，
+覆盖反而可能让帧生成失效（这是用户实测反馈过的问题）。部署时界面上会写明
+「游戏目录已有 xxx，用游戏自带的那份」。不做替代方案时也可以手动只放代理 + INI。
 
 - 来源：社区仓库 [RankFTW/rhi-repo](https://github.com/RankFTW/rhi-repo) 的 GitHub Releases
 - **不走 GitHub 接口**：直接拼 Releases 直链下载，不先查 API
