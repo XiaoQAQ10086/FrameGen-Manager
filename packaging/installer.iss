@@ -1,4 +1,4 @@
-﻿; FrameGen Manager - Inno Setup 6 打包脚本
+; FrameGen Manager - Inno Setup 6 打包脚本
 ; 编译： iscc packaging\installer.iss
 ;
 ; 设计要点：
@@ -12,7 +12,7 @@
 #define AppName "FrameGen Manager"
 ; 版本号可由打包脚本传入：iscc /DAppVersion=1.2.3 installer.iss
 #ifndef AppVersion
-#define AppVersion "0.9.7"
+#define AppVersion "0.9.8"
 #endif
 #define AppExeName "framegen-manager.exe"
 
@@ -34,9 +34,9 @@ WizardStyle=modern
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 UninstallDisplayName={#AppName}
-; 若准备了图标，取消下面两行注释
-; SetupIconFile=app.ico
-; UninstallDisplayIcon={app}\{#AppExeName}
+; 图标：packaging\app.ico 由 make-ico.ps1 从母版生成，同一个文件也被 build.rs 编进了 exe
+SetupIconFile=app.ico
+UninstallDisplayIcon={app}\{#AppExeName}
 
 [Languages]
 Name: "chinese"; MessagesFile: "compiler:Default.isl"

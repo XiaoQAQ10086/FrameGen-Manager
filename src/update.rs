@@ -941,7 +941,7 @@ pub fn prepare_deploy_ini_files(
 /// ghproxy.cdn.9i0i.com / ghp.icu / gh-proxy.top / ghproxy.homeboyc.cn /
 /// gh.jasonzeng.dev / mirror.ghproxy.com 全部连不上，已删掉：留着的死源只会在
 /// 官方源也失败时挨个白等一次连接超时，纯粹拖慢用户。
-/// 用户仍可在界面上自己填源（一行一个），见 split_custom_sources。
+/// 界面上的下载源只能从这里挑（「自动」或指定其中一个），不再支持手填地址。
 pub const MIRRORS: [&str; 6] = [
     // 第一轮实测活下来的
     "https://gh-proxy.com/",
@@ -956,42 +956,31 @@ pub const MIRRORS: [&str; 6] = [
 /// 默认备用源（= 最快的那个镜像）。界面上「当前备用源」显示的就是它。
 pub const DEFAULT_BACKUP_PREFIX: &str = "https://gh-proxy.com/";
 
-/// 实际要试的镜像列表，按**实测速率**从快到慢排。
+/// 界面选中的下载源前缀 —— 做个归一化：去空格、补上结尾的斜杠（前缀是拼在官方
+/// 地址前面的）。不像网址就返回 None，等于「自动」。
 ///
-/// 用户选中的源（界面上的测速列表，或手填的前缀）排在最前面，其余内置镜像跟在
-/// 后面兜底 —— 选中的源整个挂掉时不至于直接失败。
-/// 用户自己填的源：界面上允许一行一个（以前只支持一个）。
-/// 顺手把常见的写法归一化：去空格、补上结尾的斜杠（前缀是拼在官方地址前面的）。
-pub fn split_custom_sources(custom: &str) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
-    for raw in custom.split(['\n', '\r', ',', ';', ' ', '\t']) {
-        let s = raw.trim();
-        if s.len() < 8 || !s.contains("://") {
-            continue;
-        }
-        let s = s.trim_end_matches('/').to_owned() + "/";
-        if !out.contains(&s) {
-            out.push(s);
-        }
+/// 界面上的下载源**只能从内置镜像里挑**，手填地址那个功能已经删掉。
+pub fn normalize_source(raw: &str) -> Option<String> {
+    let s = raw.trim();
+    if s.len() < 8 || !s.contains("://") {
+        return None;
     }
-    out
+    Some(s.trim_end_matches('/').to_owned() + "/")
 }
 
 fn mirrors(custom: &str) -> Vec<String> {
-    let customs = split_custom_sources(custom);
+    let selected = normalize_source(custom);
     let rest: Vec<String> = MIRRORS
         .iter()
-        .filter(|m| !customs.iter().any(|c| c == *m))
+        .filter(|m| selected.as_deref() != Some(*m))
         .map(|s| (*s).to_owned())
         .collect();
-    let rest = rank_mirrors(&rest);
-    if customs.is_empty() {
-        rest
-    } else {
-        let mut out = customs;
-        out.extend(rest);
-        out
+    let mut out = rank_mirrors(&rest);
+    // 选中的源排最前面，其余镜像按实测速率跟在后面兜底
+    if let Some(sel) = selected {
+        out.insert(0, sel);
     }
+    out
 }
 
 // ---------------------------------------------------------- 选源：实测速率记忆

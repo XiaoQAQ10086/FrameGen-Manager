@@ -192,7 +192,7 @@ fn main() -> eframe::Result<()> {
         return Ok(());
     }
 
-    // 手动导入流水线（只解包 + 校验，不写资产目录）：cargo run -- --importtest <zip/文件夹>...
+    // 手动导入流水线（只解包 + 校验，不写资产目录）：cargo run -- --importtest <zip>...
     let argv_i2: Vec<String> = std::env::args().collect();
     if let Some(pos) = argv_i2.iter().position(|a| a == "--importtest") {
         println!("===== 手动导入 自测（只校验，不写资产目录）=====");
@@ -205,7 +205,9 @@ fn main() -> eframe::Result<()> {
             "  当前在用的版本 = {}",
             if legacy { "310.1 版（RTX 20 系）" } else { "最新版（310.9）" }
         );
-        match importer::stage(&paths, legacy, &work, &cancel, |m| println!("  {m}")) {
+        match importer::stage(&paths, legacy, &work, &cancel, |m, f| {
+            println!("  [{:>3.0}%] {m}", f * 100.0)
+        }) {
             Ok((items, notes)) => {
                 println!("  认出来 {} 个文件：", items.len());
                 for it in &items {
@@ -446,12 +448,22 @@ fn main() -> eframe::Result<()> {
         return Ok(());
     }
 
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_title("FrameGen Manager")
+        // 卡片比原来的纯文本行高，默认窗口给大一点，四张卡片不用滚动就能看全
+        .with_inner_size([1060.0, 820.0])
+        .with_min_inner_size([880.0, 560.0]);
+    // 窗口/任务栏图标：取自本 exe 的图标资源（build.rs 把 packaging\app.ico 编了进去），
+    // 取不到就照常启动
+    if let Some(ic) = icon::app_icon() {
+        viewport = viewport.with_icon(egui::IconData {
+            rgba: ic.rgba,
+            width: ic.width as u32,
+            height: ic.height as u32,
+        });
+    }
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title("FrameGen Manager")
-            // 卡片比原来的纯文本行高，默认窗口给大一点，四张卡片不用滚动就能看全
-            .with_inner_size([1060.0, 820.0])
-            .with_min_inner_size([880.0, 560.0]),
+        viewport,
         ..Default::default()
     };
 
@@ -1276,6 +1288,28 @@ fn selftest() {
     // 上游 0.3.0 换过文件名、路径和 README 写法，下面这两组断言就是防它再改一次
     let mut fails: Vec<String> = Vec::new();
 
+    println!("\n--- 图标 ---");
+    match icon::app_icon() {
+        Some(ic) => {
+            ck(
+                &mut fails,
+                ic.width == 256 && ic.height == 256,
+                "窗口图标取到 256×256（来自本 exe 的图标资源）",
+            );
+            ck(
+                &mut fails,
+                ic.rgba.len() == ic.width * ic.height * 4
+                    && ic.rgba.chunks_exact(4).any(|p| p[3] > 0),
+                "窗口图标像素完整、不是全透明",
+            );
+        }
+        None => ck(
+            &mut fails,
+            false,
+            "窗口图标取不到（build.rs 没把 packaging/app.ico 编进 exe？）",
+        ),
+    }
+
     println!("\n--- 显卡路由（哪张卡走哪条路）---");
     for (name, want) in [
         ("NVIDIA GeForce RTX 3050", scan::GpuRoute::Sm86),
@@ -1571,7 +1605,7 @@ fn selftest() {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    println!("\n--- 手动导入：校验与自定义源 ---");
+    println!("\n--- 手动导入：校验与下载源 ---");
     {
         // 没签名的文件（就是本程序自己）必须判成「不可信」
         if let Ok(exe) = std::env::current_exe() {
@@ -1625,19 +1659,17 @@ fn selftest() {
             importer::ini_sanity("[Unknown]\nKey=1\n").is_err(),
             "没有任何已知段落也判成可疑",
         );
-        // 自定义源：一行一个，顺便归一化结尾斜杠、去重
-        let multi = update::split_custom_sources("https://a.example\nhttps://b.example/\n\nhttps://a.example/");
+        // 选中的下载源会归一化：补结尾斜杠；不像网址的一律当「自动」
         ck(
             &mut fails,
-            multi.len() == 2
-                && multi[0] == "https://a.example/"
-                && multi[1] == "https://b.example/",
-            "自定义源支持一行一个（归一化 + 去重）",
+            update::normalize_source("  https://a.example  ")
+                == Some("https://a.example/".to_owned()),
+            "下载源前缀补上结尾斜杠",
         );
         ck(
             &mut fails,
-            update::split_custom_sources("随便写点什么").is_empty(),
-            "不像网址的行会被忽略",
+            update::normalize_source("随便写点什么").is_none(),
+            "不像网址的输入被当成「自动」",
         );
         // 上游源码 zip 里同时有根目录、310.1/、archive/0.2.4/ 三套同名文件：
         // 同名时只留当前在用的那一版（0 最好），否则用户会被三份一样的东西搞晕，
@@ -3233,15 +3265,14 @@ impl App {
             }
             Msg::ImportStaged(items, notes) => {
                 self.import_notes = notes;
+                // 读包阶段结束，进度条该消失了（写入阶段很快，不再单独显示进度）
+                self.progress = None;
                 let untrusted = items.iter().filter(|i| !i.trusted).count();
                 if untrusted == 0 {
                     self.status = format!("{} 个文件校验通过，正在写入 ...", items.len());
                     self.finish_import(items, true);
                 } else {
-                    self.busy = false;
-                    self.import_busy = false;
-                    self.cancel = None;
-                    self.status = format!("{untrusted} 个文件校验没过，等你确认");
+                    self.finish_busy(format!("{untrusted} 个文件校验没过，等你确认"));
                     self.note(format!(
                         "手动导入：{} 个文件校验没过（等用户确认）",
                         untrusted
@@ -3250,16 +3281,15 @@ impl App {
                 }
             }
             Msg::ImportDone(report) => {
-                self.busy = false;
-                self.import_busy = false;
-                self.cancel = None;
+                // 这里曾经漏掉 progress = None —— 导入成功后「上游资产」卡片上还挂着
+                // 「…正在找需要的 ...」，看着像还在读包（用户报的就是这个）
+                self.finish_busy("导入完成");
                 self.update_state = update::load_state();
                 for line in report.lines() {
                     if !line.trim().is_empty() {
                         self.note(line.to_owned());
                     }
                 }
-                self.status = "导入完成".to_owned();
                 self.import_report = Some(report);
             }
             Msg::UpdateChecked(s) => {
@@ -3282,8 +3312,6 @@ impl App {
             }
             Msg::SpeedTested(list) => {
                 self.speed_testing = false;
-                self.busy = false;
-                self.progress = None;
                 let mut fastest: Option<(u64, String)> = None;
                 for s in &list {
                     match &s.error {
@@ -3301,7 +3329,7 @@ impl App {
                     }
                 }
                 self.speed_results = list;
-                self.status = match fastest {
+                let status = match fastest {
                     Some((k, p)) => format!(
                         "测速完成，最快的是 {}（{} KB/s），在「下载源」里点一下就能选中",
                         update::source_label(&p),
@@ -3309,18 +3337,17 @@ impl App {
                     ),
                     None => "测速完成，但一个能用的源都没测出来".to_owned(),
                 };
+                self.finish_busy(status);
             }
             Msg::Done(m) => {
                 self.note(m.clone());
                 // 部署完顺带把「游戏目录已有运行库」这类说明摆在状态栏里，用户一眼能看到
-                self.status = if self.deploy_in_flight && !self.deploy_notes.is_empty() {
+                let status = if self.deploy_in_flight && !self.deploy_notes.is_empty() {
                     format!("{m}（{}）", self.deploy_notes.join("；"))
                 } else {
                     m
                 };
-                self.busy = false;
-                self.progress = None;
-                self.cancel = None;
+                self.finish_busy(status);
                 self.download_failed = false;
                 self.dl_started = None;
                 self.refresh();
@@ -3337,18 +3364,15 @@ impl App {
                 }
             }
             Msg::Failed(e) => {
-                self.note(format!("错误: {e}"));
-                self.status = format!("错误: {e}");
-                self.busy = false;
-                self.progress = None;
-                self.cancel = None;
+                // 走统一收尾：这条以前忘了清 import_busy —— 导入失败后那个转圈会一直转
+                let m = format!("错误: {e}");
+                self.note(m.clone());
+                self.finish_busy(m);
             }
             Msg::DownloadFailed(e) => {
-                self.note(format!("下载失败: {e}"));
-                self.status = format!("下载失败: {e}");
-                self.busy = false;
-                self.progress = None;
-                self.cancel = None;
+                let m = format!("下载失败: {e}");
+                self.note(m.clone());
+                self.finish_busy(m);
                 self.download_failed = true;
             }
             Msg::GpuOpDone(r) => {
@@ -3414,10 +3438,7 @@ impl App {
                     "已取消下载（未留下任何残留）".to_owned()
                 };
                 self.note(m.clone());
-                self.status = m;
-                self.busy = false;
-                self.progress = None;
-                self.cancel = None;
+                self.finish_busy(m);
                 self.download_failed = false;
             }
         }
@@ -3502,7 +3523,20 @@ impl App {
 
     // ---- 后台任务
 
-    /// 手动导入：选中 zip / 文件夹 → 后台解包 + 逐个校验。
+    /// 手动导入：选中 zip（可多选）→ 后台解包 + 逐个校验。
+    /// 后台任务收尾：状态栏、忙碌标记、进度条、取消句柄一次收干净。
+    ///
+    /// 以前这几件事在每个 Msg 分支里各写一遍，结果手动导入那条路漏了清进度条 ——
+    /// 导入其实已经成功、也能正常部署了，界面上却还挂着「…正在找需要的 ...」，
+    /// 看着像卡住。以后新增后台任务，收尾只调这一个函数。
+    fn finish_busy(&mut self, status: impl Into<String>) {
+        self.status = status.into();
+        self.busy = false;
+        self.import_busy = false;
+        self.progress = None;
+        self.cancel = None;
+    }
+
     fn start_import(&mut self, paths: Vec<PathBuf>) {
         if paths.is_empty() {
             return;
@@ -3518,13 +3552,16 @@ impl App {
         self.cancel = Some(cancel.clone());
         self.busy = true;
         self.import_busy = true;
+        // 上一次导入留下的进度条残影先擦掉，否则会闪一下旧文字
+        self.progress = None;
         self.status = "正在读取压缩包并校验（大包要几秒）...".to_owned();
         self.note(format!("开始手动导入：{} 个来源", paths.len()));
         let legacy = self.legacy_3101;
         self.spawn(move |tx, ctx| {
             let ptx = tx.clone();
-            let r = importer::stage(&paths, legacy, &work, &cancel, move |m| {
-                let _ = ptx.send(Msg::Progress(m, 0.0, 0));
+            let r = importer::stage(&paths, legacy, &work, &cancel, move |m, f| {
+                // total 传 0：导入没有「字节总数」可言，进度条用 f 走
+                let _ = ptx.send(Msg::Progress(m, f, 0));
             });
             let _ = tx.send(match r {
                 Ok((items, notes)) => Msg::ImportStaged(items, notes),
@@ -3544,10 +3581,7 @@ impl App {
         let skipped = items.len() - keep.len();
         if keep.is_empty() {
             importer::cleanup(&items);
-            self.busy = false;
-            self.import_busy = false;
-            self.cancel = None;
-            self.status = "没有可导入的文件".to_owned();
+            self.finish_busy("没有可导入的文件");
             return;
         }
         self.status = format!("正在写入 {} 个文件 ...", keep.len());
@@ -4620,17 +4654,6 @@ impl eframe::App for App {
                                 self.start_import(files);
                             }
                         }
-                        if theme::ghost_button(ui, "导入文件夹…", !self.busy)
-                            .on_hover_text("已经自己解压过的话，直接选那个文件夹")
-                            .clicked()
-                        {
-                            if let Some(dir) = rfd::FileDialog::new()
-                                .set_title("选择解压出来的文件夹")
-                                .pick_folder()
-                            {
-                                self.start_import(vec![dir]);
-                            }
-                        }
                         if self.import_busy {
                             ui.add(egui::Spinner::new().size(12.0));
                         }
@@ -4692,13 +4715,8 @@ impl eframe::App for App {
                             .max_by_key(|s| s.kbps);
                         match fastest {
                             Some(s) => format!("自动（最快：{}  {} KB/s）", s.label, s.kbps),
-                            None => "自动（按实测速度挑最快）".to_owned(),
+                            None => "自动".to_owned(),
                         }
-                    } else if current.contains('\n') {
-                        format!(
-                            "指定：自定义 {} 个源",
-                            current.lines().filter(|l| !l.trim().is_empty()).count()
-                        )
                     } else {
                         format!("指定：{}", update::source_label(&current))
                     };
@@ -4706,11 +4724,7 @@ impl eframe::App for App {
                         .width(320.0)
                         .selected_text(selected_text)
                         .show_ui(ui, |ui| {
-                            ui.selectable_value(
-                                &mut choice,
-                                String::new(),
-                                "自动（按实测速度挑最快）",
-                            );
+                            ui.selectable_value(&mut choice, String::new(), "自动");
                             for (prefix, label, speed) in &rows {
                                 ui.selectable_value(
                                     &mut choice,
@@ -4726,7 +4740,7 @@ impl eframe::App for App {
                         }
                         self.save_config();
                         self.status = if choice.is_empty() {
-                            "已改为自动选源（按实测速率挑最快的）".to_owned()
+                            "已改为自动选源".to_owned()
                         } else {
                             format!("已选中下载源 {}", update::source_label(&choice))
                         };
@@ -4742,34 +4756,7 @@ impl eframe::App for App {
                         };
                         ui.label(theme::hint(txt));
                     }
-                    ui.label(theme::hint(
-                        "选中的源排最前面，其余镜像仍会兜底；下载中不会因为慢而换源，慢也让它慢慢下完。",
-                    ));
-                    ui.collapsing("自定义下载源（高级，一行一个）", |ui| {
-                        ui.add(
-                            egui::TextEdit::multiline(&mut self.backup_prefix)
-                                .desired_width(f32::INFINITY)
-                                .desired_rows(3)
-                                .hint_text("https://自己的镜像/\nhttps://再来一个/"),
-                        );
-                        ui.horizontal(|ui| {
-                            if theme::ghost_button(ui, "用这些源", true).clicked() {
-                                self.use_backup = !self.backup_prefix.trim().is_empty();
-                                self.save_config();
-                                self.status = "下载源已保存".to_owned();
-                            }
-                            if theme::ghost_button(ui, "改回自动", true).clicked() {
-                                self.backup_prefix.clear();
-                                self.use_backup = false;
-                                self.save_config();
-                                self.status =
-                                    "已改回自动选源（按实测速度挑最快的）".to_owned();
-                            }
-                        });
-                        ui.label(theme::hint(
-                            "一行一个前缀，会拼在官方地址前面，按你填的顺序先试。填错也没关系：内容对不上会被自动拒绝。",
-                        ));
-                    });
+                    ui.label(theme::hint("选中的源排最前面，其余镜像作为兜底。"));
 
                     // 进度条就放在按钮下面，速度/剩余时间单独一行
                     if let Some((text, f)) = self.progress.clone() {
@@ -4816,20 +4803,6 @@ impl eframe::App for App {
                             self.start_download();
                         }
                         ui.label(theme::hint(format!("当前备用源：{}", self.backup_prefix)));
-                        ui.collapsing("想换个备用源地址", |ui| {
-                            ui.add(
-                                egui::TextEdit::singleline(&mut self.backup_prefix)
-                                    .desired_width(260.0)
-                                    .hint_text("https://xxx/"),
-                            );
-                            if theme::ghost_button(ui, "保存", true).clicked() {
-                                self.save_config();
-                                self.status = "备用源设置已保存".to_owned();
-                            }
-                            ui.label(theme::hint(
-                                "前缀会拼在官方地址前面。填错也没关系，内容对不上会被自动拒绝。",
-                            ));
-                        });
                     }
 
                     // 资产清单：按「核心 Mod / DLSS 运行库」分组显示
@@ -5856,10 +5829,7 @@ impl eframe::App for App {
             } else if cancel {
                 self.import_pending = None;
                 importer::cleanup(&items);
-                self.busy = false;
-                self.import_busy = false;
-                self.cancel = None;
-                self.status = "已取消导入".to_owned();
+                self.finish_busy("已取消导入");
             }
         }
 

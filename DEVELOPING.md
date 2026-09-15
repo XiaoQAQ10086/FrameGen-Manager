@@ -332,15 +332,16 @@ game_library.json（和配置文件放一起，便携版就在 exe 旁边）：�
 * 策略：签名可信 → 静默；否则 → 弹窗（默认跳过可疑项，可强行导入，选择写日志）。
 * 导入的文件在 `update_state.json` 里标 `imported: true`：判定「已就绪」只比文件在不在、
   大小对不对，**不再要求官方指纹** —— 用户就是因为下不动才导入的，否则会又去下一遍。
-* 自测：`--importtest <zip/文件夹>`（只解包 + 校验，不写资产目录）、
+* 自测：`--importtest <zip>`（只解包 + 校验，不写资产目录）、
   `--verifytest <文件>`（打印签名结论、签名者、证书指纹）。
 
 ### 下载源列表（为什么改成一行下拉）
 
 平铺按钮在 3 个源时刚好，6 个以上会折成好几行 —— 改成一行 `ComboBox`，「自动」时把实测最快的那个
 写进标题。源列表 2026-09-15 用 `--speedall` 实测两轮共 27 个候选，活下来的只有 6 个（写进
-`MIRRORS` 并注明实测速度）；**死源不留** —— 每次下载都要为它空等一次超时。自定义源改成一行一个
-（`update::split_custom_sources` 负责归一化结尾斜杠 + 去重）。
+`MIRRORS` 并注明实测速度）；**死源不留** —— 每次下载都要为它空等一次超时。**下载源只能从这几个
+里挑**（「自动」或指定其中一个），手填地址那个功能已经删掉；`update::normalize_source()` 只负责
+给选中的前缀做归一化（补结尾斜杠）。
 
 ### 两个 DLSS 运行库：缺才补，已有不动
 
@@ -603,3 +604,21 @@ assets / backups / 配置文件 / **下载记录**（`assets\update_state.json`�
       icon.rs        从 EXE 提取图标
       theme.rs       浅色主题 + 卡片 / 徽章 / 按钮组件
       util.rs        哈希 / 原子替换 / 便携配置与备份目录（含老版本一次性搬迁）
+
+## 图标
+
+* `packaging/app-icon.png` —— 1024×1024 母版（美术原图另存一份留档）。改图后重跑：
+  `powershell -ExecutionPolicy Bypass -File packaging\make-ico.ps1`
+* `packaging/make-ico.ps1` —— 从母版生成并**提交** `packaging/app.ico`
+  （16/20/24/32/40/48/64/96/128/256；≤64 存 DIB、≥96 存 PNG）。Cargo 因此**不需要任何
+  图片 / 图标 crate**。脚本顺带把每一档**用 Win32 LoadImage 读回来**验证并出一张预览图。
+  （注意：System.Drawing 自己的 `Icon(path,w,h)` 读不了 PNG 压缩帧、会读出噪点 —— 那是
+  .NET 的老问题，Shell / LoadImage / PrivateExtractIcons 都正常，别被它误导。）
+* `build.rs` —— 调 Windows SDK 自带的 `rc.exe` 把 app.ico 编成 .res，再用
+  `cargo:rustc-link-arg` 交给链接器。**没有 build-dependency**；找不到 rc.exe 或 app.ico
+  时只警告、不中断构建（换台没装 SDK 的机器照样能编，只是 exe 没图标）。
+  坑：`.rc` 里 `\` 是转义字符，路径里的反斜杠必须写成两个，否则 rc 报 RC2135 file not found。
+* 窗口 / 任务栏图标不是另找一张图：`icon::app_icon()` 用 `PrivateExtractIconsW` 从
+  **本 exe 的图标资源**取 256 档，复用 `icon.rs` 里已有的 HICON → RGBA。
+  `--selftest` 里有断言（尺寸 + 像素不是全透明）。
+* 安装包：`packaging/installer.iss` 的 `SetupIconFile=app.ico` 用的是同一个文件。

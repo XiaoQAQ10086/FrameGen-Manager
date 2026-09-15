@@ -190,27 +190,9 @@ fn classify(kind: Kind, name: String, tmp: PathBuf, from: String) -> Result<Stag
     })
 }
 
-/// 递归列出目录里的所有文件
-fn walk_files(dir: &Path) -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    let mut stack = vec![dir.to_path_buf()];
-    while let Some(d) = stack.pop() {
-        let Ok(rd) = std::fs::read_dir(&d) else { continue };
-        for e in rd.flatten() {
-            let p = e.path();
-            if p.is_dir() {
-                stack.push(p);
-            } else {
-                out.push(p);
-            }
-        }
-    }
-    out
-}
-
-/// 从一批路径里找出所有认得的文件，解到 work_dir 并逐个校验。
+/// 从用户选的一个或多个 zip 里找出所有认得的文件，解到 work_dir 并逐个校验。
 ///
-/// paths 里可以混着 .zip 和文件夹（有人习惯先解压）。
+/// 只支持 zip：以前也支持直接选一个解压好的文件夹，那个入口已经删掉。
 /// legacy = 当前在用的是不是 310.1 版；上游源码 zip 里同时有根目录、310.1/ 和 archive/
 /// 三套同名文件，靠它决定优先取哪一套。
 pub fn stage(
@@ -218,7 +200,9 @@ pub fn stage(
     legacy: bool,
     work_dir: &Path,
     cancel: &AtomicBool,
-    mut progress: impl FnMut(String),
+    // 进度回调：(给用户看的一句话, 0.0~1.0 的完成度)。以前没有完成度，
+    // 大压缩包导入时进度条一动不动，看着像卡死 —— 现在按「已看几个文件」推进。
+    mut progress: impl FnMut(String, f32),
     // 第二个返回值是「说明」清单：哪些文件被跳过、为什么，界面会写进导入结果
 ) -> Result<(Vec<Staged>, Vec<String>)> {
     std::fs::create_dir_all(work_dir)?;
@@ -233,61 +217,37 @@ pub fn stage(
         if cancel.load(Ordering::Relaxed) {
             anyhow::bail!("{}", update::CANCELLED_MSG);
         }
-        if p.is_dir() {
-            // 先自己解压过的人：直接扫文件夹
-            let files = walk_files(p);
-            progress(format!("扫描文件夹 {}（{} 个文件）...", p.display(), files.len()));
-            for f in files {
-                if cancel.load(Ordering::Relaxed) {
-                    anyhow::bail!("{}", update::CANCELLED_MSG);
-                }
-                let base = f
-                    .file_name()
-                    .map(|s| s.to_string_lossy().to_lowercase())
-                    .unwrap_or_default();
-                let Some(kind) = kind_of(&base) else { continue };
-                let rel = f
-                    .strip_prefix(p)
-                    .map(|r| r.to_string_lossy().to_string())
-                    .unwrap_or_else(|_| f.display().to_string());
-                let tmp = work_dir.join(format!("s{si}-{uniq}-{base}"));
-                uniq += 1;
-                std::fs::copy(&f, &tmp)
-                    .with_context(|| format!("复制 {} 失败", f.display()))?;
-                match classify(kind, base, tmp.clone(), p.display().to_string()) {
-                    Ok(st) => cands.push((build_rank(&rel, legacy), rel, st)),
-                    Err(e) => {
-                        let _ = std::fs::remove_file(&tmp);
-                        progress(format!("{} 处理失败，已跳过：{e}", f.display()));
-                    }
-                }
-            }
-            continue;
-        }
         if !p.is_file() {
-            progress(format!("跳过（不存在）：{}", p.display()));
+            progress(format!("跳过（不是 zip 文件）：{}", p.display()), 0.0);
             continue;
         }
         let pack = p
             .file_name()
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_default();
-        progress(format!("打开 {pack} ..."));
+        progress(format!("打开 {pack} ..."), 0.0);
         let list = match update::zip_list(p) {
             Ok(l) => l,
             Err(e) => {
                 // 选错文件很正常（比如选了 rar），说清原因就好
-                progress(format!("{pack} 不是有效的 zip，已跳过（{e}）"));
+                progress(format!("{pack} 不是有效的 zip，已跳过（{e}）"), 0.0);
                 continue;
             }
         };
-        progress(format!("{pack} 里有 {} 个文件，正在找需要的 ...", list.len()));
-        for meta in &list {
+        let n = list.len();
+        progress(format!("{pack} 里有 {n} 个文件，正在找需要的 ..."), 0.0);
+        for (i, meta) in list.iter().enumerate() {
             if cancel.load(Ordering::Relaxed) {
                 anyhow::bail!("{}", update::CANCELLED_MSG);
             }
+            let seen = i + 1;
+            let frac = seen as f32 / n.max(1) as f32;
             let base = basename_lower(&meta.name);
-            let Some(kind) = kind_of(&base) else { continue };
+            let Some(kind) = kind_of(&base) else {
+                progress(format!("{pack}：已看 {seen}/{n}，正在找需要的 ..."), frac);
+                continue;
+            };
+            progress(format!("{pack}：已看 {seen}/{n}，正在校验 {base} ..."), frac);
             let tmp = work_dir.join(format!("s{si}-{uniq}-{base}"));
             uniq += 1;
             let n = update::zip_extract_to(p, meta, &tmp)?;
@@ -299,7 +259,7 @@ pub fn stage(
                 Ok(st) => cands.push((build_rank(&meta.name, legacy), meta.name.clone(), st)),
                 Err(e) => {
                     let _ = std::fs::remove_file(&tmp);
-                    progress(format!("{} 处理失败，已跳过：{e}", meta.name));
+                    progress(format!("{} 处理失败，已跳过：{e}", meta.name), frac);
                 }
             }
         }
