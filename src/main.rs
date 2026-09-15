@@ -1366,6 +1366,81 @@ fn selftest() {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    println!("\n--- 日志滚动（目录里只留两个文件）---");
+    {
+        let dir = std::env::temp_dir().join("fgm-log-selftest");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+        let names = |d: &Path| -> Vec<String> {
+            let mut v: Vec<String> = std::fs::read_dir(d)
+                .map(|rd| {
+                    rd.flatten()
+                        .map(|e| e.file_name().to_string_lossy().to_string())
+                        .collect()
+                })
+                .unwrap_or_default();
+            v.sort();
+            v
+        };
+        let read = |p: &Path| std::fs::read_to_string(p).unwrap_or_default();
+
+        // 情况一：老版本留下的多个带时间戳文件（用户升级上来就是这个样）
+        for n in [
+            "framegen-20260101010101UTC.log",
+            "framegen-20260202020202UTC.log",
+        ] {
+            let _ = std::fs::write(dir.join(n), b"legacy");
+        }
+        let cur = log::rotate(&dir);
+        ck(
+            &mut fails,
+            cur == dir.join(log::CUR_NAME),
+            "本次写的是固定名字 framegen.log",
+        );
+        ck(
+            &mut fails,
+            names(&dir) == vec![log::PREV_NAME.to_owned()],
+            &format!(
+                "升级上来第一次滚动：旧的带时间戳文件全清掉，只留 prev（实际 {:?}）",
+                names(&dir)
+            ),
+        );
+        ck(
+            &mut fails,
+            read(&dir.join(log::PREV_NAME)) == "legacy",
+            "老版本里最新那份被留成「上一次」，没白丢",
+        );
+
+        // 情况二：正常一轮滚动 —— 本次的变成「上一次」，更早的删掉
+        std::fs::write(dir.join(log::CUR_NAME), b"run2").unwrap();
+        log::rotate(&dir);
+        ck(
+            &mut fails,
+            read(&dir.join(log::PREV_NAME)) == "run2",
+            "上一次运行的内容被滚到 prev",
+        );
+        ck(
+            &mut fails,
+            !dir.join(log::CUR_NAME).is_file(),
+            "本次的文件先不存在（由 init 新建，保证从干净文件开始写）",
+        );
+        ck(
+            &mut fails,
+            names(&dir) == vec![log::PREV_NAME.to_owned()],
+            "第二轮之后目录里只剩 prev 一个（init 马上会建本次那个）",
+        );
+
+        // 情况三：再滚一轮，prev 被删、本次上位
+        std::fs::write(dir.join(log::CUR_NAME), b"run3").unwrap();
+        log::rotate(&dir);
+        ck(
+            &mut fails,
+            read(&dir.join(log::PREV_NAME)) == "run3" && names(&dir).len() == 1,
+            "继续滚动也不会堆积（永远最多 2 个文件）",
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     println!("\n--- 手动导入：校验与自定义源 ---");
     {
         // 没签名的文件（就是本程序自己）必须判成「不可信」

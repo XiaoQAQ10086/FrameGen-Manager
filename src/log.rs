@@ -9,6 +9,10 @@
 //!
 //! 实现刻意做得糙而稳：一个全局文件句柄加一把锁，每行写完立刻 flush（进程被强杀
 //! 也留得下内容），任何一步失败都静默忽略 —— 日志绝不能把主流程搞崩。
+//!
+//! **目录里永远只有两个文件**：framegen.log（本次运行）+ framegen.prev.log（上一次运行）。
+//! 以前是「一次运行一个带时间戳的文件、保留 10 个」，用户反馈说点开一次多一个、看着乱，
+//! 所以改成固定名字滚动覆盖：上一次的改名成 prev，更早的删掉。
 
 use std::fs::{File, OpenOptions};
 use std::io::Write;
@@ -17,8 +21,12 @@ use std::sync::{Mutex, OnceLock};
 
 use crate::util;
 
-/// 最多保留几个日志文件，超了删最旧的。
-const KEEP_FILES: usize = 10;
+/// 本次运行的日志文件名（固定名字：每次启动都复用同一个，不再一启动多一个文件）
+pub const CUR_NAME: &str = "framegen.log";
+/// 上一次运行的日志文件名 —— 只留这一份「上一次」。
+/// 为什么不只留一份：用户常常是先关掉程序、过一会儿才来反馈，只留一份的话
+/// 出问题那趟的记录已经被这次启动覆盖了；留两份刚好既能查、又不堆积。
+pub const PREV_NAME: &str = "framegen.prev.log";
 
 static FILE: OnceLock<Mutex<File>> = OnceLock::new();
 static PATH: OnceLock<PathBuf> = OnceLock::new();
@@ -45,12 +53,55 @@ pub fn path() -> Option<&'static PathBuf> {
 /// 开一个本次会话的日志文件，返回它的路径。
 pub fn init() -> Option<PathBuf> {
     let d = dir()?;
-    prune(&d);
-    let p = d.join(format!("framegen-{}.log", stamp()));
+    let p = rotate(&d);
     let f = OpenOptions::new().create(true).append(true).open(&p).ok()?;
     let _ = FILE.set(Mutex::new(f));
     let _ = PATH.set(p.clone());
     Some(p)
+}
+
+/// 滚动日志：**目录里永远只有两个文件**。
+///
+///   1. 上一次的上一次（framegen.prev.log）删掉
+///   2. 上一次那份（framegen.log）改名成 framegen.prev.log
+///   3. 老版本（0.9.5 及以前）每次启动建一个带时间戳的文件：把最新的那份留作
+///      「上一次」，其余全删 —— 用户一升级上来，目录里十几个文件立刻变干净
+///
+/// 抽成独立函数是为了自测能直接验它（init 里的全局句柄只能设一次）。
+/// 返回本次要写的文件路径。
+pub fn rotate(d: &Path) -> PathBuf {
+    let cur = d.join(CUR_NAME);
+    let prev = d.join(PREV_NAME);
+    let _ = std::fs::remove_file(&prev);
+    if cur.is_file() && std::fs::rename(&cur, &prev).is_err() {
+        // 改名失败（极少见：被别的程序占着）就删掉，保证本次是从干净的文件开始写
+        let _ = std::fs::remove_file(&cur);
+    }
+
+    let mut legacy: Vec<PathBuf> = std::fs::read_dir(d)
+        .map(|rd| {
+            rd.flatten()
+                .map(|e| e.path())
+                .filter(|p| {
+                    p.file_name()
+                        .and_then(|n| n.to_str())
+                        .map(|n| n.starts_with("framegen-") && n.ends_with(".log"))
+                        .unwrap_or(false)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    legacy.sort();
+    if !prev.is_file() {
+        // 刚从老版本升级上来：把最新那份带时间戳的留成「上一次」，别让用户白丢
+        if let Some(newest) = legacy.pop() {
+            let _ = std::fs::rename(&newest, &prev);
+        }
+    }
+    for p in legacy {
+        let _ = std::fs::remove_file(p);
+    }
+    cur
 }
 
 /// 写一行。没初始化过就什么都不做 —— 命令行自检和测试不该因此崩。
@@ -67,14 +118,6 @@ pub fn section(title: &str) {
     line(&format!("========== {} ==========", title));
 }
 
-/// 文件名用的时间戳（纯数字，按名字排序就是按时间排序）
-fn stamp() -> String {
-    util::now_utc()
-        .chars()
-        .filter(|c| c.is_ascii_alphanumeric())
-        .collect()
-}
-
 /// 行首的时间（只取时分秒）
 fn clock() -> String {
     util::now_utc()
@@ -84,24 +127,3 @@ fn clock() -> String {
         .to_owned()
 }
 
-/// 只保留最近 KEEP_FILES 个日志文件。文件名带时间戳，按名字排序即按时间排序。
-fn prune(d: &Path) {
-    let Ok(rd) = std::fs::read_dir(d) else { return };
-    let mut files: Vec<PathBuf> = rd
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| {
-            p.file_name()
-                .and_then(|n| n.to_str())
-                .map(|n| n.starts_with("framegen-") && n.ends_with(".log"))
-                .unwrap_or(false)
-        })
-        .collect();
-    files.sort();
-    if files.len() <= KEEP_FILES {
-        return;
-    }
-    for p in &files[..files.len() - KEEP_FILES] {
-        let _ = std::fs::remove_file(p);
-    }
-}
