@@ -127,7 +127,7 @@ fn do_migrate_backups() -> Option<String> {
 const CONFIG_NAME: &str = "framegen-manager.json";
 
 /// 应用配置。默认放在 exe 同级（便携，解压即用）；exe 同级不可写时回退 %APPDATA%。
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
     /// 用户自定义的资产目录。None 表示用默认位置。
     #[serde(default)]
@@ -138,6 +138,34 @@ pub struct AppConfig {
     /// 用户选定的下载源前缀。留空 = 自动（按实测速率挑最快的那个）。
     #[serde(default)]
     pub backup_prefix: String,
+    /// 部署时写进 INI 的「优化等级」（上游 0.3.2 是 0~3 档；出厂默认 1 = 加速且与官方逐位一致）。
+    /// 只影响**部署到游戏目录的那一份**，资产目录里的原文件不动。
+    #[serde(default = "default_fg_optimized")]
+    pub fg_optimized: u8,
+    /// 部署时写进 INI 的「倍率上限」（3 = 最高 4X 出厂默认；5 = 最高 6X）。
+    #[serde(default = "default_fg_frames")]
+    pub fg_frames: u8,
+}
+
+// 这两个是**业务默认**（1 / 3），不是 u8 的类型默认（0），所以 AppConfig 的 Default
+// 必须手写 —— 否则配置文件丢了或者读坏了，会静默变成「档位 0」（原厂内核不加速）。
+fn default_fg_optimized() -> u8 {
+    1
+}
+fn default_fg_frames() -> u8 {
+    3
+}
+
+impl Default for AppConfig {
+    fn default() -> Self {
+        Self {
+            asset_dir: None,
+            allow_backup_source: false,
+            backup_prefix: String::new(),
+            fg_optimized: default_fg_optimized(),
+            fg_frames: default_fg_frames(),
+        }
+    }
 }
 
 

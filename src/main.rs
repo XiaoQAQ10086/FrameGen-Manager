@@ -844,6 +844,16 @@ fn ck(fails: &mut Vec<String>, ok: bool, what: &str) {
     }
 }
 
+/// 「优化等级」下拉框上显示的一行短标题
+fn fg_optimized_label(v: u8) -> &'static str {
+    match v {
+        0 => "0 · 原厂不加速",
+        2 => "2 · 更快（轻微有损）",
+        3 => "3 · 最快（有损）",
+        _ => "1 · 与官方逐位一致",
+    }
+}
+
 /// **部署前的显卡闸门**：返回 Some(理由) = 禁止部署，None = 放行。
 ///
 /// 抽成独立的纯函数是为了自测能直接断言 —— 「哪张卡能装、哪张不能」是用户最容易
@@ -1379,6 +1389,54 @@ fn selftest() {
             &row_of("version.dll", 100, true),
         ) == AssetState::Ready,
         "下载来的文件 + 指纹一致 → 已就绪",
+    );
+
+    println!("\n--- 部署用的 INI 档位改写 ---");
+    {
+        let dir = std::env::temp_dir().join("fgm-ini-tiers");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+        let src = dir.join("dlssg_sm86.ini");
+        std::fs::write(&src, "; c\n[FrameGeneration]\nOptimized=1\nMaxGeneratedFrames=3\n").unwrap();
+        let (p, n) = update::prepare_deploy_ini(
+            &src,
+            update::DEFAULT_OPTIMIZED,
+            update::DEFAULT_MAX_FRAMES,
+        )
+        .unwrap();
+        ck(&mut fails, p == src && n.is_empty(), "默认档位：直接用上游原文件，不做任何改写");
+        let (p2, n2) = update::prepare_deploy_ini(&src, 2, 5).unwrap();
+        let txt = std::fs::read_to_string(&p2).unwrap_or_default();
+        ck(
+            &mut fails,
+            p2 != src
+                && txt.contains("Optimized=2")
+                && txt.contains("MaxGeneratedFrames=5")
+                && !txt.contains("Optimized=1"),
+            "换档位：只改这两个键，其余内容原样",
+        );
+        ck(&mut fails, n2.len() == 2, "两处改动都写进说明");
+        ck(
+            &mut fails,
+            std::fs::read_to_string(&src)
+                .map(|t| t.contains("Optimized=1"))
+                .unwrap_or(false),
+            "资产目录里那份原文件保持不动",
+        );
+        let slim = dir.join("slim.ini");
+        std::fs::write(&slim, "; slim\n[General]\nEnabled=1\n").unwrap();
+        ck(
+            &mut fails,
+            update::prepare_deploy_ini(&slim, 3, 5).is_ok(),
+            "INI 里没有那两个键也不报错（照旧部署）",
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    ck(
+        &mut fails,
+        util::AppConfig::default().fg_optimized == update::DEFAULT_OPTIMIZED
+            && util::AppConfig::default().fg_frames == update::DEFAULT_MAX_FRAMES,
+        "配置的默认档位与出厂默认一致（配置丢了也不会变成档位 0）",
     );
 
     println!("\n--- 显卡路由（哪张卡走哪条路）---");
@@ -2691,6 +2749,10 @@ struct App {
     cancel: Option<Arc<AtomicBool>>,
     use_backup: bool,
     backup_prefix: String,
+    /// 部署时写进 INI 的「优化等级」（上游 0.3.2 的 0~3 档，默认 1）
+    fg_optimized: u8,
+    /// 部署时写进 INI 的「倍率上限」（3 = 4X，5 = 6X）
+    fg_frames: u8,
     download_failed: bool,
     /// 测速结果，界面按它列候选源
     speed_results: Vec<update::SourceSpeed>,
@@ -2801,7 +2863,7 @@ impl App {
             spoof_ack: false,
             spoof_pending: None,
             confirm_old_driver: false,
-                kernel_ac_pending: None,
+            kernel_ac_pending: None,
             allow_kernel_ac: false,
                 hags_fake: match std::env::var("DLSSG_FAKE_HAGS").ok().as_deref() {
                 Some("on") | Some("2") => Some(gpu::HagsState::Enabled),
@@ -2829,6 +2891,8 @@ impl App {
             } else {
                 cfg.backup_prefix
             },
+            fg_optimized: cfg.fg_optimized,
+            fg_frames: cfg.fg_frames,
             download_failed: false,
             speed_results: Vec::new(),
             speed_testing: false,
@@ -3555,6 +3619,8 @@ impl App {
             asset_dir: util::load_config().asset_dir,
             allow_backup_source: self.use_backup,
             backup_prefix: self.backup_prefix.clone(),
+            fg_optimized: self.fg_optimized,
+            fg_frames: self.fg_frames,
         };
         if let Err(e) = util::save_config(&cfg) {
             self.note(format!("保存配置失败: {e}"));
@@ -3572,6 +3638,8 @@ impl App {
         cfg.asset_dir = Some(dir.clone());
         cfg.allow_backup_source = self.use_backup;
         cfg.backup_prefix = self.backup_prefix.clone();
+        cfg.fg_optimized = self.fg_optimized;
+        cfg.fg_frames = self.fg_frames;
         if let Err(e) = util::save_config(&cfg) {
             self.status = format!("保存配置失败: {e}");
             return;
@@ -4165,17 +4233,22 @@ impl App {
         }
         self.deploy_notes = notes;
 
-        // INI 直接用资产目录里那份原文件：上游 0.3.1 起 20/30 系通用，
-        // 出厂 INI 一个键都不需要改（这里以前会给 RTX 20 系改写 Router=SM75）
-        let ini = update::asset_path(update::INI_REPO_PATH).unwrap_or_default();
-        if !ini.is_file() {
-            self.status = format!(
-                "缺少 {}，请先点「下载 / 更新资产」",
-                update::INI_REPO_PATH
-            );
-            return;
+        // INI：按界面上那两个档位准备。都是出厂默认时返回的就是资产里那份原文件
+        //（一个字都不改）；改了档位才写一份 deploy.ini，资产里那份始终不动。
+        let asset_ini = update::asset_path(update::INI_REPO_PATH).unwrap_or_default();
+        let (ini_path, ini_notes) =
+            match update::prepare_deploy_ini(&asset_ini, self.fg_optimized, self.fg_frames) {
+                Ok(v) => v,
+                Err(e) => {
+                    self.status = format!("准备 INI 失败: {e}");
+                    return;
+                }
+            };
+        for n in &ini_notes {
+            self.note(n.clone());
+            self.deploy_notes.push(n.clone());
         }
-        files.push(deploy::DeployFile::new(deploy::INI_NAME, ini));
+        files.push(deploy::DeployFile::new(deploy::INI_NAME, ini_path));
 
         self.busy = true;
         self.deploy_in_flight = true;
@@ -5023,13 +5096,66 @@ impl eframe::App for App {
                     if let Some(d) = self.driver.as_ref().filter(|d| d.too_old()) {
                         ui.label(
                             egui::RichText::new(format!(
-                                "⚠ 当前驱动 {} 低于 {}，帧生成可能不生效（点「部署」时会再确认一次）。",
+                                "⚠ 当前驱动 {} 低于 {}：更旧的驱动会自动回退到 PTX 内核（只在首次加载时多一次编译），一般仍然能用，但更新驱动更稳（点「部署」时会再确认一次）。",
                                 d.marketing,
                                 gpu::MIN_FG_DRIVER_TEXT
                             ))
                             .size(11.5)
                             .color(theme::DANGER),
                         );
+                    }
+
+                    // 上游 0.3.2 的两个档位：只写进**部署到游戏目录的那一份** INI，
+                    // 资产目录里的原文件不动；两个都是出厂默认时我们一个字都不改。
+                    let fg_before = (self.fg_optimized, self.fg_frames);
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("优化等级").size(12.0).color(theme::TEXT_MUTED));
+                        let r = egui::ComboBox::from_id_salt("fg-optimized")
+                            .selected_text(fg_optimized_label(self.fg_optimized))
+                            .show_ui(ui, |ui| {
+                                for (v, t) in [
+                                    (0u8, "0 · 原厂内核，不加速"),
+                                    (1u8, "1 · 加速，画面与官方逐位一致（默认）"),
+                                    (2u8, "2 · 更快，图像内核轻微有损（仅最新版）"),
+                                    (3u8, "3 · 最快，全部有损（仅最新版）"),
+                                ] {
+                                    ui.selectable_value(&mut self.fg_optimized, v, t);
+                                }
+                            });
+                        r.response.on_hover_text(
+                            "上游 0.3.2 新增的四级一致性档位：数字越大越快、离官方画面越远。\n                             1（默认）是全部「逐位一致」的加速；2 / 3 有画质代价，只在最新版上有效。",
+                        );
+                        ui.add_space(12.0);
+                        ui.label(egui::RichText::new("倍率上限").size(12.0).color(theme::TEXT_MUTED));
+                        let r2 = egui::ComboBox::from_id_salt("fg-frames")
+                            .selected_text(if self.fg_frames >= 5 { "6X" } else { "4X" })
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(&mut self.fg_frames, 3, "4X（出厂默认）");
+                                ui.selectable_value(
+                                    &mut self.fg_frames,
+                                    5,
+                                    "6X（要游戏自带的插件也支持）",
+                                );
+                            });
+                        r2.response.on_hover_text(
+                            "游戏请求的倍率上限：4X 是上游出厂默认；6X 只在最新版上支持，\n                             而且游戏自己的插件只支持 4X 时，选了也没用。",
+                        );
+                    });
+                    if (self.fg_optimized, self.fg_frames) != fg_before {
+                        self.save_config();
+                    }
+                    if self.fg_optimized == update::DEFAULT_OPTIMIZED
+                        && self.fg_frames == update::DEFAULT_MAX_FRAMES
+                    {
+                        ui.label(theme::hint(
+                            "出厂默认（优化等级 1、倍率上限 4X）：部署时直接用上游原文件，不做任何改写。",
+                        ));
+                    } else {
+                        ui.label(theme::hint(format!(
+                            "部署时会写进游戏目录那份 dlssg_sm86.ini：优化等级 {}、倍率上限 {}（资产目录里的原文件不动）。",
+                            fg_optimized_label(self.fg_optimized),
+                            if self.fg_frames >= 5 { "6X" } else { "4X" }
+                        )));
                     }
 
                     ui.add_space(2.0);
@@ -5668,7 +5794,8 @@ impl eframe::App for App {
                     );
                     ui.add_space(6.0);
                     ui.label(
-                        "驱动过旧时帧生成很可能不生效，部署了也是白部署。建议先更新显卡驱动再试。",
+                        "按上游说明，cubin 内核需要 R580 以上；更旧的驱动会自动改用 PTX 内核（只在首次加载时多一次编译），所以一般仍能用，只是首帧慢一点。
+更新驱动更稳，但不更新也可以继续试。",
                     );
                     ui.add_space(8.0);
                     ui.horizontal(|ui| {

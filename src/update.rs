@@ -799,10 +799,78 @@ pub fn clear_download_records() -> usize {
     n
 }
 
-// （这里原来有一段「按显卡改写 INI」的代码：给 RTX 20 系把 Router 改成 SM75。
-//  上游 0.3.1 起不需要了 —— 根目录这一套文件 20/30 系通用，出厂 INI 一个键都不用改，
-//  所以整个子系统（ini_get / ini_set / IniPlan / prepare_deploy_ini*）都删掉了，
-//  部署时直接用资产目录里那份原文件。）
+// ------------------------------------------------- 部署用的 INI（只改用户主动选的档位）
+
+/// 出厂默认的「优化等级」（上游 0.3.2 的出厂 INI：Optimized=1）
+pub const DEFAULT_OPTIMIZED: u8 = 1;
+/// 出厂默认的「倍率上限」（3 = 最高 4X；5 = 最高 6X）
+pub const DEFAULT_MAX_FRAMES: u8 = 3;
+
+/// 把「键=值」这一行改掉，其它内容（包括注释和顺序）原样保留。
+/// 找不到这个键就返回 None —— 调用方保持原样并说明一句，而不是报错。
+fn ini_set_key(text: &str, key: &str, value: &str) -> Option<String> {
+    let mut found = false;
+    let mut out = String::with_capacity(text.len());
+    for line in text.split_inclusive('\n') {
+        let t = line.trim();
+        if !t.starts_with(';') && !t.starts_with('#') {
+            if let Some(rest) = t.strip_prefix(key) {
+                if rest.strip_prefix('=').is_some() {
+                    out.push_str(&format!("{key}={value}"));
+                    if line.ends_with('\n') {
+                        out.push('\n');
+                    }
+                    found = true;
+                    continue;
+                }
+            }
+        }
+        out.push_str(line);
+    }
+    if found {
+        Some(out)
+    } else {
+        None
+    }
+}
+
+/// 准备要部署的 INI，返回（文件路径, 给人看的改动说明）。
+///
+/// 出厂 INI 本来就是对的，所以**两个值都是默认值时直接返回资产里那份原文件，一个字都不改**；
+/// 只有用户主动选了别的档位才写一份 dlssg_sm86.deploy.ini（资产里那份原文件始终不动）。
+///
+/// optimized：0 原厂不加速 / 1 加速且画面与官方逐位一致（出厂默认）/ 2 再加有损图像内核 / 3 全部有损
+/// max_frames：3 = 最高 4X（出厂默认）/ 5 = 最高 6X（仅 310.9 版，且要游戏自带插件支持）
+pub fn prepare_deploy_ini(
+    upstream: &Path,
+    optimized: u8,
+    max_frames: u8,
+) -> Result<(PathBuf, Vec<String>)> {
+    if !upstream.is_file() {
+        bail!("还没有下载 {INI_REPO_PATH}, 请先点「下载 / 更新资产」");
+    }
+    if optimized == DEFAULT_OPTIMIZED && max_frames == DEFAULT_MAX_FRAMES {
+        return Ok((upstream.to_path_buf(), Vec::new()));
+    }
+    let mut out = std::fs::read_to_string(upstream).context("读取 INI 失败")?;
+    let mut notes: Vec<String> = Vec::new();
+    for (key, value, what) in [
+        ("Optimized", optimized.to_string(), "优化等级"),
+        ("MaxGeneratedFrames", max_frames.to_string(), "倍率上限"),
+    ] {
+        match ini_set_key(&out, key, &value) {
+            Some(new) => {
+                notes.push(format!("{what} {key}={value}"));
+                out = new;
+            }
+            // 上游以后改键名/精简掉这一项时不能报错，照旧部署、说明一句
+            None => notes.push(format!("{what}：这份 INI 里没有 {key} 这一行，保持原样")),
+        }
+    }
+    let dest = upstream.with_file_name("dlssg_sm86.deploy.ini");
+    std::fs::write(&dest, &out).context("写入部署用 INI 失败")?;
+    Ok((dest, notes))
+}
 
 // ---------------------------------------------------------------- 第三方 DLSS 运行库
 //

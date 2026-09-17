@@ -118,6 +118,20 @@ archive/0.2.4/，仓库根目录现在就是新版。这一版变了五处，每
 | INI | 有 Router / KernelImage / HardwareBilinear | 精简成 5 段约 2 KB，没有 Router | SM75 改写抛错，RTX 20 用户部署直接失败 |
 | README 版本号 | "# DLSSG Native 0.2.4" | "# DLSSG for SM86（Proxy）- 0.3.0 版本" | 界面「上游版本」显示未知 |
 
+### 0.3.2：优化等级 0~3、内核重写、docs 补齐
+
+* 310.9 版的部分推理内核被重写，生成画面与官方 DLSS-G **逐位一致**（不再有损），另有 0~8% 加速。
+* 出厂 INI 的 `[FrameGeneration] Optimized` 从布尔变成 **0~3 四级**：0 原厂不加速 /
+  1 全部加速且逐位一致（**出厂默认**）/ 2 再加有损图像内核 / 3 全部有损；
+  `MaxGeneratedFrames` 仍是 3 = 4X、5 = 6X。
+* 因此「部署」卡片加了两个下拉（`App::fg_optimized` / `App::fg_frames`，存进配置），
+  部署时由 `update::prepare_deploy_ini()` 把这两个键写进**部署到游戏目录的那一份**
+  （`dlssg_sm86.deploy.ini`），资产目录里的原文件不动；**两个都是出厂默认时直接返回原文件、
+  一个字都不改**。INI 里找不到键时不报错，照旧部署并在说明里写一句。
+  （注意：`AppConfig` 的 Default 是**手写**的 —— 这两个字段的业务默认是 1 / 3，不是 u8 的 0。）
+* 上游把 `docs/INSTALL.md` 补上了（0.3.0 / 0.3.1 时 README 里那个链接是坏的），进阶键
+  （Router / SM75Family / KernelImage / SpoofArchToGame / 抓取诊断）现在有官方文档可看。
+
 ### 0.3.1：20 系和 30 系共用同一套文件（因此删掉了「版本切换」）
 
 上游 0.3.1（2026-09-15）把 RTX 20 系（Turing / SM75）救回来了：根目录那份 `version.dll`
