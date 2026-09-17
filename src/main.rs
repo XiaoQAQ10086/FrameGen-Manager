@@ -5096,7 +5096,7 @@ impl eframe::App for App {
                     if let Some(d) = self.driver.as_ref().filter(|d| d.too_old()) {
                         ui.label(
                             egui::RichText::new(format!(
-                                "⚠ 当前驱动 {} 低于 {}：更旧的驱动会自动回退到 PTX 内核（只在首次加载时多一次编译），一般仍然能用，但更新驱动更稳（点「部署」时会再确认一次）。",
+                                "⚠ 当前驱动 {} 低于 {}：更旧的驱动会自动回退到 PTX 内核。",
                                 d.marketing,
                                 gpu::MIN_FG_DRIVER_TEXT
                             ))
@@ -5793,10 +5793,7 @@ impl eframe::App for App {
                         .strong(),
                     );
                     ui.add_space(6.0);
-                    ui.label(
-                        "按上游说明，cubin 内核需要 R580 以上；更旧的驱动会自动改用 PTX 内核（只在首次加载时多一次编译），所以一般仍能用，只是首帧慢一点。
-更新驱动更稳，但不更新也可以继续试。",
-                    );
+                    ui.label("按上游说明，cubin 内核需要 R580 以上；更旧的驱动会自动回退到 PTX 内核。");
                     ui.add_space(8.0);
                     ui.horizontal(|ui| {
                         if theme::ghost_button(ui, "仍要继续部署", true).clicked() {
