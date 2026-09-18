@@ -82,6 +82,22 @@ fn main() -> eframe::Result<()> {
         return Ok(());
     }
 
+    // 自更新：真去下载某个已发布版本，校验 SHA256 并解出 exe（不动当前程序）
+    //   framegen-manager.exe --selfupdatetest 0.9.11
+    if let Some(i) = std::env::args().position(|a| a == "--selfupdatetest") {
+        let v = std::env::args().nth(i + 1).unwrap_or_default();
+        selfupdatestage(&v);
+        return Ok(());
+    }
+    // 自更新换文件：对给定的两个文件跑一遍替换逻辑（自测用；别对正在运行的程序用）
+    //   framegen-manager.exe --swapapply <现程序> <新程序>
+    if let Some(i) = std::env::args().position(|a| a == "--swapapply") {
+        let a = std::env::args().nth(i + 1).unwrap_or_default();
+        let b = std::env::args().nth(i + 2).unwrap_or_default();
+        swapapply(&a, &b);
+        return Ok(());
+    }
+
     // 下载测速：走生产路径（镜像优先 + 官方指纹校验）拉一遍 version.dll
     if std::env::args().any(|a| a == "--speedtest") {
         speedtest();
@@ -618,6 +634,61 @@ fn write_result(out: &str, r: anyhow::Result<String>) {
     }
     if let Err(e) = std::fs::write(out, &text) {
         println!("写结果文件失败: {e}");
+    }
+}
+
+/// 自更新【下载 + 校验】自测：真去拉某个已发布版本，校验 SHA256、解出 exe 暂存。
+/// 全程不动当前程序（暂存的 .new 下次启动会被清掉）。
+fn selfupdatestage(version: &str) {
+    if version.is_empty() {
+        println!("用法：--selfupdatetest <版本号>   例如 --selfupdatetest 0.9.11");
+        return;
+    }
+    println!("===== 自更新：下载与校验 =====");
+    println!("  目标版本 = v{version}");
+    let c = match update::client() {
+        Ok(c) => c,
+        Err(e) => {
+            println!("  [FAIL] 建 HTTP 客户端失败：{e}");
+            return;
+        }
+    };
+    let cancel = AtomicBool::new(false);
+    let mut last = String::new();
+    let mut cb = |_done: u64, _total: u64, what: &str| {
+        if what != last {
+            println!("  下载 {what} ...");
+            last = what.to_owned();
+        }
+    };
+    match update::stage_self_update(&c, version, &cancel, &mut cb) {
+        Ok(s) => {
+            println!("  [PASS] zip {} 字节，SHA256 {} 校验通过", s.bytes, s.sha256);
+            let n = std::fs::metadata(&s.exe).map(|m| m.len()).unwrap_or(0);
+            println!("  已解出新版 exe = {}（{n} 字节，没动当前程序）", s.exe.display());
+        }
+        Err(e) => println!("  [FAIL] {e:#}"),
+    }
+}
+
+/// 自更新【换文件】自测：让 swap_in_place 对指定的两个文件跑一遍。
+/// 这样可以把「改名成 .old -> 写入新版」这套流程在真实文件上验证，而不碰正在运行的程序。
+fn swapapply(cur: &str, new: &str) {
+    if cur.is_empty() || new.is_empty() {
+        println!("用法：--swapapply <现程序> <新程序>");
+        return;
+    }
+    println!("===== 自更新：换文件 =====");
+    println!("  现程序 = {cur}");
+    println!("  新程序 = {new}");
+    let before = std::fs::metadata(cur).map(|m| m.len()).unwrap_or(0);
+    match update::swap_in_place(Path::new(cur), Path::new(new)) {
+        Ok(old) => {
+            let after = std::fs::metadata(cur).map(|m| m.len()).unwrap_or(0);
+            let bak = std::fs::metadata(&old).map(|m| m.len()).unwrap_or(0);
+            println!("  [PASS] 原位现在是新版（{after} 字节，原来 {before}），旧版备份 {bak} 字节 -> {}", old.display());
+        }
+        Err(e) => println!("  [FAIL] {e:#}"),
     }
 }
 
@@ -1390,6 +1461,55 @@ fn selftest() {
         ) == AssetState::Ready,
         "下载来的文件 + 指纹一致 → 已就绪",
     );
+
+    // 自更新：SHA256SUMS 解析 + 换文件流程（用临时文件真跑一遍）
+    {
+        let sums = "# 注释\nabc   other.zip\n0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef  FrameGen-Manager-v1.2.3.zip\n";
+        ck(
+            &mut fails,
+            update::parse_sha256sums(sums, "FrameGen-Manager-v1.2.3.zip").is_some(),
+            "SHA256SUMS：能取到对应文件的哈希",
+        );
+        ck(
+            &mut fails,
+            update::parse_sha256sums(sums, "FrameGen-Manager-v9.9.9.zip").is_none(),
+            "SHA256SUMS：清单里没有的文件返回 None",
+        );
+        ck(
+            &mut fails,
+            update::parse_sha256sums(sums, "abc").is_none(),
+            "SHA256SUMS：长度不对的哈希不认（防手抖写错一行）",
+        );
+        let dir = std::env::temp_dir().join("fgm-swap-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+        let cur = dir.join("app.exe");
+        let new = dir.join("app.exe.new");
+        std::fs::write(&cur, b"OLD").unwrap();
+        std::fs::write(&new, b"NEW").unwrap();
+        match update::swap_in_place(&cur, &new) {
+            Ok(old) => {
+                ck(
+                    &mut fails,
+                    std::fs::read(&cur).unwrap_or_default() == b"NEW"
+                        && std::fs::read(&old).unwrap_or_default() == b"OLD",
+                    "换文件：新版写进原位、旧版留在 .old（这就是备份）",
+                );
+                ck(&mut fails, !new.exists(), "换文件：暂存的 .new 用完就清掉");
+            }
+            Err(e) => ck(&mut fails, false, &format!("换文件流程失败：{e}")),
+        }
+        // 写新版失败必须回滚，不能留下一个半截程序
+        let cur2 = dir.join("app2.exe");
+        std::fs::write(&cur2, b"OLD2").unwrap();
+        let r = update::swap_in_place(&cur2, &dir.join("不存在.exe"));
+        ck(
+            &mut fails,
+            r.is_err() && std::fs::read(&cur2).unwrap_or_default() == b"OLD2",
+            "换文件：写新版失败时原程序还在（回滚）",
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     println!("\n--- 部署用的 INI 档位改写 ---");
     {
@@ -2652,6 +2772,10 @@ enum Msg {
     SelfVersionChecked { latest: Option<String>, manual: bool },
     /// 所有候选源的测速结果回来了
     SpeedTested(Vec<update::SourceSpeed>),
+    /// 自更新：新版已下载、校验通过、暂存好了
+    SelfUpdateStaged(Box<update::StagedUpdate>),
+    /// 自更新失败（文案里带原因；界面会顺手打开发布页）
+    SelfUpdateFailed(String),
 }
 
 struct App {
@@ -2719,6 +2843,10 @@ struct App {
     // ---- 显卡名称伪装
     /// 查到的新版本号。Some 时右上角会出现下载入口。
     new_version: Option<String>,
+    /// 「发现新版本」的确认框开着没有
+    self_update_prompt: bool,
+    /// 已经下载并校验好的新版；由 ui() 完成换文件 + 重启
+    self_update_apply: Option<PathBuf>,
     spoof_open: bool,
     spoof_target: String,
     spoof_ack: bool,
@@ -2789,9 +2917,15 @@ impl App {
         let driver = gpu::detect_driver(&adapters);
         let cfg = util::load_config();
 
+        // 上一次自更新留下的 .old（旧版备份）和 .new（没换成的暂存）：新版都跑起来了，可以删
+        let su_left = update::cleanup_self_update_leftovers();
+
         let mut boot_notes: Vec<String> = Vec::new();
         if cleaned > 0 {
             boot_notes.push(format!("已清理 {cleaned} 个未完成的下载残留"));
+        }
+        if su_left > 0 {
+            boot_notes.push(format!("已清理 {su_left} 个上次自动更新留下的文件"));
         }
         if let Some(m) = migrated {
             boot_notes.push(m);
@@ -2857,6 +2991,8 @@ impl App {
             driver,
             adapters,
             new_version: None,
+            self_update_prompt: false,
+            self_update_apply: None,
             spoof_open: std::env::var_os("DLSSG_SPOOF_OPEN").is_some(),
             // 默认指向 5060：既是最常见的目标，也和社区流传的做法一致
             spoof_target: gpu::PRESETS.last().copied().unwrap_or_default().to_owned(),
@@ -3450,6 +3586,29 @@ impl App {
                 }
                 self.import_report = Some(report);
             }
+            Msg::SelfUpdateStaged(s) => {
+                self.progress = None;
+                self.busy = false;
+                let short = if s.sha256.len() >= 12 {
+                    s.sha256[..12].to_owned()
+                } else {
+                    s.sha256.clone()
+                };
+                self.note(format!(
+                    "新版本已下载并通过 SHA256 校验（{}，{short}…），马上替换程序并重启",
+                    util::format_bytes(s.bytes)
+                ));
+                self.self_update_apply = Some(s.exe.clone());
+            }
+            Msg::SelfUpdateFailed(e) => {
+                self.progress = None;
+                self.busy = false;
+                self.status = format!("自动更新失败：{e}");
+                self.note("已为你打开发布页，可以手动下载新版".to_owned());
+                if let Err(e2) = util::open_url(update::RELEASES_URL) {
+                    self.note(format!("打开发布页也失败了：{e2}"));
+                }
+            }
             Msg::UpdateChecked(s) => {
                 self.status = "更新检查完成".to_owned();
                 // 先从磁盘读一遍（可能被别的进程改过），再把这次检查到的上游版本写回缓存：
@@ -3562,6 +3721,14 @@ impl App {
                 }
             }
             Msg::SelfVersionChecked { latest, manual } => {
+                // 调试 / 进阶开关：DLSSG_AUTO_UPDATE=1 时，一发现新版本就直接下载并更新，
+                // 不弹确认框。用途：① 无人值守自测整条自更新链路；② 想让它静默升级的用户。
+                if latest.is_some() && std::env::var_os("DLSSG_AUTO_UPDATE").is_some() {
+                    let v = latest.clone().unwrap_or_default();
+                    self.note(format!("DLSSG_AUTO_UPDATE：发现 v{v}，直接开始自动更新"));
+                    self.start_self_update(&v);
+                    return;
+                }
                 // 只有手动点的那次才会把 busy 立起来，所以也只有它需要放下来
                 if manual {
                     self.busy = false;
@@ -4087,6 +4254,60 @@ impl App {
     }
 
     /// 检查 FrameGen Manager 自己有没有新版本。
+    /// 下载新版并暂存（不动当前程序）。成功后由 ui() 完成替换与重启。
+    fn start_self_update(&mut self, version: &str) {
+        let v = version.to_owned();
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.cancel = Some(cancel.clone());
+        self.busy = true;
+        self.progress = Some(("正在准备下载…".to_owned(), 0.0));
+        self.status = format!("正在下载 v{v}");
+        self.spawn(move |tx, _ctx| {
+            let r = (|| -> anyhow::Result<update::StagedUpdate> {
+                let c = update::client()?;
+                // 进度文案自己给，别把镜像 URL 甩到界面上（下载层给的是源地址/源名）
+                let mut cb = |done: u64, total: u64, _what: &str| {
+                    let f = if total > 0 {
+                        done as f32 / total as f32
+                    } else {
+                        0.0
+                    };
+                    let _ = tx.send(Msg::Progress("正在下载新版…".to_owned(), f, total));
+                };
+                update::stage_self_update(&c, &v, &cancel, &mut cb)
+            })();
+            let _ = tx.send(match r {
+                Ok(s) => Msg::SelfUpdateStaged(Box::new(s)),
+                Err(e) => Msg::SelfUpdateFailed(format!("{e:#}")),
+            });
+        });
+    }
+
+    /// 自更新收尾：换文件 + 重启。换成功就请求关窗（新版会自己起来）。
+    fn apply_self_update(&mut self, new_exe: &Path) {
+        let cur = match std::env::current_exe() {
+            Ok(p) => p,
+            Err(e) => {
+                self.status = format!("取不到当前程序路径，没法自动替换：{e}");
+                return;
+            }
+        };
+        match update::swap_in_place(&cur, new_exe) {
+            Ok(old) => {
+                log::line(&format!("自更新：程序已替换，旧版备份 {}", old.display()));
+                if let Err(e) = update::restart_self(&cur) {
+                    self.status = format!("程序已更新，但自动重启失败：{e}（手动打开一次即可）");
+                    return;
+                }
+                self.ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+            Err(e) => {
+                self.status = format!("替换程序失败：{e:#}");
+                let _ = util::open_url(update::RELEASES_URL);
+            }
+        }
+    }
+
     /// 读我们仓库 raw 上的 Cargo.toml，不占任何 API 配额（见 update::fetch_latest_self_version）。
     /// manual = 用户自己点的标题栏「检查更新」。点了得立刻有反应，
     /// 不然就是「点了没动静」；启动时那次则安静地跑，别打断用户。
@@ -4362,6 +4583,10 @@ impl eframe::App for App {
         while let Ok(m) = self.rx.try_recv() {
             self.handle(m);
         }
+        // 自更新收尾：把暂存好的新版换上去、重启自己。放在每帧最前面是因为要拿 ctx 关窗口。
+        if let Some(new_exe) = self.self_update_apply.take() {
+            self.apply_self_update(&new_exe);
+        }
         // 用户去系统设置里看完/改完再切回来 —— 这时重读一次硬件加速状态。
         // 只在「刚获得焦点」那一帧读，不是每帧都读注册表。
         let focused = self.ctx.input(|i| i.focused);
@@ -4414,12 +4639,10 @@ impl eframe::App for App {
                         // 本软件有新版本 —— 放最右边，最显眼
                         if let Some(v) = self.new_version.clone() {
                             if theme::primary_button(ui, &format!("有新版本 {v}"), true)
-                                .on_hover_text("点一下打开 GitHub 发布页下载新版")
+                                .on_hover_text("点一下看详情：可以在这里直接下载并自动更新，也可以打开发布页手动下")
                                 .clicked()
                             {
-                                if let Err(e) = util::open_url(update::RELEASES_URL) {
-                                    self.status = format!("打开发布页失败: {e}");
-                                }
+                                self.self_update_prompt = true;
                             }
                             ui.add_space(6.0);
                         }
@@ -5871,6 +6094,59 @@ impl eframe::App for App {
                 self.allow_kernel_ac = false;
                 self.status = "已取消部署".to_owned();
                 log::line("用户在内核级反作弊确认弹窗里选择了取消");
+            }
+        }
+
+        // ---------------- 有新版本：在这里直接下载并自动更新
+        if self.self_update_prompt {
+            let ctx = self.ctx.clone();
+            let ver = self.new_version.clone().unwrap_or_default();
+            let (mut go, mut page, mut later) = (false, false, false);
+            egui::Window::new("发现新版本")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+                .show(&ctx, |ui| {
+                    ui.set_max_width(460.0);
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "新版 v{ver}（当前 v{}）",
+                            update::SELF_VERSION
+                        ))
+                        .size(13.0)
+                        .strong(),
+                    );
+                    ui.add_space(6.0);
+                    ui.label(
+                        "点「下载并更新」会：下载新版（约 3.2 MB）→ 核对发布时给出的 SHA256 → 替换当前程序并重启。",
+                    );
+                    ui.add_space(4.0);
+                    ui.label(theme::hint(
+                        "旧版会留成 framegen-manager.exe.old，下次启动自动删掉。你的设置、资产、游戏库都不动。",
+                    ));
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if theme::primary_button(ui, "下载并更新", true).clicked() {
+                            go = true;
+                        }
+                        if theme::ghost_button(ui, "打开下载页", true).clicked() {
+                            page = true;
+                        }
+                        if theme::ghost_button(ui, "稍后", true).clicked() {
+                            later = true;
+                        }
+                    });
+                });
+            if go {
+                self.self_update_prompt = false;
+                self.start_self_update(&ver);
+            } else if page {
+                self.self_update_prompt = false;
+                if let Err(e) = util::open_url(update::RELEASES_URL) {
+                    self.status = format!("打开发布页失败: {e}");
+                }
+            } else if later {
+                self.self_update_prompt = false;
             }
         }
 

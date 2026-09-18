@@ -1247,6 +1247,177 @@ fn download_with_mirror(
     })
 }
 
+// ------------------------------------------------------------------ 软件自身更新
+// 只做「便携版自替换」：下载新版 zip -> 比 SHA256 -> 解出 exe 暂存成 <当前 exe>.new
+// -> 把正在运行的 exe 改名成 .old（这就是备份）-> 写入新版 -> 重启自己。
+//
+// **为什么一定要比 SHA256**：我们的 exe 没有代码签名，下载还走第三方镜像，
+// 不比哈希就等于把「执行任意程序」的机会交给中间人。哈希取自发布时一起上传的
+// SHA256SUMS.txt（同一次发布、同一个源）。
+
+/// 我们仓库某个版本的发布资产直链。
+pub fn self_release_url(tag: &str, asset: &str) -> String {
+    format!("https://github.com/{SELF_REPO}/releases/download/{tag}/{asset}")
+}
+
+/// 从 SHA256SUMS.txt 里取某个文件的哈希（形如「哈希 文件名」，忽略注释和空行）。
+pub fn parse_sha256sums(text: &str, name: &str) -> Option<String> {
+    for line in text.lines() {
+        let t = line.trim();
+        if t.is_empty() || t.starts_with('#') {
+            continue;
+        }
+        let mut it = t.split_whitespace();
+        let (Some(hash), Some(file)) = (it.next(), it.next()) else {
+            continue;
+        };
+        if hash.len() == 64 && file.trim_start_matches('*') == name {
+            return Some(hash.to_ascii_lowercase());
+        }
+    }
+    None
+}
+
+/// 自更新的暂存结果。
+pub struct StagedUpdate {
+    /// 新版程序：已下载、已校验、已解压到 <当前 exe>.new
+    pub exe: PathBuf,
+    /// 通过校验的那个 zip 的 SHA256
+    pub sha256: String,
+    /// zip 的字节数
+    pub bytes: u64,
+}
+
+/// 下载新版本并暂存成 <当前 exe>.new，**不动**当前程序（换文件由 swap_in_place 做）。
+pub fn stage_self_update(
+    client: &reqwest::blocking::Client,
+    version: &str,
+    cancel: &AtomicBool,
+    progress: &mut dyn FnMut(u64, u64, &str),
+) -> Result<StagedUpdate> {
+    let cur = std::env::current_exe().context("取不到当前程序路径")?;
+    let dir = cur
+        .parent()
+        .map(Path::to_path_buf)
+        .context("当前程序没有所在目录")?;
+    if !crate::util::is_writable(&dir) {
+        bail!(
+            "程序所在目录不可写（{}），没法自动更新，请手动下载新版",
+            dir.display()
+        );
+    }
+    let tag = format!("v{version}");
+    let zip_name = format!("FrameGen-Manager-{tag}.zip");
+    let work = std::env::temp_dir().join("fgm-selfupdate");
+    std::fs::create_dir_all(&work).context("建临时目录失败")?;
+    let sums_path = work.join("SHA256SUMS.txt");
+    let zip_path = work.join(&zip_name);
+
+    progress(0, 0, "SHA256SUMS.txt");
+    download_with_mirror(
+        client,
+        &self_release_url(&tag, "SHA256SUMS.txt"),
+        &sums_path,
+        cancel,
+        progress,
+    )
+    .context("下载 SHA256SUMS.txt 失败")?;
+    let sums = std::fs::read_to_string(&sums_path).context("读 SHA256SUMS.txt 失败")?;
+    let want = parse_sha256sums(&sums, &zip_name).with_context(|| {
+        format!("这次发布的 SHA256SUMS.txt 里没有 {zip_name}（老版本没带这个文件），只能手动下载")
+    })?;
+
+    progress(0, 0, &zip_name);
+    download_with_mirror(
+        client,
+        &self_release_url(&tag, &zip_name),
+        &zip_path,
+        cancel,
+        progress,
+    )
+    .with_context(|| format!("下载 {zip_name} 失败"))?;
+    let bytes = std::fs::metadata(&zip_path).map(|m| m.len()).unwrap_or(0);
+    let got = crate::util::sha256_file(&zip_path)?;
+    if !got.eq_ignore_ascii_case(&want) {
+        let _ = std::fs::remove_file(&zip_path);
+        bail!("下载的文件校验不通过（期望 {want}，实际 {got}），已丢弃，没有动你的程序");
+    }
+    crate::log::line(&format!("自更新：{zip_name} 校验通过 {got}"));
+
+    let entry = zip_list(&zip_path)?
+        .into_iter()
+        .find(|m| {
+            m.name
+                .rsplit(['/', '\\'])
+                .next()
+                .map(|n| n.eq_ignore_ascii_case("framegen-manager.exe"))
+                .unwrap_or(false)
+        })
+        .context("新版 zip 里没有 framegen-manager.exe")?;
+    let staged = cur.with_extension("exe.new");
+    let n = zip_extract_to(&zip_path, &entry, &staged)?;
+    let _ = std::fs::remove_file(&zip_path);
+    let mut head = [0u8; 2];
+    if let Ok(mut f) = std::fs::File::open(&staged) {
+        use std::io::Read;
+        let _ = f.read_exact(&mut head);
+    }
+    if n < 1_000_000 || &head != b"MZ" {
+        let _ = std::fs::remove_file(&staged);
+        bail!("解压出来的程序看着不对（{n} 字节），已丢弃");
+    }
+    crate::util::clear_motw(&staged);
+    Ok(StagedUpdate {
+        exe: staged,
+        sha256: got,
+        bytes,
+    })
+}
+
+/// 把 new_exe 换成当前程序本体：当前 exe 先改名成 .old（这就是备份），再把新版写回原位；
+/// 写失败会把 .old 改回来，绝不留一个半截程序。
+pub fn swap_in_place(cur: &Path, new_exe: &Path) -> Result<PathBuf> {
+    let old = cur.with_extension("exe.old");
+    let _ = std::fs::remove_file(&old);
+    std::fs::rename(cur, &old).with_context(|| format!("没法把当前程序改名成 {}", old.display()))?;
+    match std::fs::copy(new_exe, cur) {
+        Ok(_) => {
+            crate::util::clear_motw(cur);
+            let _ = std::fs::remove_file(new_exe);
+            Ok(old)
+        }
+        Err(e) => {
+            let _ = std::fs::rename(&old, cur);
+            Err(anyhow::Error::new(e).context("写入新版程序失败，已还原成原来的程序"))
+        }
+    }
+}
+
+/// 启动新版（自更新最后一步）。
+pub fn restart_self(cur: &Path) -> Result<()> {
+    let mut cmd = std::process::Command::new(cur);
+    if let Some(d) = cur.parent() {
+        cmd.current_dir(d);
+    }
+    cmd.spawn().context("启动新版程序失败")?;
+    Ok(())
+}
+
+/// 启动时清掉上一次自更新留下的 .old / .new，返回删掉几个。
+pub fn cleanup_self_update_leftovers() -> usize {
+    let Ok(cur) = std::env::current_exe() else {
+        return 0;
+    };
+    let mut n = 0;
+    for ext in ["exe.old", "exe.new"] {
+        let p = cur.with_extension(ext);
+        if p.is_file() && std::fs::remove_file(&p).is_ok() {
+            n += 1;
+        }
+    }
+    n
+}
+
 // ------------------------------------------------------------------ 测速
 
 /// 一个源的测速结果。
