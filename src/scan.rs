@@ -68,6 +68,9 @@ pub struct LibraryCache {
     pub scanned: Vec<CachedRow>,
     #[serde(default)]
     pub manual: Vec<CachedRow>,
+    /// 用户主动移除过的条目（按安装目录记）。重新扫描时不会再列出来。
+    #[serde(default)]
+    pub ignored: Vec<String>,
 }
 
 const LIBRARY_NAME: &str = "game_library.json";

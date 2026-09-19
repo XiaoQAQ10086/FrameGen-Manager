@@ -484,10 +484,21 @@ fn part_path(dest: &Path) -> PathBuf {
 pub fn clean_stale_partials() -> usize {
     let Ok(dir) = util::assets_dir() else { return 0 };
     let Ok(rd) = std::fs::read_dir(&dir) else { return 0 };
+    let cutoff = std::time::SystemTime::now()
+        .checked_sub(std::time::Duration::from_secs(7 * 24 * 3600));
     let mut n = 0;
     for e in rd.flatten() {
         let p = e.path();
-        if p.extension().map(|x| x == "part").unwrap_or(false) && std::fs::remove_file(&p).is_ok() {
+        if !p.extension().map(|x| x == "part").unwrap_or(false) {
+            continue;
+        }
+        // 断点续传要靠 .part 接着下，所以只清「很久没动过」的（7 天），
+        // 别把刚下到一半的删掉 —— 跨会话继续下载就靠它。
+        let stale = match (cutoff, std::fs::metadata(&p).and_then(|m| m.modified())) {
+            (Some(c), Ok(t)) => t < c,
+            _ => true,
+        };
+        if stale && std::fs::remove_file(&p).is_ok() {
             n += 1;
         }
     }
@@ -645,22 +656,47 @@ pub fn download(
 ) -> Result<Downloaded> {
     let Sink { dest, cancel, progress } = sink;
     let tmp = part_path(dest);
-    let _ = std::fs::remove_file(&tmp);
-
-    let mut resp = client
-        .get(url)
+    // 断点续传：上次没下完的 .part 接着下（只有服务器回 206 才算数）。
+    // 换源重试、同一个源再试一次，都能从这里续上，慢速网络不用从头再来。
+    let mut resume = std::fs::metadata(&tmp).map(|m| m.len()).unwrap_or(0);
+    let mut req = client.get(url);
+    if resume > 0 {
+        req = req.header("Range", format!("bytes={resume}-"));
+    }
+    let mut resp = req
         .send()
         .map_err(|e| anyhow::anyhow!(friendly_error(&e)))?;
     let status = resp.status();
-    if !status.is_success() {
+    if status == reqwest::StatusCode::PARTIAL_CONTENT && resume > 0 {
+        crate::log::line(&format!("断点续传 {repo_path}：从 {resume} 字节接着下"));
+    } else if status.is_success() {
+        // 服务器不支持 Range（回 200），只能从头下
+        resume = 0;
+    } else {
         bail!("下载 {repo_path} 返回 HTTP {}", status.as_u16());
     }
     let resp_etag = etag_of(&resp);
-    let total = resp.content_length().filter(|n| *n > 0).unwrap_or(0);
+    let total = resp
+        .content_length()
+        .filter(|n| *n > 0)
+        .map(|n| n + resume)
+        .unwrap_or(0);
 
     let mut buf: Vec<u8> = Vec::with_capacity(total as usize);
+    if resume > 0 {
+        if let Ok(old) = std::fs::read(&tmp) {
+            buf = old;
+        }
+        if buf.len() as u64 != resume {
+            buf.clear();
+            resume = 0;
+        }
+    }
+    if resume == 0 {
+        let _ = std::fs::remove_file(&tmp);
+    }
     let mut chunk = vec![0u8; 64 * 1024];
-    let mut got: u64 = 0;
+    let mut got: u64 = resume;
     // 只记总耗时，供下完后记录实测速率用 —— 不再按速度拦任何东西。
     let t0 = Instant::now();
     // 进度回调里那第三段文字在这里算一次 —— 别每 64 KB 都新分配一个 String
@@ -1280,12 +1316,18 @@ pub fn parse_sha256sums(text: &str, name: &str) -> Option<String> {
 
 /// 自更新的暂存结果。
 pub struct StagedUpdate {
-    /// 新版程序：已下载、已校验、已解压到 <当前 exe>.new
-    pub exe: PathBuf,
-    /// 通过校验的那个 zip 的 SHA256
+    /// 已经下载并校验好的安装程序（在临时目录里）
+    pub installer: PathBuf,
+    /// 安装程序的 SHA256（校验通过的那一个）
     pub sha256: String,
-    /// zip 的字节数
+    /// 安装程序的字节数
     pub bytes: u64,
+}
+
+/// jsDelivr 上的同一份安装程序（发布时仓库 dist/ 下也放一份）。
+/// 它比 GitHub 的资源域名快得多，所以更新时先试它，失败再走发布资产 + 镜像。
+pub fn self_cdn_url(tag: &str, asset: &str) -> String {
+    format!("https://cdn.jsdelivr.net/gh/{SELF_REPO}@{tag}/dist/{asset}")
 }
 
 /// 下载新版本并暂存成 <当前 exe>.new，**不动**当前程序（换文件由 swap_in_place 做）。
@@ -1302,17 +1344,18 @@ pub fn stage_self_update(
         .context("当前程序没有所在目录")?;
     if !crate::util::is_writable(&dir) {
         bail!(
-            "程序所在目录不可写（{}），没法自动更新，请手动下载新版",
+            "程序所在目录不可写（{}），没法自动更新，请手动下载安装包",
             dir.display()
         );
     }
     let tag = format!("v{version}");
-    let zip_name = format!("FrameGen-Manager-{tag}.zip");
+    let setup = format!("FrameGen-Manager-{tag}-setup.exe");
     let work = std::env::temp_dir().join("fgm-selfupdate");
     std::fs::create_dir_all(&work).context("建临时目录失败")?;
     let sums_path = work.join("SHA256SUMS.txt");
-    let zip_path = work.join(&zip_name);
+    let dest = work.join(&setup);
 
+    // 1) 发布时给出的 SHA256 清单（很小，走镜像就行）
     progress(0, 0, "SHA256SUMS.txt");
     download_with_mirror(
         client,
@@ -1323,52 +1366,66 @@ pub fn stage_self_update(
     )
     .context("下载 SHA256SUMS.txt 失败")?;
     let sums = std::fs::read_to_string(&sums_path).context("读 SHA256SUMS.txt 失败")?;
-    let want = parse_sha256sums(&sums, &zip_name).with_context(|| {
-        format!("这次发布的 SHA256SUMS.txt 里没有 {zip_name}（老版本没带这个文件），只能手动下载")
+    let want = parse_sha256sums(&sums, &setup).with_context(|| {
+        format!("这次发布的 SHA256SUMS.txt 里没有 {setup}（老版本没带这个文件），只能手动下载安装包")
     })?;
 
-    progress(0, 0, &zip_name);
-    download_with_mirror(
+    // 2) 拿安装程序：先试 jsDelivr（比 GitHub 资源域名快），失败再走发布资产 + 镜像。
+    //    两条路拿的是同一个文件，断点续传也认得同一份 .part，内容由下面的 SHA256 兜住。
+    let _ = std::fs::remove_file(&dest);
+    progress(0, 0, "安装程序");
+    let cdn = self_cdn_url(&tag, &setup);
+    let from_cdn = download(
         client,
-        &self_release_url(&tag, &zip_name),
-        &zip_path,
-        cancel,
-        progress,
+        &setup,
+        Sink {
+            dest: &dest,
+            cancel,
+            progress,
+        },
+        &cdn,
+        None,
+        "cdn.jsdelivr.net",
     )
-    .with_context(|| format!("下载 {zip_name} 失败"))?;
-    let bytes = std::fs::metadata(&zip_path).map(|m| m.len()).unwrap_or(0);
-    let got = crate::util::sha256_file(&zip_path)?;
-    if !got.eq_ignore_ascii_case(&want) {
-        let _ = std::fs::remove_file(&zip_path);
-        bail!("下载的文件校验不通过（期望 {want}，实际 {got}），已丢弃，没有动你的程序");
+    .is_ok();
+    if !from_cdn {
+        download_with_mirror(
+            client,
+            &self_release_url(&tag, &setup),
+            &dest,
+            cancel,
+            progress,
+        )
+        .with_context(|| format!("下载 {setup} 失败"))?;
     }
-    crate::log::line(&format!("自更新：{zip_name} 校验通过 {got}"));
+    crate::log::line(&format!(
+        "自更新：安装程序来自{}",
+        if from_cdn {
+            " jsDelivr CDN"
+        } else {
+            "发布资产（镜像）"
+        }
+    ));
 
-    let entry = zip_list(&zip_path)?
-        .into_iter()
-        .find(|m| {
-            m.name
-                .rsplit(['/', '\\'])
-                .next()
-                .map(|n| n.eq_ignore_ascii_case("framegen-manager.exe"))
-                .unwrap_or(false)
-        })
-        .context("新版 zip 里没有 framegen-manager.exe")?;
-    let staged = cur.with_extension("exe.new");
-    let n = zip_extract_to(&zip_path, &entry, &staged)?;
-    let _ = std::fs::remove_file(&zip_path);
+    // 3) 校验：哈希对不上就丢弃，绝不动用户的程序
+    let bytes = std::fs::metadata(&dest).map(|m| m.len()).unwrap_or(0);
+    let got = crate::util::sha256_file(&dest)?;
+    if !got.eq_ignore_ascii_case(&want) {
+        let _ = std::fs::remove_file(&dest);
+        bail!("下载的安装程序校验不通过（期望 {want}，实际 {got}），已丢弃，没有动你的程序");
+    }
     let mut head = [0u8; 2];
-    if let Ok(mut f) = std::fs::File::open(&staged) {
+    if let Ok(mut f) = std::fs::File::open(&dest) {
         use std::io::Read;
         let _ = f.read_exact(&mut head);
     }
-    if n < 1_000_000 || &head != b"MZ" {
-        let _ = std::fs::remove_file(&staged);
-        bail!("解压出来的程序看着不对（{n} 字节），已丢弃");
+    if bytes < 1_000_000 || &head != b"MZ" {
+        let _ = std::fs::remove_file(&dest);
+        bail!("下载的安装程序看着不对（{bytes} 字节），已丢弃");
     }
-    crate::util::clear_motw(&staged);
+    crate::util::clear_motw(&dest);
     Ok(StagedUpdate {
-        exe: staged,
+        installer: dest,
         sha256: got,
         bytes,
     })
@@ -1391,16 +1448,6 @@ pub fn swap_in_place(cur: &Path, new_exe: &Path) -> Result<PathBuf> {
             Err(anyhow::Error::new(e).context("写入新版程序失败，已还原成原来的程序"))
         }
     }
-}
-
-/// 启动新版（自更新最后一步）。
-pub fn restart_self(cur: &Path) -> Result<()> {
-    let mut cmd = std::process::Command::new(cur);
-    if let Some(d) = cur.parent() {
-        cmd.current_dir(d);
-    }
-    cmd.spawn().context("启动新版程序失败")?;
-    Ok(())
 }
 
 /// 启动时清掉上一次自更新留下的 .old / .new，返回删掉几个。

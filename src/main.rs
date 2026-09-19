@@ -664,8 +664,8 @@ fn selfupdatestage(version: &str) {
     match update::stage_self_update(&c, version, &cancel, &mut cb) {
         Ok(s) => {
             println!("  [PASS] zip {} 字节，SHA256 {} 校验通过", s.bytes, s.sha256);
-            let n = std::fs::metadata(&s.exe).map(|m| m.len()).unwrap_or(0);
-            println!("  已解出新版 exe = {}（{n} 字节，没动当前程序）", s.exe.display());
+            let n = std::fs::metadata(&s.installer).map(|m| m.len()).unwrap_or(0);
+            println!("  已下好安装程序 = {}（{n} 字节，没动当前程序）", s.installer.display());
         }
         Err(e) => println!("  [FAIL] {e:#}"),
     }
@@ -1942,11 +1942,17 @@ fn selftest() {
                 render_exe: None,
                 ac: AcTier::None,
             }],
+            ignored: vec![dead.display().to_string()],
         };
         let p = dir.join("game_library.json");
         let wrote = scan::save_library_from(&p, &cache).is_ok();
         let back = scan::load_library_from(&p);
         ck(&mut fails, wrote && p.is_file(), "游戏库缓存能写进文件");
+        ck(
+            &mut fails,
+            back.ignored.len() == 1 && back.ignored[0] == dead.display().to_string(),
+            "忽略清单（移除过的条目）能存能读",
+        );
         ck(
             &mut fails,
             back.scanned.len() == 2 && back.manual.len() == 1,
@@ -2079,13 +2085,20 @@ fn canceltest() {
         if msg.contains("备用源") { "FAIL" } else { "PASS" }
     );
 
-    // 手工造一个残留，验证清理函数能扫到
+    // 手工造一个残留。断点续传要靠 .part 接着下，所以「刚下到一半的」必须留着，
+    // 只有很久没动过的（7 天）才清掉 —— 这里两头都验一下。
     let _ = std::fs::write(&part, b"leftover");
-    let before = part.exists();
+    let _ = update::clean_stale_partials();
+    let fresh_kept = part.exists();
+    if let Ok(f) = std::fs::OpenOptions::new().write(true).open(&part) {
+        let _ = f.set_modified(
+            std::time::SystemTime::now() - std::time::Duration::from_secs(8 * 24 * 3600),
+        );
+    }
     let n = update::clean_stale_partials();
     println!(
-        "  [{}] 手工造的 .part 被清理（清理了 {n} 个，之前存在={before}）",
-        if !part.exists() { "PASS" } else { "FAIL" }
+        "  [{}] 刚下到一半的 .part 保留、很旧的才清（清了 {n} 个，新文件保留={fresh_kept}）",
+        if fresh_kept && !part.exists() && n >= 1 { "PASS" } else { "FAIL" }
     );
     let _ = std::fs::remove_file(&dest);
     println!("===== 结束 =====");
@@ -2793,6 +2806,10 @@ struct App {
     scanned_at: String,
     /// 用户手动存进游戏库的条目。单独存一份，重新扫描不会冲掉它们。
     manual: Vec<scan::CachedRow>,
+    /// 用户主动移除过的条目（按安装目录记）；重新扫描不会再出现
+    ignored: Vec<String>,
+    /// 「被忽略」列表展开着没有
+    ignored_open: bool,
 
     ac_target: Option<AcReport>,
     /// 反作弊深度扫描正在后台跑（徽章先显示「分析中」）
@@ -2960,6 +2977,8 @@ impl App {
             scanned: false,
             scanned_at: String::new(),
             manual: Vec::new(),
+            ignored: Vec::new(),
+            ignored_open: false,
             ac_target: None,
             ac_scanning: false,
             // 枚举注册表很快，同步做完即可
@@ -3102,6 +3121,7 @@ impl App {
     /// 想刷新还是得点「扫描」。
     fn load_cached_library(&mut self) {
         let cache = scan::load_library();
+        self.ignored = cache.ignored.clone();
         if cache.scanned.is_empty() && cache.manual.is_empty() {
             return;
         }
@@ -3141,6 +3161,7 @@ impl App {
             scanned_at: self.scanned_at.clone(),
             scanned,
             manual: self.manual.clone(),
+            ignored: self.ignored.clone(),
         };
         if let Err(e) = scan::save_library(&cache) {
             self.note(format!("保存游戏库缓存失败（下次打开不会自动显示）: {e}"));
@@ -3161,6 +3182,9 @@ impl App {
             self.status = "这个目录已经在游戏库里了".to_owned();
             return;
         }
+        // 用户又把它加回来了，就别再忽略它
+        let key = dir.display().to_string();
+        self.ignored.retain(|s| s != &key);
         let entry = scan::manual_entry(&dir);
         let name = entry.name.clone();
         let cached = scan::CachedRow {
@@ -3182,11 +3206,31 @@ impl App {
         self.persist_library();
     }
 
+    /// 把这个目录从游戏库移除（扫描出来的和手动加的都能移），并记进忽略清单，
+    /// 这样重新扫描也不会再冒出来。只动列表，游戏目录里的文件一律不碰。
     fn remove_from_library(&mut self, dir: &Path) {
+        let key = dir.display().to_string();
         self.manual.retain(|c| c.entry.install_dir != dir);
-        self.games.retain(|r| !(r.manual && r.entry.install_dir == dir));
-        self.status = "已从游戏库移除（游戏目录里的文件没动）".to_owned();
+        self.games.retain(|r| r.entry.install_dir != dir);
+        if !self.ignored.iter().any(|s| s == &key) {
+            self.ignored.push(key);
+        }
+        self.status = "已从游戏库移除".to_owned();
         self.note(format!("从游戏库移除：{}", dir.display()));
+        self.persist_library();
+    }
+
+    /// 某个目录是不是被用户忽略过
+    fn is_ignored(&self, dir: &Path) -> bool {
+        let key = dir.display().to_string();
+        self.ignored.iter().any(|s| s == &key)
+    }
+
+    /// 把某个被忽略的条目放回来（重新扫描 / 下次启动就会出现）
+    fn restore_ignored(&mut self, key: &str) {
+        self.ignored.retain(|s| s != key);
+        self.status = "已恢复".to_owned();
+        self.note(format!("恢复被忽略的条目：{key}"));
         self.persist_library();
     }
 
@@ -3503,6 +3547,9 @@ impl App {
     fn handle(&mut self, msg: Msg) {
         match msg {
             Msg::Scanned(rows, notes) => {
+                // 用户移除过的条目不再列出来（重新扫描也不复活）
+                let mut rows = rows;
+                rows.retain(|r| !self.is_ignored(&r.entry.install_dir));
                 // 手动条目接在扫描结果后面 —— 重新扫描绝不能把它们冲掉
                 let manual_rows: Vec<GameRow> = self
                     .manual
@@ -3539,6 +3586,8 @@ impl App {
                 self.persist_library();
             }
             Msg::LibraryLoaded(rows, at, dropped) => {
+                let mut rows = rows;
+                rows.retain(|r| !self.is_ignored(&r.entry.install_dir));
                 let n = rows.len();
                 self.games = rows;
                 self.scanned = true;
@@ -3598,7 +3647,7 @@ impl App {
                     "新版本已下载并通过 SHA256 校验（{}，{short}…），马上替换程序并重启",
                     util::format_bytes(s.bytes)
                 ));
-                self.self_update_apply = Some(s.exe.clone());
+                self.self_update_apply = Some(s.installer.clone());
             }
             Msg::SelfUpdateFailed(e) => {
                 self.progress = None;
@@ -4284,25 +4333,35 @@ impl App {
     }
 
     /// 自更新收尾：换文件 + 重启。换成功就请求关窗（新版会自己起来）。
-    fn apply_self_update(&mut self, new_exe: &Path) {
-        let cur = match std::env::current_exe() {
-            Ok(p) => p,
-            Err(e) => {
-                self.status = format!("取不到当前程序路径，没法自动替换：{e}");
+    /// 自更新收尾：静默跑安装程序（装到当前这个目录），然后关掉自己。
+    /// 安装程序用的是上一次装到的目录（installer.iss 里 UsePreviousAppDir + 这里显式 /DIR），
+    /// 设置、资产、游戏库都在那个目录里，覆盖安装不会动它们；装完它会自己把新版拉起来。
+    fn apply_self_update(&mut self, installer: &Path) {
+        let dir = match std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(Path::to_path_buf))
+        {
+            Some(d) => d,
+            None => {
+                self.status = "取不到当前程序目录，没法自动更新".to_owned();
                 return;
             }
         };
-        match update::swap_in_place(&cur, new_exe) {
-            Ok(old) => {
-                log::line(&format!("自更新：程序已替换，旧版备份 {}", old.display()));
-                if let Err(e) = update::restart_self(&cur) {
-                    self.status = format!("程序已更新，但自动重启失败：{e}（手动打开一次即可）");
-                    return;
-                }
+        let mut cmd = std::process::Command::new(installer);
+        cmd.arg("/SILENT")
+            .arg("/NORESTART")
+            .arg(format!("/DIR={}", dir.display()));
+        match cmd.spawn() {
+            Ok(_) => {
+                log::line(&format!(
+                    "自更新：已启动安装程序 {}（装到 {}）",
+                    installer.display(),
+                    dir.display()
+                ));
                 self.ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
             Err(e) => {
-                self.status = format!("替换程序失败：{e:#}");
+                self.status = format!("启动更新安装程序失败：{e}");
                 let _ = util::open_url(update::RELEASES_URL);
             }
         }
@@ -5742,6 +5801,28 @@ impl eframe::App for App {
                     .inner_margin(egui::Margin::symmetric(14, 12)),
             )
             .show(ui, |ui| {
+            if self.ignored_open && !self.ignored.is_empty() {
+                let list = self.ignored.clone();
+                ui.horizontal_wrapped(|ui| {
+                    for key in &list {
+                        let short = std::path::Path::new(key)
+                            .file_name()
+                            .map(|n| n.to_string_lossy().to_string())
+                            .unwrap_or_else(|| key.clone());
+                        if theme::ghost_button(ui, &format!("恢复 {short}"), true)
+                            .on_hover_text(key)
+                            .clicked()
+                        {
+                            self.restore_ignored(key);
+                        }
+                    }
+                    if theme::ghost_button(ui, "全部恢复", true).clicked() {
+                        self.ignored.clear();
+                        self.persist_library();
+                    }
+                });
+                ui.add_space(6.0);
+            }
             ui.horizontal(|ui| {
                 ui.label(
                     egui::RichText::new("游戏库")
@@ -5755,6 +5836,12 @@ impl eframe::App for App {
                 }
                 if self.scanned {
                     theme::badge(ui, &format!("{} 个", self.games.len()), theme::NEUTRAL);
+                }
+                if !self.ignored.is_empty() {
+                    let n = self.ignored.len();
+                    if theme::ghost_button(ui, &format!("被忽略 ({n})"), true).clicked() {
+                        self.ignored_open = !self.ignored_open;
+                    }
                 }
                 if self.scanned && !self.scanned_at.is_empty() {
                     ui.label(theme::hint(format!("上次扫描 {}", self.scanned_at)));
@@ -5854,9 +5941,8 @@ impl eframe::App for App {
                             if theme::ghost_button(ui, "打开文件夹", true).clicked() {
                                 open = Some(target_dir.clone());
                             }
-                            if row.manual
-                                && theme::ghost_button(ui, "移除", !self.busy).clicked()
-                            {
+                            // 扫描出来的条目也能移除：移除后记进忽略清单，重新扫描不会复活
+                            if theme::ghost_button(ui, "移除", !self.busy).clicked() {
                                 remove = Some(row.entry.install_dir.clone());
                             }
                         });
@@ -6118,11 +6204,11 @@ impl eframe::App for App {
                     );
                     ui.add_space(6.0);
                     ui.label(
-                        "点「下载并更新」会：下载新版（约 3.2 MB）→ 核对发布时给出的 SHA256 → 替换当前程序并重启。",
+                        "点「下载并更新」会：下载新版安装程序（约 3.5 MB）→ 核对发布时给出的 SHA256 → 静默安装到本程序所在目录并重新启动。",
                     );
                     ui.add_space(4.0);
                     ui.label(theme::hint(
-                        "旧版会留成 framegen-manager.exe.old，下次启动自动删掉。你的设置、资产、游戏库都不动。",
+                        "设置、已下载资产、游戏库都在这个目录里，覆盖安装不会动它们。",
                     ));
                     ui.add_space(8.0);
                     ui.horizontal(|ui| {
