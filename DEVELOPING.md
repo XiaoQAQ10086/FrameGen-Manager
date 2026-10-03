@@ -25,6 +25,10 @@ Rust + egui/eframe。**不许用** Electron / Tauri / WebView。
 
 ## 自测命令
 
+自测按结果返回退出码：**全过 = 0，有失败 = 1**。CI 和打包脚本就靠它判定，别再靠数输出里的字符串。
+`--selftest` / `--sourcetest` / `--deploytest` 不依赖外网，每次推送都由 GitHub Actions 跑；
+`--downloadtest` / `--canceltest` 要连 GitHub，改下载链路时手工跑。
+
     cargo run -- --selftest        # 扫描游戏库 + 反作弊 + 更新检查 + 入口推荐 + 显卡
     cargo run -- --deploytest      # 部署 / 备份 / 还原 / 冲突 / 已装过本项目 端到端断言
     cargo run -- --canceltest      # 取消下载 + 残留清理
@@ -72,6 +76,16 @@ Rust + egui/eframe。**不许用** Electron / Tauri / WebView。
 会自动从 Cargo.toml 读版本号，产出 dist\FrameGen-Manager-v<版本>.zip 和 SHA256SUMS.txt。
 装了 Inno Setup 6 的话还会顺带出安装包。
 
+打包前先跑一遍 release 自测（**不过就不出包**），出包后再查安装包体积（**≥ 10 MB 直接报错**）。
+这样「exe 静默没图标」「安装包悄悄变胖」都流不出去。
+
+内存单独量（会开一个窗口，所以没并进打包流程）：
+
+    powershell -ExecutionPolicy Bypass -File packaging\check-memory.ps1
+    powershell -ExecutionPolicy Bypass -File packaging\check-memory.ps1 -BudgetMB 60
+
+它启动 release 版、读「私有工作集」（任务管理器「内存」列那个口径），超预算返回 1。
+
 **注意**：packaging 下的 .ps1 和 .iss 必须保持 **UTF-8 BOM**，
 否则 PowerShell 5.1 和 Inno Setup 会按 ANSI 解码，中文变乱码并报语法错。
 
@@ -79,21 +93,25 @@ Rust + egui/eframe。**不许用** Electron / Tauri / WebView。
 
 | 指标 | 目标 | 实测 |
 |---|---|---|
-| exe 体积 | 安装包 < 10 MB | 6.42 MB |
+| 安装包体积 | < 10 MB | 4.69 MB |
+| exe 体积 | —— | 7,160,832 字节 |
 | exe 运行库依赖 | 不要求用户装 VC++ | 17 个系统 DLL，无 vcruntime140.dll |
 | 启动 | < 1 s | 约 170 ms |
 | 关闭即退出 | 是 | 是 |
-| 内存 | < 60 MB | 私有工作集约 68.5 MB，未达标 |
+| 内存 | < 60 MB | 私有工作集约 53 MB，达标 |
 
-内存超标的部分几乎全部来自中文字体：加载 simhei.ttf（9.7 MB）会多占约 19 MB
-私有内存。要达标需要做字体子集化（build.rs + subsetter）。
+内存是怎么降下来的：中文字体原本占两份 —— `std::fs::read` 把 simhei.ttf（9.3 MB）
+读进堆，epaint 的 `blob_from_font_data()` 又对 `Cow::Owned` 的数据整份复制一次
+（就是里面那句 `data.clone().font`），合起来约 18.6 MB。现在字体改成**只读映射**
+（`map_font_readonly()`）并以借用数据交给 egui（`FontData::from_static`）：
+那次复制没有了，而且内核只按需调入真正用到的字形页 —— 字体里 9.29 MB 是 `glyf` 轮廓，
+界面实际只用得到几百个汉字。字体的边际成本从 18.6 MB 降到 0.4 MB。
 设 DLSSG_NO_CJK_FONT=1 可跳过字体加载，用来量化这部分开销。
 
 口径提醒：这里的「内存」指**私有工作集**（任务管理器「内存」列那个数），
 不是 `Process.WorkingSet64` —— 后者含共享 DLL 页，会虚高 30 MB 左右。
 要用 `Get-CimInstance Win32_PerfFormattedData_PerfProc_Process` 的
-`WorkingSetPrivate` 字段读才可比。实测：带字体 68.5 MB，DLSSG_NO_CJK_FONT=1 时 49.9 MB。
-显卡名伪装功能加入前后用同一套方法各测一次：68.4 MB vs 68.3 MB，没有可测量的差异。
+`WorkingSetPrivate` 字段读才可比。量它请用 `packaging\check-memory.ps1`，别手抄数。
 
 ## 上游（sdli1995/dlssg_for_sm86）的两个事实
 
@@ -200,7 +218,7 @@ archive/0.2.4/，仓库根目录现在就是新版。这一版变了五处，每
 4. 都判不出来就用上游默认 version.dll，并在界面上明确说明「未能自动判定」
 
 PE 解析是**随机读取**的：先读头部拿节表，再按节表把 RVA 换算成文件偏移 seek 过去读。
-早先的实现是「读文件前 N MB」，对 232 MB 的 TslGame.exe 和 457 MB 的 HogwartsLegacy.exe
+「读文件前 N MB」这种实现对 232 MB 的 TslGame.exe 和 457 MB 的 HogwartsLegacy.exe
 完全失效。另外必须同时读**延迟导入表**（DataDirectory[13]），否则会漏掉大部分依赖。
 
 ### 识别用户是否已经手动装过
@@ -216,7 +234,7 @@ PE 解析是**随机读取**的：先读头部拿节表，再按节表把 RVA �
 ### 游戏图标
 
 从**渲染 EXE** 提取（Windows Shell API + GDI），不管游戏来自 Steam、Epic 还是手动添加
-都能取到。踩过的坑：SHGetFileInfoW 遇到混合分隔符路径（d:/steam\...）会直接失败，
+都能取到。注意：SHGetFileInfoW 遇到混合分隔符路径（d:/steam\...）会直接失败，
 而 Steam 注册表里的 SteamPath 就是带正斜杠的，所以要先归一化。
 
 ### 下载与备用源：正常流程 0 次 API 调用
@@ -449,7 +467,7 @@ game_library.json（和配置文件放一起，便携版就在 exe 旁边）：�
 动画只在 0.45 秒里请求重绘，结束就停，空闲时一帧都不多画。插值抽成纯函数
 `fly_lerp`，自测里验端点，不用开窗口。目标卡片滚出可视区时跳过飞行、只闪一下。
 
-### 改版本号（这个坑踩过两次）
+### 改版本号
 
 **别用 PS 的 Get-Content / Set-Content 去改 Cargo.toml。** PS 5.1 按 ANSI 码页读无 BOM 的
 UTF-8 文件，中文注释里全角句号后面紧跟 CRLF 时，那个  会被当成双字节字符的尾字节吃掉
@@ -572,7 +590,7 @@ Win10 用 `ms-settings:display-advancedgraphics`。
 为此判定做得非常保守：**只有目录里真能找到游戏可执行文件才算一条记录**，宁可漏报也不列
 垃圾。扫不到不影响使用 —— 界面上还有「选择目录」。
 
-**踩到的坑（自测抓出来的）**：本机装了 QQ，而 QQ 的注册表键**也在 Tencent 下面**，它的
+**容易误报的一处（自测抓出来的）**：开发机上装了 QQ，而 QQ 的注册表键**也在 Tencent 下面**，它的
 数据指向 QQ 自己的安装目录，里头当然找得到 exe —— 于是一度被当成一条「WeGame 游戏」
 列了出来（显示成 "QQNT"）。现在有两道闸：
 
