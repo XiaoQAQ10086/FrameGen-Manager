@@ -47,6 +47,11 @@ windows-sys = { version = "0.61", features = [
     # CryptQueryObject 取出「真正签名的那张证书」再比指纹
     "Win32_Security_Cryptography",
     "Win32_Security_WinTrust",
+    # 字体文件用只读内存映射加载（见 main.rs 的 map_font_readonly）：
+    # windows-sys 把 CreateFileW / CreateFileMappingW 挂在 Win32_Security 下，
+    # 映射本身在 Win32_System_Memory。都只是 extern 声明，不会让 exe 变大。
+    "Win32_Security",
+    "Win32_System_Memory",
 ] }
 
 # 反作弊模块（模块 3）需要读注册表服务项 / PE 导入表时再加，不要现在加

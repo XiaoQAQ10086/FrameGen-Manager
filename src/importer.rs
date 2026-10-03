@@ -191,24 +191,23 @@ fn classify(kind: Kind, name: String, tmp: PathBuf, from: String) -> Result<Stag
 
 /// 从用户选的一个或多个 zip 里找出所有认得的文件，解到 work_dir 并逐个校验。
 ///
-/// 只支持 zip：以前也支持直接选一个解压好的文件夹，那个入口已经删掉。
-/// 上游源码 zip 里同时有根目录、310.1/ 和 archive/ 三套同名文件，
+/// 只支持 zip。上游源码 zip 里同时有根目录、310.1/ 和 archive/ 三套同名文件，
 /// 按路径排优先级（见 build_rank）：根目录那份最新，优先取它。
 pub fn stage(
     paths: &[PathBuf],
     work_dir: &Path,
     cancel: &AtomicBool,
-    // 进度回调：(给用户看的一句话, 0.0~1.0 的完成度)。以前没有完成度，
-    // 大压缩包导入时进度条一动不动，看着像卡死 —— 现在按「已看几个文件」推进。
+    // 进度回调：(给用户看的一句话, 0.0~1.0 的完成度)。按「已看几个文件」推进，
+    // 否则大压缩包导入时进度条一动不动，看着像卡死。
     mut progress: impl FnMut(String, f32),
     // 第二个返回值是「说明」清单：哪些文件被跳过、为什么，界面会写进导入结果
 ) -> Result<(Vec<Staged>, Vec<String>)> {
     std::fs::create_dir_all(work_dir)?;
     // 每个解出来的候选带着「它属于哪一版」的排名，等同名的都收齐了再挑赢家
     let mut cands: Vec<(u8, String, Staged)> = Vec::new();
-    // 临时文件名必须**全局唯一**：上游源码 zip 里根目录和 310.1/ 都叫 version.dll，
-    // 早先按「文件名.part」解压，第二个会把第一个覆盖掉，然后合并时又把文件删了 ——
-    // 结果就是用户点了「继续导入」之后报「导入失败」。所以这里带来源序号 + 条目序号。
+    // 临时文件名必须**全局唯一**：上游源码 zip 里根目录和 310.1/ 都叫 version.dll。
+    // 若按「文件名.part」解压，第二个会把第一个覆盖掉，合并时又把文件删掉，
+    // 用户点「继续导入」就会报「导入失败」。所以这里带来源序号 + 条目序号。
     let mut uniq = 0usize;
 
     for (si, p) in paths.iter().enumerate() {

@@ -363,7 +363,7 @@ pub fn deploy(
     // 记成 existed_before=true 的条目，这样「还原」还能把原件放回去 ——
     // 上游的步骤是「备份到单独目录，再移出游戏目录」，两步都不能少。
     // 已经在旧 manifest 里记过账的交给第 8 步处理，这里不重复备份
-    // （重复备份会用当前文件覆盖掉真正的原件，这个坑踩过一次）。
+    // （重复备份会用当前文件覆盖掉真正的原件）。
     let mut extra_removed: Vec<String> = Vec::new();
     for name in extra_proxies {
         if !PROXY_ENTRIES.contains(&name.as_str()) || name == proxy {
@@ -430,7 +430,7 @@ pub fn deploy(
     //   * 用户在弹窗里确认要移除的「另一个本项目代理」（extra_removed）—— 上面已备份
     //   * 旧 manifest 记过账、这次不用的：本来空着、是我们放的就直接删；那位置
     //     **原本就有文件**的也要删（不然两个代理并存），但备份记录必须搬进新
-    //     manifest，否则「还原」再也放不回原件（这分支以前是直接跳过的）
+    //     manifest，否则「还原」再也放不回原件
     //   * 其它：不碰
     //
     // 另外：凡是有原件备份、这次又不部署的条目，记录都要一直传下去 —— 包括文件

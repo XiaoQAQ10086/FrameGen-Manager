@@ -25,7 +25,7 @@ use winreg::RegKey;
 /// 帧生成建议的最低 NVIDIA 驱动版本。
 ///
 /// 上游的说明（0.3.1 / 0.3.2）：**cubin 内核需要约 R580 以上**，更旧的驱动会自动回退到
-/// PTX 内核（只在首次加载时多一次 JIT），仍然能用、只是首帧慢一点；591.86 与 610.74 实测可用。
+/// PTX 内核（只在首次加载时多一次 JIT），仍然能用、只是首帧慢一点；591.86 与 610.74 可用。
 /// 所以这里按 R580 报，提示语也不再写「多半不生效」——那样会把人吓去干等驱动更新。
 pub const MIN_FG_DRIVER: (u32, u32) = (580, 0);
 pub const MIN_FG_DRIVER_TEXT: &str = "580.0（R580）";
@@ -54,7 +54,7 @@ pub const PRESETS: &[&str] = &[
 ///
 /// 规则：把版本号里的数字全部连起来取最后 5 位，前三后二。
 /// 这是 NVIDIA Windows 驱动版本与市场版本号的固定对应关系，
-/// 已用 nvidia-smi 在本机实测校验过（32.0.16.1692 <-> 616.92）。
+/// 对应关系已用 nvidia-smi 校验过（32.0.16.1692 <-> 616.92）。
 pub fn parse_windows_version(v: &str) -> Option<(u32, u32)> {
     let digits: String = v.chars().filter(|c| c.is_ascii_digit()).collect();
     if digits.len() < 5 {
@@ -92,7 +92,7 @@ impl DriverInfo {
     }
 }
 
-/// 调 nvidia-smi 问驱动自己。比读注册表权威，但要起一个进程（实测约 35ms）。
+/// 调 nvidia-smi 问驱动自己。比读注册表权威，但要起一个进程（约 35ms）。
 fn nvidia_smi_version() -> Option<String> {
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -297,8 +297,8 @@ pub fn detect_driver(adapters: &[GpuAdapter]) -> Option<DriverInfo> {
 ///
 /// 注册表里**只有一个地方**记它：`HKLM\SYSTEM\CurrentControlSet\Control\GraphicsDrivers`
 /// 的 `HwSchMode`（2 = 开，1 = 关）。但这个值**可能根本不存在** —— Windows 11 默认
-/// 就是开启，而系统不一定往注册表里写这一项（实测本机 Win11 26300 实际开着、值却不存在，
-/// 全注册表扫了一遍也没有第二个地方记状态）。所以读不到时绝不能当成「关着」，
+/// 就是开启，而系统不一定往注册表里写这一项（Win11 26300 上该功能实际开着、这一项却不存在，
+/// 全注册表也没有第二个地方记状态）。所以读不到时绝不能当成「关着」，
 /// 只能老实报「未知」，让用户点「去设置」自己看。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HagsState {

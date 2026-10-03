@@ -148,7 +148,7 @@ pub fn card_rect<R>(ui: &mut Ui, add: impl FnOnce(&mut Ui) -> R) -> (R, egui::Re
         })
         .show(ui, |ui| {
             // 卡片一律撑满可用宽度。egui 的 Frame 默认**按内容决定宽度**，内容少的
-            // 卡片就会缩成窄窄一条（实测「目标目录」只有 255px，其他卡片都是 467px），
+            // 卡片会缩成窄窄一条（「目标目录」这类卡片只有 255px 宽，其他是 467px），
             // 看起来就是「卡片规格不一」。把宽度下限顶到可用宽度，所有卡片就对齐了。
             let w = ui.available_width();
             ui.set_min_width(w);

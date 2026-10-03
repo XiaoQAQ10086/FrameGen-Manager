@@ -297,7 +297,7 @@ pub fn steam_roots() -> Vec<PathBuf> {
 
 /// 记一条扫描说明：既写进日志，也带回去给界面显示。
 ///
-/// 扫描「扫不出来」这类反馈以前完全没法查 —— 现在每个跳过都有理由落在日志里，
+/// 扫描「扫不出来」这类反馈要靠日志才能定位 —— 每个跳过都记下理由，
 /// 用户把 logs 目录发过来就能定论。
 fn note(notes: &mut Vec<String>, s: String) {
     crate::log::line(&s);
@@ -351,8 +351,8 @@ pub fn steam_libraries_notes(root: &Path, notes: &mut Vec<String>) -> Vec<PathBu
 
 /// 这些不是游戏，只是 Steam 的运行库 / 再分发包。
 ///
-/// 早先用「名字里包含 proton 就算运行库」的子串匹配，会把真游戏一起误杀
-/// （Proton Bus Simulator 就是）；所以现在按 Steam 对运行库的固定命名来判：
+/// 按「名字里包含 proton 就算运行库」的子串匹配会把真游戏一起误杀
+/// （Proton Bus Simulator 就是）；所以按 Steam 对运行库的固定命名来判：
 /// 精确名 + 明确的版本号前缀。
 pub fn is_steam_junk(name: &str) -> bool {
     let n = name.trim().to_lowercase();
@@ -567,9 +567,9 @@ pub fn scan_epic_notes(notes: &mut Vec<String>) -> Vec<GameEntry> {
 // 两处用到它：find_render_exe 判断哪个 exe 是渲染器；advise_proxy 判断游戏会不会
 // 加载某个代理 DLL 名。
 //
-// 关键教训：早先的实现是「把文件前 N MB 读进来再解析」，对 232 MB 的 TslGame.exe
-// 和 457 MB 的 HogwartsLegacy.exe 完全失效 —— 导入表根本不在前 16 MB 内。
-// 现在先读头部拿节表，再按节表把 RVA 换算成文件偏移，seek 过去精确读取，任意大小都能解析。
+// 「把文件前 N MB 读进来再解析」对 232 MB 的 TslGame.exe 和 457 MB 的
+// HogwartsLegacy.exe 完全失效 —— 导入表根本不在前 16 MB 内。
+// 所以先读头部拿节表，再按节表把 RVA 换算成文件偏移，seek 过去精确读取，任意大小都能解析。
 
 use std::io::{BufReader, Read, Seek, SeekFrom};
 
@@ -634,7 +634,7 @@ const WEGAME_NON_GAME_KEYS: [&str; 9] = [
 ///
 /// 这个前提挡掉的是最要命的一类误报：本机装了 QQ，而 QQ 的注册表键**也在 Tencent
 /// 下面**，它的数据指向 QQ 自己的安装目录，里头当然找得到 exe —— 于是被当成一条
-/// 「WeGame 游戏」列出来了（实测踩到过）。装都没装 WeGame，就不可能有 WeGame 游戏。
+/// 「WeGame 游戏」列出来了。装都没装 WeGame，就不可能有 WeGame 游戏。
 pub fn wegame_installed() -> bool {
     let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
     for root in ["SOFTWARE\\WOW6432Node\\Tencent\\WeGame", "SOFTWARE\\Tencent\\WeGame"] {
@@ -1324,8 +1324,8 @@ pub fn pick_gpu_name(
 
 /// 读显卡型号名。
 ///
-/// **不再自己遍历显示适配器类键。** 以前这里是「取第一个名字带 NVIDIA 的条目」，
-/// 而那个键下面可能有：
+/// **不自己遍历显示适配器类键。** 「取第一个名字带 NVIDIA 的条目」这种做法不可靠，
+/// 因为那个键下面可能有：
 ///   * 旧显卡留下的**幽灵条目**（换过卡就会有）；
 ///   * 被别的工具改过的值（网上"解锁帧生成"的教程就会改 DriverDesc）。
 ///
@@ -1424,7 +1424,7 @@ pub fn find_render_exe(install_dir: &Path) -> Option<PathBuf> {
             continue;
         }
 
-        // 多信号加权。实测过两条看似更聪明的路，都不行：
+        // 多信号加权。两条看似更聪明的路都不行：
         //   1) 只看目录名 -> PUBG 的 Engine\Binaries\Win64\UnrealCEFSubProcess、
         //      CS2 的 game\bin\win64\vconsole2 都会被当成正主；
         //   2) 读 PE 导入表找 d3d12.dll -> cs2.exe 只静态导入 user32+kernel32，

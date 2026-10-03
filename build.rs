@@ -12,9 +12,13 @@ use std::process::Command;
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
-    let ico = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("packaging")
-        .join("app.ico");
+    // 运行期读 CARGO_MANIFEST_DIR，不要用 env!() 把路径在编译期烤进 build script。
+    // env!() 记的是「编译 build script 那一刻」的绝对路径：项目换盘符或搬目录后，
+    // cargo 仍可能复用缓存好的那份 build script，于是它拿着旧路径去找 app.ico ——
+    // 找不到只警告不报错，表现是 exe 静默没有图标。cargo 每次运行 build script 都会
+    // 重新设置这个环境变量，运行期读到的总是当前值。
+    let manifest = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR 未设置");
+    let ico = PathBuf::from(manifest).join("packaging").join("app.ico");
     println!("cargo:rerun-if-changed={}", ico.display());
 
     if std::env::var("CARGO_CFG_WINDOWS").is_err() {

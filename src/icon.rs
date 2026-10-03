@@ -32,8 +32,8 @@ impl std::fmt::Debug for IconImage {
 fn wide(path: &Path) -> Vec<u16> {
     use std::os::windows::ffi::OsStrExt;
     let mut v: Vec<u16> = path.as_os_str().encode_wide().collect();
-    // 实测坑：SHGetFileInfoW 遇到混合分隔符的路径（d:/steamsteamapps...）
-    // 会直接失败。Steam 注册表里的 SteamPath 就是带正斜杠的，所以这里统一成反斜杠。
+    // SHGetFileInfoW 遇到混合分隔符的路径（d:/steamsteamapps...）会直接失败。
+    // Steam 注册表里的 SteamPath 就是带正斜杠的，所以这里统一成反斜杠。
     for c in v.iter_mut() {
         if *c == b'/' as u16 {
             *c = b'\\' as u16;

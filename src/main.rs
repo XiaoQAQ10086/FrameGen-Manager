@@ -160,7 +160,7 @@ fn main() -> eframe::Result<()> {
         return Ok(());
     }
 
-    // 把所有候选源实测一遍并打印速度表：cargo run -- --speedall
+    // 把所有候选源测一遍并打印速度表：cargo run -- --speedall
     // 和界面上「测速」按钮走的是同一个函数，用来验证选源这条链路。
     if std::env::args().any(|a| a == "--speedall") {
         speedall();
@@ -378,7 +378,7 @@ fn main() -> eframe::Result<()> {
     }
 
 
-    // 备用源实测：cargo run -- --backuptest
+    // 备用源测速：cargo run -- --backuptest
     if std::env::args().any(|a| a == "--backuptest") {
         println!("===== 备用源实测 =====");
         let c = match update::client() {
@@ -876,7 +876,7 @@ Content-Type: application/octet-stream
     (port, stop)
 }
 
-/// 实测每个候选源的下载速率，打印成表。
+/// 测每个候选源的下载速率，打印成表。
 /// **和界面上「测速」按钮调的是同一个 speed_test_all**，所以这个命令的
 /// 结果就代表了那个按钮会不会工作。
 fn speedall() {
@@ -928,7 +928,7 @@ fn fg_optimized_label(v: u8) -> &'static str {
 /// **部署前的显卡闸门**：返回 Some(理由) = 禁止部署，None = 放行。
 ///
 /// 抽成独立的纯函数是为了自测能直接断言 —— 「哪张卡能装、哪张不能」是用户最容易
-/// 被坑的一条规则（装了半天不生效）。do_deploy 直接用这里的文案定状态，
+/// 也是最容易出错的一条规则（装了半天不生效）。do_deploy 直接用这里的文案定状态，
 /// 界面卡片另外写更短的一句（只说结论和颜色）。
 fn gpu_gate(route: scan::GpuRoute) -> Option<&'static str> {
     match route {
@@ -1266,8 +1266,8 @@ fn selftest() {
                 .collect();
             specs.push(update::INI_REPO_PATH.to_owned());
             println!("  逐个 HEAD 取内容指纹（0 次 API 调用）：");
-            // 这一段以前要 15 秒以上：release 直链是 github.com，第一次探测会先干等
-            // 连接超时才轮到镜像。现在直链探测改镜像优先，连接超时也从 15s 收到 8s。
+            // 直链探测走镜像优先、连接超时 8s，所以这一段很快：若按官方优先，第一次
+            // 探测要先干等 github.com 的连接超时（15s）才轮到镜像。
             let t_head = std::time::Instant::now();
             for path in &specs {
                 match update::probe_remote(&c, path) {
@@ -2520,8 +2520,8 @@ fn deploytest() {
                 .unwrap_or(false);
             check!(recorded_as_existing, "这个位置被记成「原本就有文件」");
 
-            // 换成别的入口再部署：以前这一分支被直接跳过，
-            // 结果是两个代理并存，而且原件再也还原不回来。
+            // 换成别的入口再部署：不处理这一分支的话，两个代理会并存，
+            // 而且原件再也还原不回来。
             let winmm_switch = src.join("winmm_switch.dll");
             fs::write(&winmm_switch, b"FAKE_WINMM_SWITCH").unwrap();
             let switch = [deploy::DeployFile::new("winmm.dll", &winmm_switch)];
@@ -2582,7 +2582,7 @@ fn deploytest() {
         Some(real) => {
             let t6 = root.join("extra-proxy");
             let _ = fs::create_dir_all(&t6);
-            // 模拟「用户手动装了 dinput8.dll」，而我们这次要用 version.dll
+            // 模拟「用户手动装了 dinput8.dll」，而待部署的是 version.dll
             fs::copy(&real, t6.join("dinput8.dll")).unwrap();
             check!(
                 deploy::find_extra_own_proxies(&t6, "version.dll") == vec!["dinput8.dll".to_owned()],
@@ -2947,8 +2947,8 @@ impl App {
         if let Some(m) = migrated {
             boot_notes.push(m);
         }
-        // 老版本可以切到上游的 310.1 版；0.3.1 起 20/30 系用同一套文件，不再区分。
-        // 曾经切过的用户本地那份是旧的：探测落到镜像时指纹不可信，「已是最新」的判定
+        // 上游 0.3.1 起 20/30 系用同一套文件，310.1 那个切换已经取消。但带旧的 310.1
+        // 记录的本地 version.dll 是老的：探测落到镜像时指纹不可信，「已是最新」的判定
         // 会退化成比字节数，旧文件正好和旧记录对得上 → 静默跳过下载。清一次记录。
         if util::config_had_legacy_3101() {
             let n = update::clear_download_records();
@@ -3389,8 +3389,8 @@ impl App {
     ///
     /// assets 目录由调用方解析一次传进来，避免每一行都去读配置文件。
     ///
-    /// 关键：必须先确认文件真的还躺在 assets 目录里。早先这里只比对
-    /// update_state.json 里的下载记录，用户把资产文件删光之后，
+    /// 关键：必须先确认文件真的还躺在 assets 目录里。只比对
+    /// update_state.json 里的下载记录不够：用户把资产文件删光之后，
     /// 界面照样显示「已就绪」—— 记录还在，文件早就没了。
     fn asset_state(&self, assets: Option<&Path>, row: &AssetRow) -> AssetState {
         // DLSS 运行库单独判：靠 NVIDIA 签名，不看下载记录
@@ -3434,7 +3434,7 @@ impl App {
             return AssetState::Outdated;
         }
         // **手动导入的文件没有官方指纹**（etag 是空的）—— 拿它去比指纹只会永远报
-        // 「有更新」，用户明明导入的就是最新版（实测踩到过）。
+        // 「有更新」，即使用户导入的就是最新版。
         // 这里改成比大小：做过「检查更新」就知道上游多大，一样 → 就绪；
         // 不一样（比如导入了旧版）→ 有更新，提示该重下。没查过上游大小就按就绪算。
         if rec.imported || rec.etag.is_empty() {
@@ -3623,8 +3623,8 @@ impl App {
                 }
             }
             Msg::ImportDone(report) => {
-                // 这里曾经漏掉 progress = None —— 导入成功后「上游资产」卡片上还挂着
-                // 「…正在找需要的 ...」，看着像还在读包（用户报的就是这个）
+                // 收尾时必须把 progress 清掉，否则「上游资产」卡片上还挂着
+                // 「…正在找需要的 ...」，看着像还在读包
                 self.finish_busy("导入完成");
                 self.update_state = update::load_state();
                 self.refresh_asset_rows();
@@ -3663,7 +3663,7 @@ impl App {
                 // 先从磁盘读一遍（可能被别的进程改过），再把这次检查到的上游版本写回缓存：
                 // 顶部那个「上游 x.y.z」徽章读的就是 update_state.json 里的版本，
                 // 不写回去它就要等到点一次「下载 / 更新资产」才更新 ——
-                // 用户实测「卡片显示 0.3.1、徽章还是 0.3.0」就是这么来的。
+                // 「卡片显示 0.3.1、徽章还是 0.3.0」就是这么来的。
                 self.update_state = update::load_state();
                 if let Some(v) = s.version.clone() {
                     if self.update_state.version.as_deref() != Some(v.as_str()) {
@@ -3742,7 +3742,7 @@ impl App {
                 }
             }
             Msg::Failed(e) => {
-                // 走统一收尾：这条以前忘了清 import_busy —— 导入失败后那个转圈会一直转
+                // 走统一收尾：漏了清 import_busy 的话，导入失败后那个转圈会一直转
                 let m = format!("错误: {e}");
                 self.note(m.clone());
                 self.finish_busy(m);
@@ -3879,9 +3879,9 @@ impl App {
 
     /// 后台任务收尾：状态栏、忙碌标记、进度条、取消句柄一次收干净。
     ///
-    /// 以前这几件事在每个 Msg 分支里各写一遍，结果手动导入那条路漏了清进度条 ——
-    /// 导入其实已经成功、也能正常部署了，界面上却还挂着「…正在找需要的 ...」，
-    /// 看着像卡住。以后新增后台任务，收尾只调这一个函数。
+    /// 这几件事若在每个 Msg 分支里各写一遍，很容易漏掉一处（手动导入那条路就漏过
+    /// 清进度条）——导入其实已经成功、也能正常部署，界面上却还挂着「…正在找需要的
+    /// ...」，看着像卡住。新增后台任务时，收尾只调这一个函数。
     fn finish_busy(&mut self, status: impl Into<String>) {
         self.status = status.into();
         self.busy = false;
@@ -4020,9 +4020,9 @@ impl App {
 
                 // 六个文件各发一次 HEAD 到 raw.githubusercontent.com 拿内容指纹。
                 // 走的是 CDN，不占 api.github.com 那每小时 60 次的配额 ——
-                // 配额被共享出口 IP 吃光正是之前「检查更新 / 下载」失败的原因。
+                // 配额被共享出口 IP 吃光会让「检查更新 / 下载」失败。
                 // 在用的那一版有哪些文件：6 个代理入口 + INI。
-                // 名单写死过一次，上游把 altnative/ 改名成 alternatives/ 之后就全 404 了。
+                // 名单写死的话，上游一改名（altnative/ → alternatives/）就会全 404。
                 let mut specs: Vec<String> = scan::PROXY_PRIORITY
                     .iter()
                     .map(|p| update::proxy_repo_path(p).to_owned())
@@ -4485,8 +4485,8 @@ impl App {
         //
         // 上游（0.3.0 起）只要求放「代理 DLL + INI」（运行库/模型/后端都内嵌在代理里），
         // 而很多游戏目录本来就带自己的 nvngx_dlssg.dll / nvngx_dlss.dll（和游戏自己的
-        // DLSS 版本配套）。以前无条件覆盖，用户实测「工具部署不生效、手动只放两个文件
-        // 反而正常」—— 所以现在已有的一律不碰，用完提醒一句。
+        // DLSS 版本配套）。无条件覆盖会出事：有用户遇到「工具部署不生效、手动只放两个
+        // 文件反而正常」——所以已有的一律不碰，用完提醒一句。
         let mut files = vec![deploy::DeployFile::new(&proxy, dll.clone())];
         let mut notes: Vec<String> = Vec::new();
         let (have, need) = update::runtime_deploy_plan(&dir);
@@ -5199,7 +5199,7 @@ impl eframe::App for App {
                     };
                     let mut choice = current.clone();
                     // 一行下拉：源多的时候不再把界面铺成好几行。
-                    // 「自动」时把当前实测最快的那个写进标题，用户一眼知道会用谁。
+                    // 「自动」时把当前测速最快的那个写进标题，用户一眼知道会用谁。
                     let selected_text = if current.is_empty() {
                         let fastest = self
                             .speed_results
@@ -5633,7 +5633,7 @@ impl eframe::App for App {
                     // 固定 3 + 3 两行：交给 horizontal_wrapped 自动换行会排成 5 + 1，
                     // 最后一项孤零零占一行，看着像出了错。
                     // 用 selectable_value 而不是 radio_value：radio 被选中时只多画一个
-                    // 小圆点（实测整行只有 32 个像素变化），看着像没点动；
+                    // 小圆点（整行只有 32 个像素变化），看着像没点动；
                     // selectable_value 选中后整个选项底色变绿，一眼可见，点击区域也更大。
                     ui.horizontal(|ui| {
                         for p in &gpu::PRESETS[..3] {
@@ -5651,8 +5651,8 @@ impl eframe::App for App {
 
                     ui.add_space(4.0);
                     // 不用 ui.checkbox：egui 0.36 勾选后只是在 8px 的小方框里画一条
-                    // 1 像素宽的细对勾，方框底色完全不变。实测勾上前后整行只差 32 个
-                    // 像素，肉眼几乎看不出勾没勾上 —— 用户会以为「点了没反应」。
+                    // 1 像素宽的细对勾，方框底色完全不变：勾上前后整行只差 32 个像素，
+                    // 肉眼几乎看不出勾没勾上 —— 用户会以为「点了没反应」。
                     // toggle_value 选中时整行变绿，状态一眼可见，而且点击区域大得多。
                     let ack_text = if self.spoof_ack {
                         "已勾选：我已阅读并理解上面的副作用（再点一次取消）"
@@ -5793,6 +5793,20 @@ impl eframe::App for App {
             self.icon_textures.insert(key, tex);
         }
 
+        // 图标进了纹理缓存之后，行里那份 RGBA 就是纯粹的重复。留着一分钱好处都没有：
+        // 真要重新提取，再调一次 icon_of 就有了；丢掉它，游戏多了才不会把内存顶起来。
+        // 上面那个 any() 让这段在清完之后每帧只做一次廉价判断。
+        if self.games.iter().any(|r| r.icon.is_some()) {
+            let done: Vec<String> = self.icon_textures.keys().cloned().collect();
+            for row in self.games.iter_mut() {
+                if row.icon.is_some()
+                    && done.contains(&row.entry.install_dir.display().to_string())
+                {
+                    row.icon = None;
+                }
+            }
+        }
+
         // ---------------- 中央：游戏库卡片列表
         egui::CentralPanel::default()
             .frame(
@@ -5919,8 +5933,8 @@ impl eframe::App for App {
                         ui.add_space(2.0);
                         ui.horizontal(|ui| {
                             // 关键：部署目标必须是「渲染 EXE 所在目录」，不是游戏根目录。
-                            // mod 文件放错地方游戏根本不会加载；早先这里传的是根目录，
-                            // 导致选中后部署卡片去根目录找文件，一律显示「未部署」。
+                            // mod 文件放错地方游戏根本不会加载；传根目录的话，选中后部署
+                            // 卡片会去根目录找文件，一律显示「未部署」。
                             // 部署目标由行构建时算好存进 row.target：
                             // 扫出来的游戏是渲染 EXE 所在目录，手动条目就是用户存的那个目录。
                             let target_dir = row.target.clone();
@@ -6448,7 +6462,7 @@ impl App {
     }
 }
 /// egui 自带字体不含汉字，不装字体整个中文界面会是方块。
-/// 直接读系统字体，避免往 exe 里塞 10 MB 字体。
+/// 直接用系统字体，避免往 exe 里塞 10 MB 字体。
 fn install_cjk_font(ctx: &egui::Context) {
     // 诊断开关：设了就用默认字体（中文会变方块），用来量化字体占多少内存
     if std::env::var_os("DLSSG_NO_CJK_FONT").is_some() {
@@ -6462,14 +6476,20 @@ fn install_cjk_font(ctx: &egui::Context) {
 
     for name in CANDIDATES {
         let path = font_dir.join(name);
-        let Ok(bytes) = std::fs::read(&path) else {
+        // 映射失败（罕见：被安全软件拦、权限异常）就退回整份读进来 —— 仍然走
+        // from_static，只是那份数据变成常驻的堆内存。宁可多占几 MB 也不能让界面变方块。
+        let Some(bytes) = map_font_readonly(&path).or_else(|| {
+            std::fs::read(&path)
+                .ok()
+                .map(|b| &*Box::leak(b.into_boxed_slice()))
+        }) else {
             continue;
         };
 
         let mut fonts = egui::FontDefinitions::default();
         fonts.font_data.insert(
             "cjk".to_owned(),
-            std::sync::Arc::new(egui::FontData::from_owned(bytes)),
+            std::sync::Arc::new(egui::FontData::from_static(bytes)),
         );
         fonts
             .families
@@ -6484,6 +6504,66 @@ fn install_cjk_font(ctx: &egui::Context) {
 
         ctx.set_fonts(fonts);
         return;
+    }
+}
+
+/// 把字体文件只读映射进内存，返回一个活到进程结束的切片；失败返回 None。
+///
+/// 为什么不用 `std::fs::read`：
+/// * 黑体 9.3 MB 里有 9.29 MB 是 `glyf`（字形轮廓），而界面实际只用得到几百个汉字。
+///   `std::fs::read` 会把整份文件拷进本进程的私有内存并一直占着；映射之后由内核按页
+///   按需调入，没碰过的页不占内存，而且这些页是文件后备的，系统内存紧张时可以直接丢弃。
+/// * 顺带避开 epaint 的一次整份复制：`blob_from_font_data()` 内部写的是
+///   `data.clone().font`，对 `Cow::Owned` 的字体数据会再复制一整份。映射出来的是借用
+///   数据，只能走 `FontData::from_static`，那次 clone 就只复制一个指针。
+///
+/// 视图建好后立即关掉两个句柄：只要不 `UnmapViewOfFile`，视图就始终有效 —— 它本来就
+/// 要活到进程结束，所以这里既不解除映射也不需要 Drop。
+fn map_font_readonly(path: &Path) -> Option<&'static [u8]> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Foundation::{CloseHandle, GENERIC_READ, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, OPEN_EXISTING,
+    };
+    use windows_sys::Win32::System::Memory::{
+        CreateFileMappingW, MapViewOfFile, FILE_MAP_READ, PAGE_READONLY,
+    };
+
+    let len = std::fs::metadata(path).ok()?.len();
+    if len == 0 {
+        return None;
+    }
+    // CreateFileW 走的是 UTF-16 宽字符路径
+    let mut w: Vec<u16> = path.as_os_str().encode_wide().collect();
+    w.push(0);
+
+    unsafe {
+        let file = CreateFileW(
+            w.as_ptr(),
+            GENERIC_READ,
+            FILE_SHARE_READ,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+            std::ptr::null_mut(),
+        );
+        if file == INVALID_HANDLE_VALUE {
+            return None;
+        }
+        // 大小传 0 = 映射整个文件
+        let map = CreateFileMappingW(file, std::ptr::null(), PAGE_READONLY, 0, 0, std::ptr::null());
+        if map.is_null() {
+            CloseHandle(file);
+            return None;
+        }
+        let view = MapViewOfFile(map, FILE_MAP_READ, 0, 0, 0);
+        // 句柄用完就关：视图的生命周期由映射对象自己撑着
+        CloseHandle(map);
+        CloseHandle(file);
+        if view.Value.is_null() {
+            return None;
+        }
+        Some(std::slice::from_raw_parts(view.Value as *const u8, len as usize))
     }
 }
 

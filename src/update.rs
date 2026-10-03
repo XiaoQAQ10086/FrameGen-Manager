@@ -8,7 +8,7 @@
 //! 原因：api.github.com 未登录时按 IP 每小时只有 60 次配额，而不少用户走加速器 /
 //! 代理，出口 IP 是共享的，配额会被别人吃光，于是「检查更新」「下载资产」直接失败。
 //!
-//! 替代方案（都已实测）：
+//! 替代方案：
 //!   * 变更指纹：对 raw.githubusercontent.com 发 **HEAD**，响应里的 `ETag` 就是内容的
 //!     SHA-256（64 位十六进制）。官方源和 ghproxy 镜像**都会**返回它。
 //!   * 文件下载：raw.githubusercontent.com 官方源，或镜像前缀。
@@ -72,7 +72,7 @@ pub struct RemoteFile {
     pub etag: String,
     /// 这个指纹**是不是官方源给的**。
     ///
-    /// 镜像给的指纹和官方对不上（实测 gh-proxy.com 返回的是弱标签
+    /// 镜像给的指纹和官方对不上（gh-proxy.com 返回的是弱标签
     /// `W/"11378bae..."`，内容哈希也完全是另一个值）。拿镜像的指纹去比"内容变没变"，
     /// 就会出现「同一个文件每次都被判定为需要更新」—— 也就是用户报的
     /// 「不断重复下载、停不下来」。所以指纹只在可信时参与判定。
@@ -107,7 +107,7 @@ impl UpdateState {
     ///
     /// 注意要传**本地文件名**（比如 winmm.dll），不是仓库路径
     /// （altnative/winmm.dll）—— files 表是按本地文件名做 key 的。
-    /// 早先用 remote.name 查，导致 altnative 那四个永远被判定成「有更新」。
+    /// 别拿 remote.name 去查：那是仓库路径，altnative 那四个会被永远判定成「有更新」。
     ///
     /// 老版本的记录里没有 etag 字段，这时按「需要更新」处理，
     /// 重新下载一次就会补上，属于一次性成本。
@@ -129,7 +129,7 @@ pub fn client() -> Result<reqwest::blocking::Client> {
         // 对下载来说这个值是「单次读取」的上限，不是整段下载的总上限：
         // reqwest 的阻塞读每调用一次就重新计时，所以只要服务器还在往外吐字节，
         // 多慢都能慢慢下完 —— 用户线路慢不该被掐断。
-        // （曾经按「平均速度低于 300 KB/s 就换源」，有用户因此下到四分之一就断了。）
+        // （按「平均速度低于 300 KB/s 就换源」会把慢线路掐断，只下到四分之一。）
         // 它现在只兜底一件事：源彻底不动了 —— 连续 300 秒一个字节都没有才判它死。
         .timeout(Duration::from_secs(300))
         // 连接超时别设太长：源被墙时每个候选都要空等这么久。
@@ -147,16 +147,16 @@ fn cancelled(cancel: Option<&AtomicBool>) -> bool {
     cancel.map(|c| c.load(Ordering::Relaxed)).unwrap_or(false)
 }
 
-// 原来这里记的是「每个主机上次哪个候选**成功**了」，现在换成了记**实测速率**
-// （见下面的 SourceSpeeds）。区别很重要：镜像的快慢是按用户线路和时间变的，
-// 「上次能连上」不代表「这次够快」，而慢源不换掉就是用户抱怨的那个问题。
+// 这里记的是每个候选的**测速值**（见下面的 SourceSpeeds），而不是「上次哪个成功了」。
+// 区别很重要：镜像的快慢按用户线路和时间变，「上次能连上」不代表「这次够快」，
+// 而慢源不换掉就是用户抱怨的那个问题。
 
 /// 按候选顺序依次尝试，第一个成功的胜出。
 ///
 /// **探测和下载的优先级是反的，这是故意的**：
 /// * 探测（HEAD，拿 ETag 指纹）走**官方优先** —— 指纹要从 GitHub 自己那里拿才可信。
 ///   HEAD 很小，官方 raw 即使是慢速链路也能秒回。
-/// * 下载走**镜像优先**，镜像之间再按**实测速率**从快到慢排（见 rank_mirrors）。
+/// * 下载走**镜像优先**，镜像之间再按**测速值**从快到慢排（见 rank_mirrors）。
 ///   内容仍然用官方拿到的指纹校验，所以既快又不牺牲可信度。
 ///
 /// attempt 拿到的是 (完整 URL, 源前缀)；前缀空串表示官方源。
@@ -216,7 +216,7 @@ pub const RELEASES_URL: &str = "https://github.com/XiaoQAQ10086/FrameGen-Manager
 ///
 /// **为什么不查 Releases 接口**：
 ///   * api.github.com 未登录按 IP 限 60 次/小时 —— 正是这个项目一直在躲的东西；
-///   * gh-proxy 这类镜像**只代理资源文件、拒绝代理网页**（实测直接回
+///   * gh-proxy 这类镜像**只代理资源文件、拒绝代理网页**（直接回
 ///     "Web page content is not allowed"），所以 releases 页面和 releases.atom 都抓不到；
 ///   * 而 raw 上的 Cargo.toml 只有 2KB，官方源和镜像都拿得到，且不占配额。
 ///
@@ -224,7 +224,7 @@ pub const RELEASES_URL: &str = "https://github.com/XiaoQAQ10086/FrameGen-Manager
 /// 所以 main 上的版本号等于最新已发布版本。改流程的话这里要跟着改。
 ///
 /// **为什么不只信第一个成功的源**：raw.githubusercontent.com 前面有 CDN 缓存，
-/// 仓库里刚改完 Cargo.toml 的那几分钟，缓存还在吐旧内容。实测发 0.4.0 时官方 raw
+/// 仓库里刚改完 Cargo.toml 的那几分钟，缓存还在吐旧内容。发 0.4.0 时官方 raw
 /// 有约 3 分钟仍然说 0.3.0 —— 而官方恰好是优先源，一旦它「成功」返回就直接采信了，
 /// 于是还停在 0.3.0 的用户被告知「已是最新」，根本看不到更新提示。各家的缓存时机
 /// 不一样，所以这里改成**所有源都问、取最大的版本号**。
@@ -316,7 +316,7 @@ pub fn is_newer(remote: &str, local: &str) -> bool {
 
 /// 取响应头里的 ETag，并确认它看起来就是内容的 SHA-256。
 ///
-/// raw.githubusercontent.com（以及实测会透传的 ghproxy 镜像）返回的 ETag 就是
+/// raw.githubusercontent.com（以及会透传这个头的 ghproxy 镜像）返回的 ETag 就是
 /// 64 位十六进制的 SHA-256；不满足这个形状就当作没有，免得拿别的哈希去比对。
 fn etag_of(resp: &reqwest::blocking::Response) -> Option<String> {
     let raw = resp.headers().get("etag")?.to_str().ok()?;
@@ -508,7 +508,7 @@ pub fn clean_stale_partials() -> usize {
 /// 本地这份文件是不是已经是最新版。
 ///
 /// **必须同时满足三条**：下载记录在、指纹和远端一致、而且文件真的还在且大小对得上。
-/// 只看记录会造成「文件被删了却认为无需下载」—— asset_state 那边踩过同样的坑。
+/// 只看记录会造成「文件被删了却认为无需下载」（asset_state 那边同理）。
 pub fn local_is_current(
     state: &UpdateState,
     local_name: &str,
@@ -554,7 +554,7 @@ pub struct Sink<'a> {
 /// 不用用户再手点「改用备用源」。
 ///
 /// **prefer_mirror 是有讲究的：**
-/// * 大文件（15 MB 的代理 DLL）传 true —— 镜像实测快几十倍。代价是
+/// * 大文件（15 MB 的代理 DLL）传 true —— 镜像快几十倍。代价是
 ///   gh-proxy.com **不转发 ETag**，那边 ETag 比对会落空，必须靠 `verify` 里的
 ///   签名校验兜住（这 5 个代理 DLL 都有本项目签名，镜像伪造不出来）。
 /// * 小文件（581 B 的 ini）传 false —— 官方源再慢也是瞬间，而且官方**会**给
@@ -697,7 +697,7 @@ pub fn download(
     }
     let mut chunk = vec![0u8; 64 * 1024];
     let mut got: u64 = resume;
-    // 只记总耗时，供下完后记录实测速率用 —— 不再按速度拦任何东西。
+    // 只记总耗时，供下完后记录测速值用 —— 不再按速度拦任何东西。
     let t0 = Instant::now();
     // 进度回调里那第三段文字在这里算一次 —— 别每 64 KB 都新分配一个 String
     let tag = format!("经 {}", source_label(source));
@@ -750,7 +750,7 @@ pub fn download(
     })
 }
 
-/// 下载成功后把实测速率记下来，下次排序就有依据了。
+/// 下载成功后把测速值记下来，下次排序就有依据了。
 /// 太小的样本不记 —— 581 字节的 ini 算出来的数没有意义。
 fn record_download_speed(source: &str, bytes: u64, secs: f64) {
     if bytes < SPEED_RECORD_MIN_BYTES || secs < 0.3 {
@@ -914,30 +914,30 @@ pub fn prepare_deploy_ini(
 // 这两个文件由 NVIDIA 官方签名，这里从社区仓库的 release 里取（该仓库只做搬运打包，
 // 我们解压后会校验签名者必须是 NVIDIA，否则丢弃）。
 
-/// 内置镜像，按**实测速度**从快到慢排。
+/// 内置镜像，按**测速值**从快到慢排。
 ///
-/// 2026-09 本机实测（拉 raw 上的 version.dll，每次 512 KB 样本，多轮）：
+/// 参考速率（拉 raw 上的 version.dll，每次 512 KB 样本，多轮）：
 ///   ghfile.geekertao.top   约 0.4 MB/s
 ///   ghfast.top             约 0.2 MB/s
 ///   gh-proxy.cn            约 0.07 MB/s
 ///   gh.xxooo.cf            约 0.06 MB/s
 ///   ghproxy.net            0.02 ~ 0.16 MB/s
 ///   raw 官方直连           0.00 ~ 0.06 MB/s   <- 基本不通
-/// gh-proxy.com 曾是本机最快的（3.9 ~ 5.2 MB/s），后来对本机开始返回 403，
-/// 但别人线路仍然可用，所以留着 —— download_auto 会挨个换源，不通就跳过。
+/// gh-proxy.com 在部分线路上最快（3.9 ~ 5.2 MB/s），但会对另一些线路返回 403，
+/// 所以留着 —— download_auto 会挨个换源，不通就跳过。
 ///
-/// **只留实测打得通的源。** 第二轮试过的 ghproxy.cfd / ghps.cc /
-/// ghproxy.cdn.9i0i.com / ghp.icu / gh-proxy.top / ghproxy.homeboyc.cn /
-/// gh.jasonzeng.dev / mirror.ghproxy.com 全部连不上，已删掉：留着的死源只会在
-/// 官方源也失败时挨个白等一次连接超时，纯粹拖慢用户。
+/// **只留连得上的源。** ghproxy.cfd / ghps.cc / ghproxy.cdn.9i0i.com / ghp.icu /
+/// gh-proxy.top / ghproxy.homeboyc.cn / gh.jasonzeng.dev / mirror.ghproxy.com
+/// 全部连不上，已删掉：留着的死源只会在官方源也失败时挨个白等一次连接超时，
+/// 纯粹拖慢用户。
 /// 界面上的下载源只能从这里挑（「自动」或指定其中一个），不再支持手填地址。
 pub const MIRRORS: [&str; 6] = [
-    // 第一轮实测活下来的
+    // 连得上的
     "https://gh-proxy.com/",
     "https://ghfast.top/",
     "https://ghfile.geekertao.top/",
     "https://ghproxy.net/",
-    // 第二轮候选里活下来的两个
+    // 候选里同样连得上的两个
     "https://gh.xxooo.cf/",
     "https://gh-proxy.cn/",
 ];
@@ -965,20 +965,20 @@ fn mirrors(custom: &str) -> Vec<String> {
         .map(|s| (*s).to_owned())
         .collect();
     let mut out = rank_mirrors(&rest);
-    // 选中的源排最前面，其余镜像按实测速率跟在后面兜底
+    // 选中的源排最前面，其余镜像按测速值跟在后面兜底
     if let Some(sel) = selected {
         out.insert(0, sel);
     }
     out
 }
 
-// ---------------------------------------------------------- 选源：实测速率记忆
+// ---------------------------------------------------------- 选源：测速值记忆
 //
-// 为什么要这套东西：镜像的快慢**按用户线路和时间剧烈变化**。实测同一个
+// 为什么要这套东西：镜像的快慢**按用户线路和时间剧烈变化**。同一个
 // gh-proxy.com，同一台机器，相隔一小时能从 6.9 MB/s 掉到 0.34 MB/s。
 // 只记「上次哪个源成功了」根本察觉不到这种变化，用户就得陪着慢源一起等。
 
-/// 一个源的实测速率记录。
+/// 一个源的测速记录。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SpeedSample {
     /// KB/s
@@ -992,7 +992,7 @@ pub struct SourceSpeeds {
     pub entries: BTreeMap<String, SpeedSample>,
 }
 
-/// 排序用的分界线：实测速率达到这个数（KB/s）的源算「快」，排在没测过的前面。
+/// 排序用的分界线：测速值达到这个数（KB/s）的源算「快」，排在没测过的前面。
 /// 注意它**只影响先试哪个源**，不会因为慢就中断下载 —— 慢源也让它下完。
 pub const GOOD_SPEED_KBPS: u64 = 300;
 
@@ -1026,14 +1026,14 @@ fn now_unix() -> i64 {
         .unwrap_or(0)
 }
 
-/// 记下一次实测速率。prefix 空串表示官方源。
+/// 记下一次测速值。prefix 空串表示官方源。
 pub fn record_speed(prefix: &str, kbps: u64) {
     let mut s = load_speeds();
     s.entries.insert(prefix.to_owned(), SpeedSample { kbps, at: now_unix() });
     save_speeds(&s);
 }
 
-/// 取某个源的实测速率。没测过、或记录太旧，都返回 None。
+/// 取某个源的测速值。没测过、或记录太旧，都返回 None。
 fn speed_of(s: &SourceSpeeds, prefix: &str) -> Option<u64> {
     let e = s.entries.get(prefix)?;
     if now_unix() - e.at > SPEED_TTL_SECS {
@@ -1042,7 +1042,7 @@ fn speed_of(s: &SourceSpeeds, prefix: &str) -> Option<u64> {
     Some(e.kbps)
 }
 
-/// 按实测速率排序：确认够快的在前（越快越前），没测过的居中，确认太慢的垫底。
+/// 按测速值排序：确认够快的在前（越快越前），没测过的居中，确认太慢的垫底。
 pub fn rank_mirrors(ms: &[String]) -> Vec<String> {
     let s = load_speeds();
     let items: Vec<(String, Option<u64>)> =
@@ -1050,7 +1050,7 @@ pub fn rank_mirrors(ms: &[String]) -> Vec<String> {
     rank_by_scores(&items)
 }
 
-/// 纯粹按 (源, 实测速率) 排序，和磁盘状态无关，方便自测。
+/// 纯粹按 (源, 测速值) 排序，和磁盘状态无关，方便自测。
 /// None = 没测过。
 pub fn rank_by_scores(items: &[(String, Option<u64>)]) -> Vec<String> {
     let (mut good, mut unknown, mut slow) = (Vec::new(), Vec::new(), Vec::new());
@@ -1089,7 +1089,7 @@ pub const DLSS_REPO: &str = "RankFTW/rhi-repo";
 
 /// (release tag 前缀, 期望 tag, 压缩包文件名, 解出来的文件名, 界面显示名)
 ///
-/// 压缩包名是实测从仓库 releases 里查出来写死的。有了它就能直接拼直链下载，
+/// 压缩包名是从仓库 releases 里查出来写死的。有了它就能直接拼直链下载，
 /// 不必先调 releases API 拿资产列表 —— 这一步正是配额用完后卡住下载的地方。
 pub const DLSS_RUNTIME: [(&str, &str, &str, &str, &str); 2] = [
     (
@@ -1112,7 +1112,7 @@ pub const DLSS_RUNTIME: [(&str, &str, &str, &str, &str); 2] = [
 ///
 /// 上游（0.3.0 起）的说明里只要求「代理 DLL + INI」（运行库、模型、后端都内嵌在代理里），
 /// 而**很多游戏目录本来就带着自己的** nvngx_dlssg.dll / nvngx_dlss.dll（和游戏自己的
-/// DLSS / Streamline 版本配套）。无条件覆盖它们会出事：实测有用户「工具部署后帧生成
+/// DLSS / Streamline 版本配套）。无条件覆盖它们会出事：有用户遇到「工具部署后帧生成
 /// 不生效，手动只放代理 + INI 却正常」。所以规则是：**已有的不动，缺的才补**。
 ///
 /// 返回 (游戏目录里已有的名字, 缺的、需要补的名字)。
@@ -1324,12 +1324,6 @@ pub struct StagedUpdate {
     pub bytes: u64,
 }
 
-/// jsDelivr 上的同一份安装程序（发布时仓库 dist/ 下也放一份）。
-/// 它比 GitHub 的资源域名快得多，所以更新时先试它，失败再走发布资产 + 镜像。
-pub fn self_cdn_url(tag: &str, asset: &str) -> String {
-    format!("https://cdn.jsdelivr.net/gh/{SELF_REPO}@{tag}/dist/{asset}")
-}
-
 /// 下载新版本并暂存成 <当前 exe>.new，**不动**当前程序（换文件由 swap_in_place 做）。
 pub fn stage_self_update(
     client: &reqwest::blocking::Client,
@@ -1370,42 +1364,20 @@ pub fn stage_self_update(
         format!("这次发布的 SHA256SUMS.txt 里没有 {setup}（老版本没带这个文件），只能手动下载安装包")
     })?;
 
-    // 2) 拿安装程序：先试 jsDelivr（比 GitHub 资源域名快），失败再走发布资产 + 镜像。
-    //    两条路拿的是同一个文件，断点续传也认得同一份 .part，内容由下面的 SHA256 兜住。
+    // 2) 拿安装程序：只走发布资产 + 镜像，不走 jsDelivr。
+    //    jsDelivr 对 .exe / .dll 一律返回 403（文本文件不受影响），那条路必然失败，
+    //    留着只会每次更新白搭一次请求。
     let _ = std::fs::remove_file(&dest);
     progress(0, 0, "安装程序");
-    let cdn = self_cdn_url(&tag, &setup);
-    let from_cdn = download(
+    download_with_mirror(
         client,
-        &setup,
-        Sink {
-            dest: &dest,
-            cancel,
-            progress,
-        },
-        &cdn,
-        None,
-        "cdn.jsdelivr.net",
+        &self_release_url(&tag, &setup),
+        &dest,
+        cancel,
+        progress,
     )
-    .is_ok();
-    if !from_cdn {
-        download_with_mirror(
-            client,
-            &self_release_url(&tag, &setup),
-            &dest,
-            cancel,
-            progress,
-        )
-        .with_context(|| format!("下载 {setup} 失败"))?;
-    }
-    crate::log::line(&format!(
-        "自更新：安装程序来自{}",
-        if from_cdn {
-            " jsDelivr CDN"
-        } else {
-            "发布资产（镜像）"
-        }
-    ));
+    .with_context(|| format!("下载 {setup} 失败"))?;
+    crate::log::line("自更新：安装程序来自发布资产（镜像）");
 
     // 3) 校验：哈希对不上就丢弃，绝不动用户的程序
     let bytes = std::fs::metadata(&dest).map(|m| m.len()).unwrap_or(0);
@@ -1474,7 +1446,7 @@ pub struct SourceSpeed {
     pub prefix: String,
     /// 给人看的名字
     pub label: String,
-    /// 实测 KB/s。error 非空时无意义。
+    /// 测速值（KB/s）。error 非空时无意义。
     pub kbps: u64,
     pub error: Option<String>,
 }

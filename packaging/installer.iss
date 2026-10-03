@@ -1,4 +1,4 @@
-; FrameGen Manager - Inno Setup 6 打包脚本
+﻿; FrameGen Manager - Inno Setup 6 打包脚本
 ; 编译： iscc packaging\installer.iss
 ;
 ; 设计要点：
