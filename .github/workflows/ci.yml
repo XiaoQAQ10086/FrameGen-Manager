@@ -1,0 +1,50 @@
+# Build, lint and run the self tests on every push.
+#
+# Only the deterministic suites run here: --selftest, --sourcetest and
+# --deploytest. --downloadtest and --canceltest talk to GitHub, so they are not
+# part of CI; run them by hand when the download path changes.
+#
+# The test binaries now report failures through their exit code, so a red check
+# means exactly "a [FAIL] line was printed".
+name: checks
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+
+      - name: clippy (warnings are errors)
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: build
+        run: cargo build
+
+      - name: self test
+        run: .\target\debug\framegen-manager.exe --selftest
+
+      - name: source selection test
+        run: .\target\debug\framegen-manager.exe --sourcetest
+
+      - name: deploy test
+        run: .\target\debug\framegen-manager.exe --deploytest

@@ -24,6 +24,17 @@ cargo build --release
 $exe = Join-Path $root 'target\release\framegen-manager.exe'
 if (-not (Test-Path $exe)) { throw "没找到 $exe" }
 
+# 打包前先让 exe 自己体检一遍：自测必须全过（退出码 0），不过就不出包。
+# 这一步专门拦「静默变坏」—— 最典型的是 build.rs 找不到 packaging\app.ico 时
+# 只发警告不报错、exe 就没图标了；自测里那两条会红，退出码变成 1。
+Write-Output '[1.5/5] 跑 release 自测（不过就不许打包）...'
+$testOut = & $exe --selftest 2>&1 | Out-String
+if ($LASTEXITCODE -ne 0) {
+  Write-Output $testOut
+  throw "release 自测没过（退出码 $LASTEXITCODE），已中止打包"
+}
+Write-Output ('  自测通过（' + ([regex]::Matches($testOut, '\[PASS\]')).Count + ' 项全过）')
+
 Write-Output '[2/5] 组装便携版目录 ...'
 $dist = Join-Path $root 'dist'
 New-Item -ItemType Directory -Force -Path $dist | Out-Null
@@ -63,6 +74,10 @@ if ($iscc) {
   if (Test-Path $setup) {
     $h2 = (Get-FileHash $setup -Algorithm SHA256).Hash.ToLower()
     Add-Content -Path $sums -Value "$h2  $(Split-Path $setup -Leaf)"
+    # 硬指标：安装包必须 < 10 MB。超了就别发出去。
+    $mb = (Get-Item $setup).Length / 1MB
+    if ($mb -ge 10) { throw ("安装包 {0:N2} MB，超过 10 MB 的硬指标，已中止" -f $mb) }
+    Write-Output ('  安装包 {0:N2} MB（< 10 MB 达标）' -f $mb)
   }
 } else {
   Write-Output '  没装 Inno Setup，跳过安装包。想要的话装一下 Inno Setup 6 再跑一次。'

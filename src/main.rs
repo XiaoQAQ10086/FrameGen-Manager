@@ -72,8 +72,7 @@ fn main() -> eframe::Result<()> {
 
     // 无界面自检：cargo run -- --selftest
     if std::env::args().any(|a| a == "--selftest") {
-        selftest();
-        return Ok(());
+        finish_tests(selftest());
     }
 
     // 软件自身版本检查自测：cargo run -- --selfupdate
@@ -132,20 +131,17 @@ fn main() -> eframe::Result<()> {
 
     // 下载 + 完整性校验自测（只下 581 字节的 ini）：cargo run -- --downloadtest
     if std::env::args().any(|a| a == "--downloadtest") {
-        downloadtest();
-        return Ok(());
+        finish_tests(downloadtest());
     }
 
     // 取消下载 / 残留清理自测：cargo run -- --canceltest
     if std::env::args().any(|a| a == "--canceltest") {
-        canceltest();
-        return Ok(());
+        finish_tests(canceltest());
     }
 
     // 选源排序 + 慢源下载自测（本地起慢服务器，不依赖外网）：cargo run -- --sourcetest
     if std::env::args().any(|a| a == "--sourcetest") {
-        sourcetest();
-        return Ok(());
+        finish_tests(sourcetest());
     }
 
     // 打开系统设置里「硬件加速 GPU 计划」那一页（测试跳转用）：cargo run -- --openhags
@@ -444,8 +440,7 @@ fn main() -> eframe::Result<()> {
 
     // 部署/还原端到端自测：cargo run -- --deploytest
     if std::env::args().any(|a| a == "--deploytest") {
-        deploytest();
-        return Ok(());
+        finish_tests(deploytest());
     }
 
     // 调试 PE 解析：cargo run -- --pedump <exe>
@@ -908,6 +903,17 @@ fn speedall() {
     );
 }
 
+/// 无界面自测统一收尾：0 = 全过，1 = 有失败。
+///
+/// 以前这些自测只打印结果、永远返回 0，脚本和 CI 没法拿它当闸门，只能去数输出里的
+/// "[FAIL]" 字符串。这里让它直接带上退出码。
+fn finish_tests(fails: usize) -> ! {
+    if fails > 0 {
+        println!("\n[EXIT] 共 {fails} 项失败 -> 退出码 1");
+    }
+    std::process::exit(if fails == 0 { 0 } else { 1 })
+}
+
 fn ck(fails: &mut Vec<String>, ok: bool, what: &str) {
     println!("  [{}] {what}", if ok { "PASS" } else { "FAIL" });
     if !ok {
@@ -948,7 +954,7 @@ fn gpu_gate(route: scan::GpuRoute) -> Option<&'static str> {
 }
 
 /// 选源 / 下载自测。
-fn sourcetest() {
+fn sourcetest() -> usize {
     println!("===== 选源 + 下载 自测 =====");
     let mut fails: Vec<String> = Vec::new();
 
@@ -978,21 +984,20 @@ fn sourcetest() {
         Ok(c) => c,
         Err(e) => {
             println!("[FAIL] 建客户端失败: {e}");
-            return;
+            return 1;
         }
     };
     let cancel = AtomicBool::new(false);
     let tmp = std::env::temp_dir();
 
-    // 回归：有用户报「下载到四分之一就断了」。原因是当时按平均速度判 ——
-    // 低于 300 KB/s 就立刻掐掉这个源去换下一个，他线路慢，永远换不到一个「够快」的源。
-    // 现在这条规则没了：慢源必须能慢慢下完，而且字节数要对。
-    // 4 MB 的响应，每 110ms 只给 32 KB，约 220 KB/s（比当年那个阈值还慢）。
+    // 回归：慢源必须能慢慢下完，不能因为「平均速度低」就掐掉它去换下一个源 ——
+    // 那样线路慢的用户永远换不到一个「够快」的源，下到一半就断了。
+    // 这里用 4 MB 的响应、每 110ms 只给 32 KB（约 220 KB/s）来复现慢线路。
     let (slow_port, slow_stop) = spawn_http_server(4 * 1024 * 1024, 32 * 1024, 110);
     let d1 = tmp.join("fgm-slow-source-test.bin");
     let _ = std::fs::remove_file(&d1);
     let u1 = format!("http://127.0.0.1:{slow_port}/slow");
-    println!("-- 慢源（约 220 KB/s，比当年的 300 KB/s 阈值还慢）--");
+    println!("-- 慢源（约 220 KB/s）--");
     let t0 = std::time::Instant::now();
     // 顺手记下进度回调里报给界面的那几段文字 —— 用户能不能看懂就靠它
     let mut notes: Vec<String> = Vec::new();
@@ -1071,9 +1076,10 @@ fn sourcetest() {
     for f in &fails {
         println!("  - {f}");
     }
+    fails.len()
 }
 
-fn selftest() {
+fn selftest() -> usize {
     println!("===== FrameGen Manager 自检 =====");
 
     match util::app_data_dir() {
@@ -2021,30 +2027,31 @@ fn selftest() {
     }
 
     println!("\n===== 自检结束 =====");
+    fails.len()
 }
 
 /// 验证「取消下载」和「残留清理」两条路径。
-fn canceltest() {
+fn canceltest() -> usize {
     println!("===== 取消下载 / 残留清理 自测 =====");
     let c = match update::client() {
         Ok(c) => c,
         Err(e) => {
             println!("[FAIL] 创建客户端失败: {e}");
-            return;
+            return 1;
         }
     };
     let remote = match update::probe_remote(&c, update::INI_REPO_PATH) {
         Ok(r) => r,
         Err(e) => {
             println!("[FAIL] 取远端指纹失败: {e}");
-            return;
+            return 1;
         }
     };
     let dest = match update::asset_path("cancel-test.ini") {
         Ok(d) => d,
         Err(e) => {
             println!("[FAIL] 定位目标失败: {e}");
-            return;
+            return 1;
         }
     };
     let _ = std::fs::remove_file(&dest);
@@ -2074,16 +2081,22 @@ fn canceltest() {
         Err(e) => format!("{e}"),
     };
     println!("  下载结果: {msg}");
-    println!("  [{}] 目标文件未被创建", if dest.exists() { "FAIL" } else { "PASS" });
-    println!("  [{}] 没有 .part 残留", if part.exists() { "FAIL" } else { "PASS" });
-    println!(
-        "  [{}] 取消被识别为「已取消」而不是下载失败",
-        if msg.contains(update::CANCELLED_MSG) { "PASS" } else { "FAIL" }
-    );
-    println!(
-        "  [{}] 没有继续去试后面的镜像",
-        if msg.contains("备用源") { "FAIL" } else { "PASS" }
-    );
+    let mut fails = 0usize;
+    let checks: [(&str, bool); 4] = [
+        ("目标文件未被创建", !dest.exists()),
+        ("没有 .part 残留", !part.exists()),
+        (
+            "取消被识别为「已取消」而不是下载失败",
+            msg.contains(update::CANCELLED_MSG),
+        ),
+        ("没有继续去试后面的镜像", !msg.contains("备用源")),
+    ];
+    for (what, ok) in checks {
+        println!("  [{}] {}", if ok { "PASS" } else { "FAIL" }, what);
+        if !ok {
+            fails += 1;
+        }
+    }
 
     // 手工造一个残留。断点续传要靠 .part 接着下，所以「刚下到一半的」必须留着，
     // 只有很久没动过的（7 天）才清掉 —— 这里两头都验一下。
@@ -2096,23 +2109,28 @@ fn canceltest() {
         );
     }
     let n = update::clean_stale_partials();
+    let stale_ok = fresh_kept && !part.exists() && n >= 1;
     println!(
         "  [{}] 刚下到一半的 .part 保留、很旧的才清（清了 {n} 个，新文件保留={fresh_kept}）",
-        if fresh_kept && !part.exists() && n >= 1 { "PASS" } else { "FAIL" }
+        if stale_ok { "PASS" } else { "FAIL" }
     );
+    if !stale_ok {
+        fails += 1;
+    }
     let _ = std::fs::remove_file(&dest);
     println!("===== 结束 =====");
+    fails
 }
 
 /// 只下载 581 字节的 dlssg_sm86.ini，用来验证下载 + git blob sha 校验链路。
 /// 故意不下 15.6 MB 的 DLL，避免自测里跑大流量。
-fn downloadtest() {
+fn downloadtest() -> usize {
     println!("===== 下载 + git blob sha 校验 自测 =====");
     let c = match update::client() {
         Ok(c) => c,
         Err(e) => {
             println!("[FAIL] 创建客户端失败: {e}");
-            return;
+            return 1;
         }
     };
     let repo_path = update::INI_REPO_PATH;
@@ -2120,7 +2138,7 @@ fn downloadtest() {
         Ok(r) => r,
         Err(e) => {
             println!("[FAIL] 取远端指纹失败: {e}");
-            return;
+            return 1;
         }
     };
     println!("  远端 {} etag={} size={}", remote.name, remote.etag, remote.size);
@@ -2129,14 +2147,14 @@ fn downloadtest() {
         Ok(d) => d,
         Err(e) => {
             println!("[FAIL] 定位目标失败: {e}");
-            return;
+            return 1;
         }
     };
 
     let cancel = AtomicBool::new(false);
     // 走生产路径（多源自动回退），而不是死磕官方那一个地址 ——
     // 官方 raw 现在会间歇性卡十几秒，测试跟着一起卡就没意义了。
-    match update::download_auto(
+    let fails = match update::download_auto(
         &c,
         repo_path,
         update::Sink {
@@ -2156,22 +2174,30 @@ fn downloadtest() {
         Ok(dl) => {
             let data = std::fs::read(&dest).unwrap_or_default();
             let blob = util::git_blob_sha1(&data);
+            let mut fails = 0usize;
             // 字节数是两条路径都拿得到的一致性信号，先看这个
+            let bytes_ok = dl.bytes == remote.size;
             println!(
                 "  [{}] 响应字节数 = {}（HEAD 拿到 {}）",
-                if dl.bytes == remote.size { "PASS" } else { "FAIL" },
+                if bytes_ok { "PASS" } else { "FAIL" },
                 dl.bytes,
                 remote.size
             );
+            if !bytes_ok {
+                fails += 1;
+            }
             // ETag 只有官方源给。官方 raw 抽风时会自动回退到镜像，镜像不转发 ETag，
             // 这时候「没得比」和「比出来不一样」是两码事，不能都算 FAIL。
             match dl.etag.as_deref().map(|e| e.eq_ignore_ascii_case(&remote.etag)) {
                 Some(true) => println!("  [PASS] 响应 ETag 和 HEAD 一致"),
-                Some(false) => println!(
-                    "  [FAIL] 响应 ETag = {} 和 HEAD 拿到的 {} 不一致，内容可能不是同一个版本",
-                    dl.etag.as_deref().unwrap_or(""),
-                    remote.etag
-                ),
+                Some(false) => {
+                    println!(
+                        "  [FAIL] 响应 ETag = {} 和 HEAD 拿到的 {} 不一致，内容可能不是同一个版本",
+                        dl.etag.as_deref().unwrap_or(""),
+                        remote.etag
+                    );
+                    fails += 1;
+                }
                 None => println!(
                     "  [INFO] 这次是从加速镜像拿到的，镜像不转发 ETag，没得比 —— \
                      正式路径上 ini 靠字节数 + 本机记录，DLL 靠本项目签名兜底"
@@ -2205,32 +2231,44 @@ fn downloadtest() {
                 "  [{}] 记录和文件都在时判定为「已是最新」",
                 if present { "PASS" } else { "FAIL" }
             );
+            if !present {
+                fails += 1;
+            }
             println!(
                 "  [{}] 文件被删掉后判定为「需要下载」",
                 if !gone { "PASS" } else { "FAIL" }
             );
+            if gone {
+                fails += 1;
+            }
             println!("  保存于: {}", dest.display());
             println!(
                 "  内容:\n{}",
                 String::from_utf8_lossy(&data[..data.len().min(200)])
             );
+            fails
         }
-        Err(e) => println!("  [FAIL] 下载失败: {e}"),
-    }
+        Err(e) => {
+            println!("  [FAIL] 下载失败: {e}");
+            1
+        }
+    };
+    fails
 }
 
 /// 在一个真实目录上跑完整的 部署 -> 校验 -> 还原 流程，最后删掉测试目录。
-fn deploytest() {
+fn deploytest() -> usize {
     use std::fs;
 
     println!("===== 部署 / 备份 / 还原 端到端自测 =====");
-    let root = PathBuf::from(r"D:\Test\deploytest");
+    // 用系统临时目录，不写死盘符：CI（GitHub runner）上没有 D: 盘。
+    let root = std::env::temp_dir().join("fgm-deploytest");
     let _ = fs::remove_dir_all(&root);
     let src = root.join("src");
     let target = root.join("target");
     if fs::create_dir_all(&src).is_err() || fs::create_dir_all(&target).is_err() {
         println!("[FAIL] 无法创建测试目录");
-        return;
+        return 1;
     }
 
     let dll_src = src.join("version.dll");
@@ -2647,6 +2685,7 @@ fn deploytest() {
     let _ = fs::remove_dir_all(&root);
     println!("
 ===== 结果: {fails} 项失败 =====");
+    fails
 }
 
 // ------------------------------------------------------------------ UI
