@@ -2508,11 +2508,25 @@ fn deploytest() -> usize {
         anticheat::scan_deep(&t3).is_blocked(),
         "含 EasyAntiCheat 目录被判为内核级并阻止"
     );
-    let t4 = root.join("clean");
+    // scan_game_dir() 会顺带检查最多 4 级**祖先**目录（EAC / BattlEye 通常装在游戏
+    // 根目录，而部署目标可能是 ...\Binaries\Win64）。所以这个「干净目录」必须放得足够深，
+    // 让那 4 级祖先全都落在本次测试自己的目录里 —— 否则会一路扫到系统临时目录的祖先，
+    // 那不受测试控制，换台机器结论就可能反过来。
+    let t4 = root.join("clean").join("a").join("b").join("c").join("d");
     let _ = fs::create_dir_all(&t4);
-    let ok_to_deploy = !anticheat::scan_deep(&t4).is_blocked();
-    // 注意：这台机器系统级存在 BEService，但那是系统状态，不应影响空目录的判定
-    check!(ok_to_deploy, "普通空目录不阻止部署");
+    check!(
+        !anticheat::scan_deep(&t4).is_blocked(),
+        "普通空目录不阻止部署"
+    );
+
+    // 反向也要成立：标记在**祖先**目录里时同样要挡住（这正是 scan_game_dir 扫祖先的理由）
+    let t5 = root.join("anc").join("Binaries").join("Win64");
+    let _ = fs::create_dir_all(&t5);
+    let _ = fs::create_dir_all(root.join("anc").join("EasyAntiCheat"));
+    check!(
+        anticheat::scan_deep(&t5).is_blocked(),
+        "标记在祖先目录（游戏根）时同样阻止部署"
+    );
 
     // ---- 已装过本项目：允许覆盖（这是「判断用户是否手动装过」的核心行为）----
     println!("
