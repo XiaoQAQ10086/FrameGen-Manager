@@ -57,7 +57,6 @@ DontCloseApplications=不要关闭这些程序(&D)
 ErrorChangingAttr=修改已有文件的属性时出错：
 ErrorCopying=复制文件时出错：
 ErrorCreatingDir=创建目录时出错：
-ErrorCreatingFile=创建文件时出错：
 WindowsVersionNotSupported=本程序不支持你当前使用的 Windows 版本。
 
 [Tasks]
