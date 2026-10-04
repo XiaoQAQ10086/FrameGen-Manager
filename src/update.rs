@@ -448,6 +448,43 @@ pub fn fetch_version(client: &reqwest::blocking::Client) -> Option<String> {
     extract_version(&text)
 }
 
+/// 给「手动导入」用的上游版本探测：**有上限**，不能让网络把导入流程拖住。
+///
+/// 只试官方地址和第一个镜像、每次 5 秒；都不通就返回 None（界面退回到上次检查的缓存值，
+/// 并如实标注「上次检查的结果」）。导入窗口前面已经等了用户几秒，这里再多等半分钟
+/// 去挨个试完所有镜像是不合理的。
+pub fn fetch_version_quick(client: &reqwest::blocking::Client) -> Option<String> {
+    let official = format!("https://raw.githubusercontent.com/{REPO}/{BRANCH}/README.md");
+    let mut urls = vec![official.clone()];
+    if let Some(m) = mirrors("").into_iter().next() {
+        urls.push(format!("{m}{official}"));
+    }
+    for url in urls {
+        let Ok(resp) = client.get(&url).timeout(Duration::from_secs(5)).send() else {
+            continue;
+        };
+        if !resp.status().is_success() {
+            continue;
+        }
+        let Ok(text) = resp.text() else { continue };
+        if let Some(v) = extract_version(&text) {
+            return Some(v);
+        }
+    }
+    None
+}
+
+/// 本机资产目录里那份 mod 的版本号。
+///
+/// 只有 0.2.4 那代在 INI 第一行写了版本（`; Native 0.2.4.`）；0.3.0 起 INI 里不带
+/// 版本号，本地也没有别的可靠来源 —— 所以这里会返回 None。界面要如实显示「未知」，
+/// 不要去猜一个数字挂在那里。
+pub fn local_asset_version() -> Option<String> {
+    let ini = util::assets_dir().ok()?.join(INI_REPO_PATH);
+    let text = std::fs::read_to_string(ini).ok()?;
+    extract_version(&text)
+}
+
 /// 官方下载地址
 pub fn official_url(repo_path: &str) -> String {
     format!("https://raw.githubusercontent.com/{REPO}/{BRANCH}/{repo_path}")

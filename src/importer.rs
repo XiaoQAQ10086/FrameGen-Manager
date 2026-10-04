@@ -60,6 +60,105 @@ pub struct Staged {
     pub trusted: bool,
 }
 
+/// stage() 的结果：认出来的文件 + 说明 + 这个压缩包的版本号
+pub struct StageResult {
+    pub items: Vec<Staged>,
+    pub notes: Vec<String>,
+    /// 从包里的 README / INI 读出来的版本；读不到就是 None
+    pub version: Option<String>,
+}
+
+/// 一次导入的「版本对照」：这个包是哪一版 / 本机装的是哪一版 / 上游最新是哪一版。
+///
+/// 为什么三个都要列：只看其中一个都会得出错误结论 —— 「上游有更新」说的是上游，
+/// 不代表用户手里这个包是新的；反过来也一样。
+#[derive(Debug, Clone, Default)]
+pub struct Versions {
+    pub pack: Option<String>,
+    pub local: Option<String>,
+    pub upstream: Option<String>,
+    /// upstream 是上次检查缓存下来的（界面要如实写清，别让人以为是刚查的）
+    pub upstream_cached: bool,
+}
+
+impl Versions {
+    /// 这个包比上游旧 —— 该提示用户去更新资产包
+    pub fn pack_is_old(&self) -> bool {
+        match (&self.pack, &self.upstream) {
+            (Some(p), Some(u)) => update::is_newer(u, p),
+            _ => false,
+        }
+    }
+
+    /// 给人看的几行（导入结果和确认弹窗共用一份文案）
+    pub fn report_lines(&self) -> Vec<String> {
+        let show = |v: &Option<String>| v.clone().unwrap_or_else(|| "未知".to_owned());
+        let up = if self.upstream_cached {
+            format!("{}（上次检查的结果）", show(&self.upstream))
+        } else {
+            show(&self.upstream)
+        };
+        let mut out = vec![
+            format!("这个压缩包：{}", show(&self.pack)),
+            format!("上游最新：{up}"),
+            format!("本机已装资产：{}", show(&self.local)),
+        ];
+        if self.pack_is_old() {
+            out.push(format!(
+                "这个包比上游旧（{} < {}）：导入后建议点「下载 / 更新资产」更新到 {}",
+                show(&self.pack),
+                show(&self.upstream),
+                show(&self.upstream)
+            ));
+        }
+        out
+    }
+
+    /// 三个号全是未知时就不必占地方了
+    pub fn worth_showing(&self) -> bool {
+        self.pack.is_some() || self.upstream.is_some() || self.local.is_some()
+    }
+}
+
+/// 从「(属于哪一版, 版本号)」里挑版本号：取排名最好的那个（并列取先出现的）。
+///
+/// 上游源码包里同时有根目录和 archive/0.2.4/ 两套 README，版本号不一样；
+/// 必须挑和**真正会被导入的那套文件**同排名的那个，否则会出现
+/// 「装的明明是当前版、界面却说这是 0.2.4」。排名含义见 build_rank。
+pub fn pick_pack_version(cands: &[(u8, Option<String>)]) -> Option<String> {
+    cands
+        .iter()
+        .filter_map(|(rank, v)| v.as_ref().map(|v| (*rank, v)))
+        .min_by_key(|(rank, _)| *rank)
+        .map(|(_, v)| v.clone())
+}
+
+/// 把 zip 里一个小文本文件（README）解到临时文件、读出首行里的版本号，然后删掉临时文件。
+fn read_zip_version(
+    zip: &Path,
+    meta: &update::ZipMeta,
+    work_dir: &Path,
+    si: usize,
+    uniq: &mut usize,
+) -> Option<String> {
+    // README 一般十几 KB；异常大的说明不是我们要的东西，不读
+    if meta.comp_size > 256 * 1024 {
+        return None;
+    }
+    let tmp = work_dir.join(format!("s{si}-{}-ver.txt", *uniq));
+    *uniq += 1;
+    let n = update::zip_extract_to(zip, meta, &tmp).ok()?;
+    let v = if n == 0 {
+        None
+    } else {
+        std::fs::read_to_string(&tmp)
+            .ok()
+            .and_then(|t| update::extract_version(&t))
+    };
+    let _ = std::fs::remove_file(&tmp);
+    v
+}
+
 /// 压缩包里的是「哪一版」—— 只看路径就能看出来，上游的布局是固定的：
 ///   * archive/…        —— 老的归档包（0.1.0 / 0.2.4），归档用
 ///   * 310.1/…          —— 上游自己的老版本目录（0.3.1 起 20/30 系都用根目录那份了）
@@ -200,11 +299,15 @@ pub fn stage(
     // 进度回调：(给用户看的一句话, 0.0~1.0 的完成度)。按「已看几个文件」推进，
     // 否则大压缩包导入时进度条一动不动，看着像卡死。
     mut progress: impl FnMut(String, f32),
-    // 第二个返回值是「说明」清单：哪些文件被跳过、为什么，界面会写进导入结果
-) -> Result<(Vec<Staged>, Vec<String>)> {
+    // 说明清单：哪些文件被跳过、为什么，界面会写进导入结果。
+    // 另外带回这个压缩包的版本号，界面用它和上游做新旧对照。
+) -> Result<StageResult> {
     std::fs::create_dir_all(work_dir)?;
     // 每个解出来的候选带着「它属于哪一版」的排名，等同名的都收齐了再挑赢家
     let mut cands: Vec<(u8, String, Staged)> = Vec::new();
+    // 版本号的候选也带着排名：源码包里根目录和 archive/0.2.4/ 各有一份 README，
+    // 得挑和「真正会被导入的那套文件」同排名的那个（见 pick_pack_version）。
+    let mut ver_cands: Vec<(u8, Option<String>)> = Vec::new();
     // 临时文件名必须**全局唯一**：上游源码 zip 里根目录和 310.1/ 都叫 version.dll。
     // 若按「文件名.part」解压，第二个会把第一个覆盖掉，合并时又把文件删掉，
     // 用户点「继续导入」就会报「导入失败」。所以这里带来源序号 + 条目序号。
@@ -241,6 +344,12 @@ pub fn stage(
             let frac = seen as f32 / n.max(1) as f32;
             let base = basename_lower(&meta.name);
             let Some(kind) = kind_of(&base) else {
+                // README 不是要导入的文件，但它的标题行写着版本号 —— 顺手读一下，
+                // 用户最想知道的就是「我手里这个包是哪一版」。
+                if base.starts_with("readme") {
+                    let v = read_zip_version(p, meta, work_dir, si, &mut uniq);
+                    ver_cands.push((build_rank(&meta.name), v));
+                }
                 progress(format!("{pack}：已看 {seen}/{n}，正在找需要的 ..."), frac);
                 continue;
             };
@@ -253,7 +362,18 @@ pub fn stage(
                 continue;
             }
             match classify(kind, base, tmp.clone(), pack.clone()) {
-                Ok(st) => cands.push((build_rank(&meta.name), meta.name.clone(), st)),
+                Ok(st) => {
+                    // 老包（0.2.4）把版本号写在 INI 第一行注释里
+                    if kind == Kind::Ini {
+                        if let Some(v) = std::fs::read_to_string(&st.tmp)
+                            .ok()
+                            .and_then(|t| update::extract_version(&t))
+                        {
+                            ver_cands.push((build_rank(&meta.name), Some(v)));
+                        }
+                    }
+                    cands.push((build_rank(&meta.name), meta.name.clone(), st))
+                }
                 Err(e) => {
                     let _ = std::fs::remove_file(&tmp);
                     progress(format!("{} 处理失败，已跳过：{e}", meta.name), frac);
@@ -304,7 +424,11 @@ pub fn stage(
         }
         out.push(st);
     }
-    Ok((out, notes))
+    Ok(StageResult {
+        items: out,
+        notes,
+        version: pick_pack_version(&ver_cands),
+    })
 }
 
 /// 把校验过的文件搬进资产目录，并记进状态（界面就会显示「已就绪」）。

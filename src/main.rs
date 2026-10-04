@@ -215,7 +215,13 @@ fn main() -> eframe::Result<()> {
         match importer::stage(&paths, &work, &cancel, |m, f| {
             println!("  [{:>3.0}%] {m}", f * 100.0)
         }) {
-            Ok((items, notes)) => {
+            Ok(res) => {
+                println!(
+                    "  包里写的版本：{}",
+                    res.version.clone().unwrap_or_else(|| "（读不出来）".to_owned())
+                );
+                let items = res.items;
+                let notes = res.notes;
                 println!("  认出来 {} 个文件：", items.len());
                 for it in &items {
                     println!(
@@ -2133,6 +2139,84 @@ fn selftest() -> usize {
         }
     }
 
+    // ---- 导入时的「版本对照」 ----
+    // 上游源码包里根目录和 archive/0.2.4/ 各有一份 README，版本号不同：挑错会出现
+    // 「装的明明是当前版、界面却说这是 0.2.4」。
+    println!("\n--- 导入的版本对照 ---");
+    {
+        let both = [
+            (2u8, Some("0.2.4".to_owned())),
+            (0u8, Some("0.3.5".to_owned())),
+        ];
+        ck(
+            &mut fails,
+            importer::pick_pack_version(&both).as_deref() == Some("0.3.5"),
+            "包里同时有新旧两套 README 时取最新那套的版本",
+        );
+        ck(
+            &mut fails,
+            importer::pick_pack_version(&[(2u8, Some("0.2.4".to_owned()))]).as_deref() == Some("0.2.4"),
+            "只有老包时取 0.2.4",
+        );
+        ck(
+            &mut fails,
+            importer::pick_pack_version(&[(0u8, None), (2u8, Some("0.2.4".to_owned()))]).as_deref()
+                == Some("0.2.4"),
+            "读不出版本的条目不影响挑选",
+        );
+        ck(
+            &mut fails,
+            importer::pick_pack_version(&[]).is_none(),
+            "什么都没有时不编一个版本号出来",
+        );
+
+        let old = importer::Versions {
+            pack: Some("0.3.0".to_owned()),
+            local: Some("0.2.4".to_owned()),
+            upstream: Some("0.3.5".to_owned()),
+            upstream_cached: false,
+        };
+        ck(&mut fails, old.pack_is_old(), "0.3.0 的包 < 上游 0.3.5：要提示更新");
+        ck(
+            &mut fails,
+            old.report_lines().iter().any(|l| l.contains("比上游旧")),
+            "对照表里写明了「比上游旧」",
+        );
+        ck(
+            &mut fails,
+            old.report_lines().iter().any(|l| l.contains("0.2.4")),
+            "对照表里也写出了本机已装资产版本",
+        );
+
+        let same = importer::Versions {
+            pack: Some("0.3.5".to_owned()),
+            upstream: Some("0.3.5".to_owned()),
+            ..Default::default()
+        };
+        ck(&mut fails, !same.pack_is_old(), "和上游同版本：不提示更新");
+        ck(
+            &mut fails,
+            !same.report_lines().iter().any(|l| l.contains("比上游旧")),
+            "同版本时对照表不写「比上游旧」",
+        );
+
+        let unknown = importer::Versions::default();
+        ck(&mut fails, !unknown.pack_is_old(), "版本都未知时不乱提示");
+        ck(&mut fails, !unknown.worth_showing(), "三个号全未知时不占地方");
+        ck(
+            &mut fails,
+            importer::Versions {
+                upstream: Some("0.3.5".to_owned()),
+                upstream_cached: true,
+                ..Default::default()
+            }
+            .report_lines()
+            .iter()
+            .any(|l| l.contains("上次检查")),
+            "上游版本是缓存来的时候要注明来源",
+        );
+    }
+
     if !fails.is_empty() {
         println!("\n  ★ 有 {} 项断言失败", fails.len());
         for f in &fails {
@@ -2932,8 +3016,8 @@ enum Msg {
     LibraryLoaded(Vec<GameRow>, String, usize),
     /// 后台跑完的深度反作弊扫描（带着目录，用来丢弃过期的结果）
     AcScanned(PathBuf, AcReport),
-    /// 手动导入：zip 读完并逐个校验完了（第二项是「跳过/说明」清单）
-    ImportStaged(Vec<importer::Staged>, Vec<String>),
+    /// 手动导入：zip 读完并逐个校验完了（附「跳过/说明」清单和版本对照）
+    ImportStaged(importer::StageResult, importer::Versions),
     /// 手动导入：写盘完成，带回给用户看的结果清单
     ImportDone(String),
     UpdateChecked(UpdateSummary),
@@ -2991,6 +3075,10 @@ struct App {
     import_report: Option<String>,
     /// 本次导入的「跳过 / 说明」清单（写进结果窗口）
     import_notes: Vec<String>,
+    /// 本次导入的版本对照（这个包 / 本机已装 / 上游最新）
+    import_versions: Option<importer::Versions>,
+    /// 调试开关 DLSSG_IMPORT 每次启动只跑一次
+    import_autorun_done: bool,
 
     /// 正在飞的选中动画
     fly: Option<FlyAnim>,
@@ -3154,6 +3242,8 @@ impl App {
             import_pending: None,
             import_report: None,
             import_notes: Vec::new(),
+            import_versions: None,
+            import_autorun_done: false,
             fly: None,
             target_card_rect: None,
             flash_until: None,
@@ -3773,8 +3863,17 @@ impl App {
                     self.ac_target = Some(rep);
                 }
             }
-            Msg::ImportStaged(items, notes) => {
-                self.import_notes = notes;
+            Msg::ImportStaged(res, versions) => {
+                self.import_notes = res.notes;
+                // 版本对照现在就摆出来（确认弹窗和结果窗口都读它），并写进日志备查
+                if versions.worth_showing() {
+                    self.note("手动导入：版本对照".to_owned());
+                    for line in versions.report_lines() {
+                        self.note(format!("  {line}"));
+                    }
+                }
+                self.import_versions = Some(versions);
+                let items = res.items;
                 // 读包阶段结束，进度条该消失了（写入阶段很快，不再单独显示进度）
                 self.progress = None;
                 let untrusted = items.iter().filter(|i| !i.trusted).count();
@@ -4084,8 +4183,30 @@ impl App {
                 // total 传 0：导入没有「字节总数」可言，进度条用 f 走
                 let _ = ptx.send(Msg::Progress(m, f, 0));
             });
+            // 包读完了顺手凑一张「新旧对照表」：这个包哪一版、本机已装哪一版、上游最新哪一版。
+            // 上游那一问有上限（fetch_version_quick：官方 + 第一个镜像，各 5 秒），查不到就退回
+            // 上次检查缓存下来的号码并在界面上注明 —— 不让网络把导入流程卡住。
+            let versions = match &r {
+                Ok(res) => {
+                    let local = update::local_asset_version();
+                    let (upstream, cached) = match update::client()
+                        .ok()
+                        .and_then(|c| update::fetch_version_quick(&c))
+                    {
+                        Some(v) => (Some(v), false),
+                        None => (update::load_state().version, true),
+                    };
+                    importer::Versions {
+                        pack: res.version.clone(),
+                        local,
+                        upstream,
+                        upstream_cached: cached,
+                    }
+                }
+                Err(_) => importer::Versions::default(),
+            };
             let _ = tx.send(match r {
-                Ok((items, notes)) => Msg::ImportStaged(items, notes),
+                Ok(res) => Msg::ImportStaged(res, versions),
                 Err(e) => Msg::Failed(e.to_string()),
             });
             ctx.request_repaint();
@@ -4834,6 +4955,17 @@ impl eframe::App for App {
         if !self.autospeed_done && std::env::var_os("DLSSG_AUTOSPEED").is_some() {
             self.autospeed_done = true;
             self.start_speed_test();
+        }
+        // 调试开关：DLSSG_IMPORT=<zip 路径>（多个用 ; 分开）启动就自动跑一次手动导入，
+        // 省得截图 / 排查时每次都要过一遍文件选择对话框
+        if !self.import_autorun_done {
+            self.import_autorun_done = true;
+            if let Some(v) = std::env::var_os("DLSSG_IMPORT") {
+                let paths: Vec<PathBuf> = std::env::split_paths(&v).filter(|p| p.is_file()).collect();
+                if !paths.is_empty() {
+                    self.start_import(paths);
+                }
+            }
         }
 
         // 启动时检查「本软件」有没有新版本，默认就开，界面上不设开关。
@@ -6465,6 +6597,8 @@ impl eframe::App for App {
         // ---------------- 手动导入：可疑项的确认弹窗
         if let Some(items) = self.import_pending.clone() {
             let ctx = self.ctx.clone();
+            // 先取出来：闭包里就不碰 self 了
+            let versions = self.import_versions.clone();
             let (mut skip, mut force, mut cancel) = (false, false, false);
             let bad: Vec<&importer::Staged> = items.iter().filter(|i| !i.trusted).collect();
             egui::Window::new("有文件没有通过校验")
@@ -6482,6 +6616,22 @@ impl eframe::App for App {
                         .color(theme::DANGER)
                         .strong(),
                     );
+                    if let Some(v) = versions.as_ref().filter(|v| v.worth_showing()) {
+                        ui.add_space(8.0);
+                        ui.label(egui::RichText::new("版本对照").strong());
+                        for line in v.report_lines() {
+                            if line.starts_with("这个包比上游旧") {
+                                ui.label(
+                                    egui::RichText::new(line)
+                                        .size(12.0)
+                                        .color(theme::WARN)
+                                        .strong(),
+                                );
+                            } else {
+                                ui.label(theme::hint(line));
+                            }
+                        }
+                    }
                     ui.add_space(6.0);
                     for it in &bad {
                         ui.label(
@@ -6536,6 +6686,7 @@ impl eframe::App for App {
         // ---------------- 手动导入：结果清单
         if let Some(text) = self.import_report.clone() {
             let ctx = self.ctx.clone();
+            let versions = self.import_versions.clone();
             let mut close = false;
             egui::Window::new("导入结果")
                 .collapsible(false)
@@ -6544,6 +6695,23 @@ impl eframe::App for App {
                 .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
                 .show(&ctx, |ui| {
                     ui.set_max_width(660.0);
+                    // 先把「新旧对照」摆在最上面：用户导入完最该知道的就是这个
+                    if let Some(v) = versions.as_ref().filter(|v| v.worth_showing()) {
+                        ui.label(egui::RichText::new("版本对照").strong());
+                        for line in v.report_lines() {
+                            if line.starts_with("这个包比上游旧") {
+                                ui.label(
+                                    egui::RichText::new(line)
+                                        .size(12.0)
+                                        .color(theme::WARN)
+                                        .strong(),
+                                );
+                            } else {
+                                ui.label(theme::hint(line));
+                            }
+                        }
+                        ui.separator();
+                    }
                     egui::ScrollArea::vertical()
                         .max_height(420.0)
                         .show(ui, |ui| {
