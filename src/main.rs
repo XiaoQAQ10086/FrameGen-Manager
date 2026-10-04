@@ -2112,6 +2112,62 @@ fn selftest() -> usize {
         );
     }
 
+    // 用户反馈的实例（日志原文）：腾讯电脑管家的键名没进名单，find_render_exe 又挑中了
+    // 它捆绑的 WeChatOCR.exe —— 当时被当成一条游戏收下了。下面这几条就是钉这个案例的。
+    {
+        let pcmgr_dir = Path::new(r"C:\Program Files (x86)\Tencent\QQPCMgr\18.1.30302.212");
+        let pcmgr_exe = Path::new(
+            r"C:\Program Files (x86)\Tencent\QQPCMgr\18.1.30302.212\WeChatOCR_1.0.1.28\WeChatOCR.exe",
+        );
+        ck(
+            &mut fails,
+            scan::wegame_non_game_key("QQPCMgr").is_some(),
+            "键名 QQPCMgr 进名单（腾讯电脑管家）",
+        );
+        // 就算以后腾讯再出一个我们没见过的键名，只要装在 QQPCMgr 目录下也必须跳过
+        ck(
+            &mut fails,
+            scan::wegame_verdict("某个没见过的键", Some(pcmgr_dir), Some(pcmgr_exe)).0
+                == scan::WegameVerdict::NonGamePath,
+            "未知键名 + QQPCMgr 目录：按目录名跳过",
+        );
+        ck(
+            &mut fails,
+            scan::wegame_verdict(
+                "某个没见过的键",
+                Some(Path::new(r"D:\Games\某游戏")),
+                Some(pcmgr_exe),
+            )
+            .0
+                == scan::WegameVerdict::NonGamePath,
+            "exe 落在非游戏产品的子目录里：跳过",
+        );
+        ck(
+            &mut fails,
+            scan::non_game_exe(pcmgr_exe).is_some(),
+            "WeChatOCR.exe 也在 exe 名单里",
+        );
+        // 反向：真游戏不能被误杀 —— WeGame 的游戏就装在带 Tencent / WeGame 的路径下
+        ck(
+            &mut fails,
+            scan::wegame_verdict(
+                "王者荣耀",
+                Some(Path::new(r"D:\Program Files\Tencent\WeGame\apps\王者荣耀")),
+                Some(Path::new(
+                    r"D:\Program Files\Tencent\WeGame\apps\王者荣耀\Game.exe",
+                )),
+            )
+            .0
+                == scan::WegameVerdict::Game,
+            "WeGame 的 apps 目录下的真游戏照样收下（不误杀 Tencent / WeGame 这两个词）",
+        );
+        ck(
+            &mut fails,
+            scan::non_game_dir_marker(Path::new(r"D:\Games\OPTIMUS")).is_none(),
+            "目录名只做整段匹配：OPTIMUS 里的 TIM 不算",
+        );
+    }
+
     println!("\n--- 日志脱敏（用户要发给别人的东西）---");
     {
         let red = util::redact(r"C:\Users\Somebody\AppData\Local\Temp\x.txt");

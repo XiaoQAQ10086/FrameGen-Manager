@@ -614,9 +614,22 @@ Win10 用 `ms-settings:display-advancedgraphics`。
    真游戏）跳过 WeGame / QQ / QQNT / WeChat / Weixin / TIM / QQMusic / QQLive /
    TencentVideo / TencentMeeting / QQBrowser / QQPinyin / TencentDocs 等客户端与工具；
 3. 值里要能读出一个真实存在的目录；
-4. 目录里要能找出「像样的可执行文件」（`find_render_exe`）；
-5. `NON_GAME_EXE_STEMS` —— 挑中的 exe 若不是游戏本体（qq / wechat / qqmusic / qqlive /
+4. **`NON_GAME_DIR_MARKERS`** —— 目录（或挑中的 exe）落在已知非游戏产品的安装目录里就跳过。
+   这条是**按路径分量**判的，和键名无关，所以腾讯以后出新客户端（键名我们没见过）
+   也能挡住。别往里加 "Tencent" / "WeGame"：WeGame 自己的 `apps\` 结构里就有这两个词；
+5. 目录里要能找出「像样的可执行文件」（`find_render_exe`）；
+6. `NON_GAME_EXE_STEMS` —— 挑中的 exe 若不是游戏本体（qq / wechat / qqmusic / qqlive /
    tencentmeeting / qqbrowser…）也跳过。这是兜底：键名也许没进名单，exe 名字会露馅。
+
+**第 4 条是被用户日志逼出来的**。有人报「库里有 QQPCMgr（腾讯电脑管家）」，日志把原因
+写得清清楚楚：
+
+    WeGame 候选 [...\Tencent\QQPCMgr] 判定=收下 目录=C:\Program Files (x86)\Tencent\QQPCMgr\18.1.30302.212
+      来自值=InstallDir 可执行文件=...\QQPCMgr\18.1.30302.212\WeChatOCR_1.0.1.28\WeChatOCR.exe
+
+键名 `QQPCMgr` 当时不在名单里，`find_render_exe` 又在它目录里挑中了捆绑的 `WeChatOCR.exe`
+（exe 名字也没进名单）—— 两道闸全漏。现在三条路一起堵：键名进名单、按目录名判、
+exe 主名也进名单。**加错名字只是不生效，不会误伤真游戏**，所以这份名单可以放心加。
 
 **日志里每个候选一行证据**，形如：
 

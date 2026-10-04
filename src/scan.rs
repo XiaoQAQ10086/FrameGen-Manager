@@ -628,7 +628,7 @@ pub fn wegame_name_from_key(key: &str) -> String {
 /// **只做精确匹配**，不做前缀匹配 —— 免得把「QQ飞车」「QQ炫舞」这种真游戏一起误杀。
 /// 用户反馈「WeGame 列表里出现无关软件」时，先往这里加：加错名字只是不生效，
 /// 不会误伤真游戏。
-const WEGAME_NON_GAME_KEYS: [(&str, &str); 20] = [
+const WEGAME_NON_GAME_KEYS: [(&str, &str); 26] = [
     ("WeGame", "WeGame 客户端本体"),
     ("wegame", "WeGame 客户端本体"),
     ("WeGameX", "WeGame 国际版客户端"),
@@ -648,6 +648,13 @@ const WEGAME_NON_GAME_KEYS: [(&str, &str); 20] = [
     ("QQBrowser", "QQ 浏览器"),
     ("QQPinyin", "QQ 输入法"),
     ("QQInput", "QQ 输入法"),
+    // 下面几条来自用户反馈的真实日志（QQPCMgr 那条曾经被当成游戏收下）
+    ("QQPCMgr", "腾讯电脑管家"),
+    ("QQPCMgrApps", "腾讯电脑管家"),
+    ("PcMgrBrowserHp", "腾讯电脑管家组件"),
+    ("QMUpdate", "QQ 音乐更新组件"),
+    ("QQPhotoDrawEx", "QQ 空间组件"),
+    ("QQ2009", "老版 QQ"),
     ("TencentDocs", "腾讯文档"),
 ];
 
@@ -655,7 +662,7 @@ const WEGAME_NON_GAME_KEYS: [(&str, &str); 20] = [
 ///
 /// 按主名精确匹配（去掉 .exe、转小写）。这里只放**不可能是游戏本体**的名字 ——
 /// 所以不放 update / setup 这类通用词。
-const NON_GAME_EXE_STEMS: [(&str, &str); 17] = [
+const NON_GAME_EXE_STEMS: [(&str, &str); 18] = [
     ("qq", "QQ"),
     ("qqnt", "QQ 新版客户端"),
     ("qqprotect", "QQ 安全组件"),
@@ -672,8 +679,54 @@ const NON_GAME_EXE_STEMS: [(&str, &str); 17] = [
     ("txmeeting", "腾讯会议"),
     ("qqbrowser", "QQ 浏览器"),
     ("qqpinyin", "QQ 输入法"),
+    // QQ 电脑管家里捆绑的微信 OCR 组件 —— 用户报的 QQPCMgr 就是被它顶进来的
+    ("wechatocr", "微信 OCR（捆绑组件）"),
     ("tencentdocs", "腾讯文档"),
 ];
+
+/// 安装目录里出现这些**目录名**，就说明这不是游戏（腾讯的客户端 / 工具）。
+///
+/// 为什么需要这一条：注册表键名可以叫任何名字。用户反馈的 QQPCMgr（腾讯电脑管家）
+/// 键名没进名单、目录里又挑中了它捆绑的 WeChatOCR.exe，两道闸都没拦住。
+/// **产品装在哪个目录里是藏不住的** —— 按路径分量判比按 exe 文件名判稳得多，
+/// 而且以后腾讯再出新产品（键名我们没见过）也能挡住。
+///
+/// 刻意**不放** "Tencent" 和 "WeGame"：WeGame 自己的 apps 目录结构里就带这两个词，
+/// 加了会把真游戏一起误杀。只放「只可能是这个产品」的目录名。
+const NON_GAME_DIR_MARKERS: [(&str, &str); 15] = [
+    ("QQPCMgr", "腾讯电脑管家"),
+    ("QQMusic", "QQ 音乐"),
+    ("QQLive", "腾讯视频"),
+    ("TencentVideo", "腾讯视频"),
+    ("TencentMeeting", "腾讯会议"),
+    ("TXMeeting", "腾讯会议"),
+    ("QQBrowser", "QQ 浏览器"),
+    ("QQPinyin", "QQ 输入法"),
+    ("TencentDocs", "腾讯文档"),
+    ("WeChat", "微信"),
+    ("Weixin", "微信"),
+    ("TIM", "TIM"),
+    ("QQProtect", "QQ 安全组件"),
+    ("Qzone", "QQ 空间"),
+    ("Foxmail", "Foxmail"),
+];
+
+/// 路径里有没有「已知非游戏产品」的目录名；有就返回那个产品名。
+///
+/// 只看**完整的路径分量**（大小写不敏感），不做子串匹配 —— 否则某个游戏目录名里
+/// 恰好含有 "TIM" 这种短词就会被误杀。
+pub fn non_game_dir_marker(path: &Path) -> Option<&'static str> {
+    for c in path.components() {
+        let name = c.as_os_str().to_string_lossy();
+        if let Some((_, label)) = NON_GAME_DIR_MARKERS
+            .iter()
+            .find(|(n, _)| name.eq_ignore_ascii_case(n))
+        {
+            return Some(label);
+        }
+    }
+    None
+}
 
 /// 一条 WeGame 候选的判定结果。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -688,6 +741,8 @@ pub enum WegameVerdict {
     NoRenderExe,
     /// 挑中的可执行文件是已知的非游戏程序
     NonGameExe,
+    /// 目录（或可执行文件）落在已知非游戏产品的安装目录里
+    NonGamePath,
 }
 
 impl WegameVerdict {
@@ -698,6 +753,7 @@ impl WegameVerdict {
             WegameVerdict::NoDir => "跳过：没有目录",
             WegameVerdict::NoRenderExe => "跳过：没有可执行文件",
             WegameVerdict::NonGameExe => "跳过：可执行文件是非游戏程序",
+            WegameVerdict::NonGamePath => "跳过：装在非游戏产品的目录里",
         }
     }
 }
@@ -741,12 +797,28 @@ pub fn wegame_verdict(
             "跳过：这个键的所有值都没指向一个存在的目录".to_owned(),
         );
     };
+    // 目录名就暴露了它是谁：用户反馈的 QQPCMgr 键名没进名单，但它装在
+    // C:\Program Files (x86)\Tencent\QQPCMgr\ 下面 —— 这一条与键名无关，
+    // 新出的腾讯产品也能挡住。
+    if let Some(label) = non_game_dir_marker(dir) {
+        return (
+            WegameVerdict::NonGamePath,
+            format!("跳过：安装目录属于「{label}」（{}）", dir.display()),
+        );
+    }
     let Some(exe) = render_exe else {
         return (
             WegameVerdict::NoRenderExe,
             format!("跳过：{} 里找不到像样的可执行文件", dir.display()),
         );
     };
+    // 挑中的 exe 落在产品自己的子目录里（QQ 电脑管家捆绑的 WeChatOCR 就是这种）
+    if let Some(label) = non_game_dir_marker(exe) {
+        return (
+            WegameVerdict::NonGamePath,
+            format!("跳过：可执行文件属于「{label}」（{}）", exe.display()),
+        );
+    }
     if let Some(label) = non_game_exe(exe) {
         return (
             WegameVerdict::NonGameExe,
@@ -801,8 +873,8 @@ pub fn scan_wegame_notes(notes: &mut Vec<String>) -> Vec<GameEntry> {
     }
     let mut out: Vec<GameEntry> = Vec::new();
     let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
-    let (mut keys, mut non_game, mut no_dir, mut no_exe, mut non_game_exe) =
-        (0usize, 0usize, 0usize, 0usize, 0usize);
+    let (mut keys, mut non_game, mut no_dir, mut no_exe, mut non_game_exe, mut non_game_path) =
+        (0usize, 0usize, 0usize, 0usize, 0usize, 0usize);
     // 每个候选都记一行证据（哪个键、哪个值、哪个目录、挑中哪个 exe、为什么这样判），
     // 用户报「选出无关软件」时看这几行就够。给个上限：畸形注册表不该把日志刷爆。
     const DETAIL_CAP: usize = 80;
@@ -884,6 +956,7 @@ pub fn scan_wegame_notes(notes: &mut Vec<String>) -> Vec<GameEntry> {
                 WegameVerdict::NoDir => no_dir += 1,
                 WegameVerdict::NoRenderExe => no_exe += 1,
                 WegameVerdict::NonGameExe => non_game_exe += 1,
+                WegameVerdict::NonGamePath => non_game_path += 1,
             }
         }
     }
@@ -931,9 +1004,9 @@ pub fn scan_wegame_notes(notes: &mut Vec<String>) -> Vec<GameEntry> {
     note(
         notes,
         format!(
-            "WeGame 扫描完成：看了 {keys} 个注册表项，收下 {} 个游戏，跳过 {}（非游戏键 {non_game}、没读到目录 {no_dir}、目录里找不到可执行文件 {no_exe}、可执行文件是非游戏程序 {non_game_exe}{}）",
+            "WeGame 扫描完成：看了 {keys} 个注册表项，收下 {} 个游戏，跳过 {}（非游戏键 {non_game}、没读到目录 {no_dir}、目录里找不到可执行文件 {no_exe}、可执行文件是非游戏程序 {non_game_exe}、装在非游戏产品目录里 {non_game_path}{}）",
             out.len(),
-            non_game + no_dir + no_exe + non_game_exe,
+            non_game + no_dir + no_exe + non_game_exe + non_game_path,
             if keys > detailed { "；候选明细另有上限，只记了前 80 条" } else { "" }
         ),
     );
