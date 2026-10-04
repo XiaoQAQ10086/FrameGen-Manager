@@ -466,6 +466,18 @@ fn main() -> eframe::Result<()> {
         return Ok(());
     }
 
+    // 调试「图形 API / 引擎」判定：cargo run -- --techtest <渲染 EXE>
+    if let Some(pos) = argv.iter().position(|a| a == "--techtest") {
+        let p = PathBuf::from(argv.get(pos + 1).cloned().unwrap_or_default());
+        println!("== {} ==", p.display());
+        let (api, engine, streamline) = scan::detect_tech(&p);
+        println!("图形 API   = {}", api.label());
+        println!("引擎       = {}", engine.label());
+        println!("自带帧生成 = {streamline}");
+        println!("导入表({}) = {:?}", scan::pe_imports(&p).len(), scan::pe_imports(&p));
+        return Ok(());
+    }
+
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("FrameGen Manager")
         // 卡片比原来的纯文本行高，默认窗口给大一点，四张卡片不用滚动就能看全
@@ -1966,6 +1978,9 @@ fn selftest() -> usize {
                     },
                     render_exe: None,
                     ac: AcTier::UserMode,
+                    api: scan::GraphicsApi::Unknown,
+                    engine: scan::GameEngine::Unknown,
+                    streamline: false,
                 },
                 scan::CachedRow {
                     entry: GameEntry {
@@ -1976,12 +1991,18 @@ fn selftest() -> usize {
                     },
                     render_exe: None,
                     ac: AcTier::None,
+                    api: scan::GraphicsApi::Unknown,
+                    engine: scan::GameEngine::Unknown,
+                    streamline: false,
                 },
             ],
             manual: vec![scan::CachedRow {
                 entry: scan::manual_entry(&dead),
                 render_exe: None,
                 ac: AcTier::None,
+                api: scan::GraphicsApi::Unknown,
+                engine: scan::GameEngine::Unknown,
+                streamline: false,
             }],
             ignored: vec![dead.display().to_string()],
         };
@@ -2222,6 +2243,89 @@ fn selftest() -> usize {
                 );
             }
         }
+    }
+
+    // ---- 图形 API 与引擎判定（用真实世界的例子构造数据）----
+    println!("\n--- 图形 API 与引擎 ---");
+    {
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<String>>();
+        let api = |imp: &[&str], sib: &[&str]| {
+            scan::api_from_names(&s(imp), &s(sib))
+        };
+        ck(
+            &mut fails,
+            api(&["d3d12.dll", "dxgi.dll"], &[]) == scan::GraphicsApi::Dx12,
+            "导入 d3d12.dll -> DX12",
+        );
+        ck(
+            &mut fails,
+            api(&["vulkan-1.dll"], &[]) == scan::GraphicsApi::Vulkan,
+            "导入 vulkan-1.dll -> Vulkan",
+        );
+        ck(
+            &mut fails,
+            api(&["d3d11.dll", "dxgi.dll"], &[]) == scan::GraphicsApi::Dx11,
+            "导入 d3d11.dll -> DX11",
+        );
+        ck(
+            &mut fails,
+            api(&["dxgi.dll"], &[]) == scan::GraphicsApi::Unknown,
+            "只有 dxgi.dll 不算数（10/11/12 都用它）",
+        );
+        ck(
+            &mut fails,
+            api(&[], &["vulkan-1.dll"]) == scan::GraphicsApi::Vulkan,
+            "导入表为空（运行时加载）时看同目录自带运行库",
+        );
+        ck(
+            &mut fails,
+            scan::GraphicsApi::Dx11.frame_gen_possible() == Some(false)
+                && scan::GraphicsApi::Dx12.frame_gen_possible() == Some(true)
+                && scan::GraphicsApi::Unknown.frame_gen_possible().is_none(),
+            "帧生成只在 DX12 / Vulkan 下有意义，未知时不下结论",
+        );
+        let eng = |exe: &str, sib: &[&str], pak: &[&str]| {
+            scan::engine_from_facts(&scan::LayoutFacts {
+                exe_name: exe.to_lowercase(),
+                siblings: s(sib),
+                pak_kinds: s(pak),
+            })
+        };
+        ck(
+            &mut fails,
+            eng("HogwartsLegacy-Win64-Shipping.exe", &[], &["pak"]) == scan::GameEngine::Unreal4,
+            "*-Win64-Shipping.exe + .pak -> Unreal 4",
+        );
+        ck(
+            &mut fails,
+            eng("SomeGame-Win64-Shipping.exe", &[], &["utoc"]) == scan::GameEngine::Unreal5,
+            "看到 .utoc（IoStore）-> Unreal 5",
+        );
+        ck(
+            &mut fails,
+            eng("MyGame.exe", &["UnityPlayer.dll", "MyGame_Data"], &[]) == scan::GameEngine::Unity,
+            "UnityPlayer.dll -> Unity",
+        );
+        ck(
+            &mut fails,
+            eng("cs2.exe", &["engine2.dll", "tier0.dll"], &[]) == scan::GameEngine::Source2,
+            "engine2.dll -> Source 2",
+        );
+        ck(
+            &mut fails,
+            eng("re4.exe", &["re_chunk_000.pak"], &[]) == scan::GameEngine::ReEngine,
+            "re_chunk_*.pak -> RE Engine",
+        );
+        ck(
+            &mut fails,
+            eng("SomeIndie.exe", &["data.win"], &[]) == scan::GameEngine::GameMaker,
+            "data.win -> GameMaker",
+        );
+        ck(
+            &mut fails,
+            eng("Mystery.exe", &["random.dll"], &[]) == scan::GameEngine::Unknown,
+            "没有证据就报 Unknown，不猜",
+        );
     }
 
     // ---- 路径归一化 / 长路径 / 版本号归一 ----
@@ -3047,6 +3151,10 @@ struct GameRow {
     target: PathBuf,
     /// 用户自己「存到游戏库」的条目（可以移除）
     manual: bool,
+    /// 图形 API / 引擎 / 是否自带 Streamline（见 scan::detect_tech）
+    api: scan::GraphicsApi,
+    engine: scan::GameEngine,
+    streamline: bool,
 }
 
 /// 选中游戏后「飞向游戏目录」的那张小卡片。
@@ -3086,6 +3194,9 @@ fn row_to_cached(r: &GameRow) -> scan::CachedRow {
         entry: r.entry.clone(),
         render_exe: r.render_exe.clone(),
         ac: r.ac,
+        api: r.api,
+        engine: r.engine,
+        streamline: r.streamline,
     }
 }
 
@@ -3458,10 +3569,24 @@ impl App {
 
     /// 一个游戏条目 -> 界面行：找渲染 EXE、判反作弊、看部署状态、取图标。
     /// known_exe 是缓存里记着的渲染 EXE —— 还在就直接用，省掉遍历游戏目录。
-    fn build_row_with(entry: GameEntry, manual: bool, known_exe: Option<PathBuf>) -> GameRow {
+    fn build_row_with(
+        entry: GameEntry,
+        manual: bool,
+        known_exe: Option<PathBuf>,
+        known_tech: Option<(scan::GraphicsApi, scan::GameEngine, bool)>,
+    ) -> GameRow {
         let render_exe = match known_exe {
             Some(p) if p.is_file() => Some(p),
             _ => scan::find_render_exe(&entry.install_dir),
+        };
+        // 图形 API / 引擎 / 有没有 Streamline：只在有渲染 EXE 时才算（要读 PE 导入表）。
+        // 启动时走缓存，不再重复读一遍。
+        let (api, engine, streamline) = match known_tech {
+            Some(t) => t,
+            None => render_exe
+                .as_deref()
+                .map(scan::detect_tech)
+                .unwrap_or((scan::GraphicsApi::Unknown, scan::GameEngine::Unknown, false)),
         };
         // 除了游戏根目录，还要看渲染 EXE 所在目录：
         // BattlEye 经常埋在 ...\Binaries\Win64\BattlEye，只看根目录会漏
@@ -3491,11 +3616,14 @@ impl App {
             icon: icon_img,
             target,
             manual,
+            api,
+            engine,
+            streamline,
         }
     }
 
     fn build_row(entry: GameEntry, manual: bool) -> GameRow {
-        Self::build_row_with(entry, manual, None)
+        Self::build_row_with(entry, manual, None, None)
     }
 
     /// 缓存条目 -> 界面行。安装目录已经不在的（游戏卸载了）扫出来的条目直接丢掉；
@@ -3508,6 +3636,8 @@ impl App {
             c.entry.clone(),
             manual,
             c.render_exe.clone(),
+            // 缓存里有就直接用，省掉一次 PE 读取 + 目录列举
+            Some((c.api, c.engine, c.streamline)),
         ))
     }
 
@@ -3591,10 +3721,18 @@ impl App {
         self.busy = true;
         self.status = format!("正在分析「{name}」...");
         self.spawn(move |tx, ctx| {
+            let render_exe = scan::find_render_exe(&dir);
+            let (api, engine, streamline) = render_exe
+                .as_deref()
+                .map(scan::detect_tech)
+                .unwrap_or((scan::GraphicsApi::Unknown, scan::GameEngine::Unknown, false));
             let cached = scan::CachedRow {
                 entry,
-                render_exe: scan::find_render_exe(&dir),
+                render_exe,
                 ac: ac_tier,
+                api,
+                engine,
+                streamline,
             };
             let row = App::build_cached_row(&cached, true);
             let _ = tx.send(Msg::ManualAdded(Box::new((cached, row)), name));
@@ -6466,6 +6604,42 @@ impl eframe::App for App {
                                 Some(p) => theme::path_text(format!("渲染 EXE   {}", p.display())),
                                 None => theme::hint("渲染 EXE   未找到（可手动选择其所在目录）"),
                             });
+                        }
+                        // 图形 API / 引擎 / 是否自带 DLSS 帧生成。
+                        // 这不只是「看着有用」：帧生成只在 DX12 / Vulkan 下存在，
+                        // DX11 及更早的游戏装上也白装 —— 提前说清能省用户一次白忙。
+                        {
+                            let mut tech: Vec<String> = Vec::new();
+                            if row.api != scan::GraphicsApi::Unknown {
+                                tech.push(row.api.label().to_owned());
+                            }
+                            if row.engine != scan::GameEngine::Unknown {
+                                tech.push(row.engine.label().to_owned());
+                            }
+                            if row.streamline {
+                                tech.push("游戏自带帧生成 (Streamline)".to_owned());
+                            }
+                            if !tech.is_empty() {
+                                ui.label(theme::hint(tech.join("  ·  ")));
+                            }
+                            if row.api.frame_gen_possible() == Some(false) {
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "这个游戏是 {}：DLSS 帧生成在它上面不存在，装了也不会生效",
+                                        row.api.label()
+                                    ))
+                                    .size(12.0)
+                                    .color(theme::WARN),
+                                );
+                            } else if row.streamline {
+                                ui.label(
+                                    egui::RichText::new(
+                                        "这个游戏自带 DLSS 帧生成 —— 正是本 Mod 需要的条件",
+                                    )
+                                    .size(12.0)
+                                    .color(theme::OK),
+                                );
+                            }
                         }
                         ui.add_space(2.0);
                         ui.horizontal(|ui| {

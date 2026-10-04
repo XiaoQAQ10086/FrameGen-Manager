@@ -50,6 +50,15 @@ pub struct CachedRow {
     /// 上次判定的反作弊等级
     #[serde(default = "tier_none")]
     pub ac: crate::anticheat::AcTier,
+    /// 渲染 EXE 用的图形 API（DX12 / Vulkan / …）
+    #[serde(default)]
+    pub api: GraphicsApi,
+    /// 游戏引擎（认不出来就是 Unknown）
+    #[serde(default)]
+    pub engine: GameEngine,
+    /// 游戏自带的导入表里有没有 Streamline（= 自带 DLSS 帧生成）
+    #[serde(default)]
+    pub streamline: bool,
 }
 
 fn tier_none() -> crate::anticheat::AcTier {
@@ -1544,6 +1553,248 @@ pub fn advise_proxy(target_dir: &Path) -> ProxyAdvice {
         undetermined: true,
         scanned: files.len(),
     }
+}
+
+// ---------------------------------------------------------------- 图形 API 与游戏引擎
+
+/// 渲染 EXE 实际用的图形 API。
+///
+/// 对用户来说这不是「冷知识」：**DLSS 帧生成只在 DX12 / Vulkan 下存在**。
+/// DX11 及更早的游戏装了这个 Mod 也不会有任何效果，早点说清楚能省一次白忙。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum GraphicsApi {
+    #[default]
+    Unknown,
+    Dx12,
+    Dx11,
+    Dx10,
+    Dx9,
+    Vulkan,
+    OpenGl,
+}
+
+impl GraphicsApi {
+    pub fn label(self) -> &'static str {
+        match self {
+            GraphicsApi::Dx12 => "DX12",
+            GraphicsApi::Dx11 => "DX11",
+            GraphicsApi::Dx10 => "DX10",
+            GraphicsApi::Dx9 => "DX9",
+            GraphicsApi::Vulkan => "Vulkan",
+            GraphicsApi::OpenGl => "OpenGL",
+            GraphicsApi::Unknown => "图形 API 未知",
+        }
+    }
+
+    /// 这个 API 下帧生成有没有意义。None = 认不出来（别说死）。
+    pub fn frame_gen_possible(self) -> Option<bool> {
+        match self {
+            GraphicsApi::Dx12 | GraphicsApi::Vulkan => Some(true),
+            GraphicsApi::Unknown => None,
+            _ => Some(false),
+        }
+    }
+}
+
+/// 游戏引擎。只报**有明确证据**的；认不出来就是 Unknown —— 不猜。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum GameEngine {
+    #[default]
+    Unknown,
+    Unreal4,
+    Unreal5,
+    Unity,
+    Source2,
+    Source,
+    Creation,
+    ReEngine,
+    CryEngine,
+    Godot,
+    GameMaker,
+    RpgMaker,
+    MonoGame,
+}
+
+impl GameEngine {
+    pub fn label(self) -> &'static str {
+        match self {
+            GameEngine::Unreal4 => "Unreal Engine 4",
+            GameEngine::Unreal5 => "Unreal Engine 5",
+            GameEngine::Unity => "Unity",
+            GameEngine::Source2 => "Source 2",
+            GameEngine::Source => "Source",
+            GameEngine::Creation => "Creation Engine",
+            GameEngine::ReEngine => "RE Engine",
+            GameEngine::CryEngine => "CryEngine",
+            GameEngine::Godot => "Godot",
+            GameEngine::GameMaker => "GameMaker",
+            GameEngine::RpgMaker => "RPG Maker",
+            GameEngine::MonoGame => "MonoGame / XNA",
+            GameEngine::Unknown => "引擎未知",
+        }
+    }
+}
+
+/// 判定引擎时用到的**观测**。纯数据，所以能用构造数据测（不用真装游戏）。
+#[derive(Debug, Clone, Default)]
+pub struct LayoutFacts {
+    /// 渲染 EXE 的文件名（小写）
+    pub exe_name: String,
+    /// 渲染 EXE 同目录的文件名（小写）
+    pub siblings: Vec<String>,
+    /// 往上找 `<根>\Content\Paks` 时看到的扩展名（小写，如 utoc / pak）
+    pub pak_kinds: Vec<String>,
+}
+
+/// 从导入表 + 同目录文件判断图形 API。
+///
+/// 优先级说明：DX12 优先于 Vulkan —— 同时导入两者的游戏（很少见）用 DX12 跑是常态。
+/// dxgi.dll 单独出现不算数（10/11/12 都会用它），必须有具体的 d3d*.dll。
+pub fn api_from_names(imports: &[String], siblings: &[String]) -> GraphicsApi {
+    let has = |list: &[String], n: &str| list.iter().any(|s| s.eq_ignore_ascii_case(n));
+    if has(imports, "d3d12.dll") || has(imports, "d3d12core.dll") {
+        return GraphicsApi::Dx12;
+    }
+    if has(imports, "vulkan-1.dll") {
+        return GraphicsApi::Vulkan;
+    }
+    if has(imports, "d3d11.dll") {
+        return GraphicsApi::Dx11;
+    }
+    if has(imports, "d3d10.dll") || has(imports, "d3d10_1.dll") {
+        return GraphicsApi::Dx10;
+    }
+    if has(imports, "d3d9.dll") {
+        return GraphicsApi::Dx9;
+    }
+    if has(imports, "opengl32.dll") {
+        return GraphicsApi::OpenGl;
+    }
+    // 导入表为空多半是「运行时才 LoadLibrary」的游戏：退一步看它把哪个运行库
+    // 放在自己旁边（Vulkan 游戏常自带 vulkan-1.dll）。仍然只是弱证据。
+    if has(siblings, "vulkan-1.dll") {
+        return GraphicsApi::Vulkan;
+    }
+    if has(siblings, "d3d12.dll") {
+        return GraphicsApi::Dx12;
+    }
+    GraphicsApi::Unknown
+}
+
+/// 从「EXE 名 + 目录长相」判断引擎。每条规则都用**游戏自己带的文件名**做证据。
+pub fn engine_from_facts(f: &LayoutFacts) -> GameEngine {
+    // 比较一律不区分大小写：调用方已经统一小写了，但这个纯函数不该因为
+    // 有人传了 "UnityPlayer.dll" 就判不出来（自测就是这么抓到的）。
+    let sib = |n: &str| f.siblings.iter().any(|s| s.eq_ignore_ascii_case(n));
+    let sib_has = |part: &str| f.siblings.iter().any(|s| s.to_ascii_lowercase().contains(part));
+    let exe = f.exe_name.to_ascii_lowercase();
+    // Unreal：<项目名>-Win64-Shipping.exe 是引擎自己的命名约定，基本不会误判。
+    // 4 还是 5 只能靠 IoStore：UE5 默认把资源打成 .utoc/.ucas。
+    if exe.ends_with("-win64-shipping.exe") || exe.ends_with("-win32-shipping.exe") {
+        return if f.pak_kinds.iter().any(|k| k == "utoc") {
+            GameEngine::Unreal5
+        } else {
+            GameEngine::Unreal4
+        };
+    }
+    if sib("unityplayer.dll") || f.siblings.iter().any(|s| s.to_ascii_lowercase().ends_with("_data")) {
+        return GameEngine::Unity;
+    }
+    if sib("engine2.dll") {
+        return GameEngine::Source2;
+    }
+    if sib("engine.dll") && sib("vstdlib.dll") {
+        return GameEngine::Source;
+    }
+    if sib("crysystem.dll") {
+        return GameEngine::CryEngine;
+    }
+    if sib_has("re_chunk_") {
+        return GameEngine::ReEngine;
+    }
+    if sib("data.win") {
+        return GameEngine::GameMaker;
+    }
+    if sib("nw.dll") || sib("rgss301.dll") || sib("rgss300.dll") {
+        return GameEngine::RpgMaker;
+    }
+    if sib("monogame.framework.dll") || f.siblings.iter().any(|s| s.to_ascii_lowercase().starts_with("xna")) {
+        return GameEngine::MonoGame;
+    }
+    if f.siblings.iter().any(|s| s.to_ascii_lowercase().ends_with(".pck")) || sib_has("godot.windows") {
+        return GameEngine::Godot;
+    }
+    // Creation Engine（Skyrim / Fallout）：资源是 Data 目录下的 .ba2 / .bsa，
+    // 而 EXE 旁边通常能看到 Data 这个目录名。
+    if sib("data") && (sib_has(".ba2") || sib_has(".bsa")) {
+        return GameEngine::Creation;
+    }
+    GameEngine::Unknown
+}
+
+/// 一次把三件事算出来：图形 API、引擎、以及**是否自带 Streamline（DLSS 帧生成）**。
+///
+/// 最后一项对本工具最关键：上游 Mod 要求游戏自带 DLSS 帧生成（Streamline），
+/// 没有它装了也不会生效 —— 这比「引擎是什么」更有用。
+pub fn detect_tech(exe: &Path) -> (GraphicsApi, GameEngine, bool) {
+    let imports = pe_imports(exe);
+    let mut siblings: Vec<String> = Vec::new();
+    if let Some(dir) = exe.parent() {
+        if let Ok(rd) = std::fs::read_dir(dir) {
+            for e in rd.flatten().take(600) {
+                siblings.push(e.file_name().to_string_lossy().to_lowercase());
+            }
+        }
+    }
+    let mut api = api_from_names(&imports, &siblings);
+    // 很多引擎（Unity 最典型）的游戏 exe 只是个壳：真正的渲染在引擎 DLL 里，
+    // 所以主 exe 的导入表里根本没有 d3d*.dll。这时去看引擎 DLL 自己的导入表 ——
+    // 实测一个 Unity 游戏：主 exe 0.6 MB（导入表没提 API），UnityPlayer.dll 里才有。
+    if api == GraphicsApi::Unknown {
+        for name in ["unityplayer.dll", "engine2.dll", "engine.dll", "crysystem.dll"] {
+            if !siblings.iter().any(|x| x == name) {
+                continue;
+            }
+            let Some(dir) = exe.parent() else { break };
+            let dep = pe_imports(&dir.join(name));
+            api = api_from_names(&dep, &siblings);
+            if api != GraphicsApi::Unknown {
+                break;
+            }
+        }
+    }
+    // UE5 的 IoStore：<根>\Content\Paks 下的 .utoc。往上看最多三层找它。
+    let mut pak_kinds: Vec<String> = Vec::new();
+    if let Some(dir) = exe.parent() {
+        let mut cur = Some(dir);
+        for _ in 0..3 {
+            let Some(d) = cur else { break };
+            if let Ok(rd) = std::fs::read_dir(d.join("Content").join("Paks")) {
+                for e in rd.flatten().take(200) {
+                    let n = e.file_name().to_string_lossy().to_lowercase();
+                    if let Some(ext) = n.rsplit('.').next() {
+                        if ext != n {
+                            pak_kinds.push(ext.to_owned());
+                        }
+                    }
+                }
+            }
+            cur = d.parent();
+        }
+    }
+    let facts = LayoutFacts {
+        exe_name: exe
+            .file_name()
+            .map(|s| s.to_string_lossy().to_lowercase())
+            .unwrap_or_default(),
+        siblings,
+        pak_kinds,
+    };
+    let engine = engine_from_facts(&facts);
+    let streamline = imports.iter().any(|i| {
+        i.contains("nvngx_dlssg") || i.contains("sl.interposer") || i.contains("sl.dlss_g")
+    });
+    (api, engine, streamline)
 }
 
 // ---------------------------------------------------------------- 显卡识别
