@@ -14,7 +14,8 @@ pub const BORDER: Color32 = Color32::from_rgb(0xDF, 0xE3, 0xE9);
 pub const BORDER_STRONG: Color32 = Color32::from_rgb(0xC6, 0xCD, 0xD6);
 
 pub const TEXT: Color32 = Color32::from_rgb(0x1F, 0x23, 0x28);
-pub const TEXT_MUTED: Color32 = Color32::from_rgb(0x6B, 0x72, 0x80);
+/// 次要文字。别调浅：11~12px 下浅灰落在浅色背景上很难看清（这个值对白底约 7.6:1）。
+pub const TEXT_MUTED: Color32 = Color32::from_rgb(0x4B, 0x55, 0x63);
 
 /// NVIDIA 绿。绿色填充上配深色文字才能保证对比度。
 pub const ACCENT: Color32 = Color32::from_rgb(0x76, 0xB9, 0x00);
@@ -24,7 +25,7 @@ pub const ACCENT_TEXT: Color32 = Color32::from_rgb(0x14, 0x1C, 0x00);
 pub const OK: Color32 = Color32::from_rgb(0x1B, 0x7F, 0x3B);
 pub const WARN: Color32 = Color32::from_rgb(0xB2, 0x6A, 0x00);
 pub const DANGER: Color32 = Color32::from_rgb(0xC6, 0x28, 0x28);
-pub const NEUTRAL: Color32 = Color32::from_rgb(0x6B, 0x72, 0x80);
+pub const NEUTRAL: Color32 = Color32::from_rgb(0x4B, 0x55, 0x63);
 
 // ---------------------------------------------------------------- 尺寸
 
@@ -119,7 +120,7 @@ pub fn apply(ctx: &egui::Context) {
             (egui::TextStyle::Heading, egui::FontId::new(17.0, egui::FontFamily::Proportional)),
             (egui::TextStyle::Body, egui::FontId::new(14.0, egui::FontFamily::Proportional)),
             (egui::TextStyle::Button, egui::FontId::new(14.0, egui::FontFamily::Proportional)),
-            (egui::TextStyle::Small, egui::FontId::new(11.5, egui::FontFamily::Proportional)),
+            (egui::TextStyle::Small, egui::FontId::new(12.0, egui::FontFamily::Proportional)),
             (egui::TextStyle::Monospace, egui::FontId::new(12.0, egui::FontFamily::Monospace)),
         ]
         .into();
@@ -185,7 +186,7 @@ pub fn badge(ui: &mut Ui, text: &str, color: Color32) {
         .corner_radius(CornerRadius::same(9))
         .inner_margin(Margin::symmetric(8, 2))
         .show(ui, |ui| {
-            ui.label(RichText::new(text).size(11.5).color(color).strong());
+            ui.label(RichText::new(text).size(12.0).color(color).strong());
         });
 }
 
@@ -245,13 +246,13 @@ pub fn danger_button(ui: &mut Ui, text: &str, enabled: bool) -> egui::Response {
 
 /// 小字辅助文本
 pub fn hint(text: impl Into<String>) -> RichText {
-    RichText::new(text.into()).size(11.5).color(TEXT_MUTED)
+    RichText::new(text.into()).size(12.0).color(TEXT_MUTED)
 }
 
 /// 等宽小字（路径展示）
 pub fn path_text(text: impl Into<String>) -> RichText {
     RichText::new(text.into())
-        .size(11.5)
+        .size(12.0)
         .monospace()
         .color(TEXT_MUTED)
 }

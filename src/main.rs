@@ -2019,6 +2019,120 @@ fn selftest() -> usize {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // ---- WeGame 判定：用构造数据覆盖真实世界的例子 ----
+    // 开发机上没装 WeGame，这条链路没法在真机上验；把判定抽成纯函数之后，
+    // 这里就能把「哪些是真游戏、哪些是无关软件」钉死，以后改规则也不会改坏。
+    println!("\n--- WeGame 判定（构造数据）---");
+    for (key, expect) in [
+        ("QQ", true),
+        ("QQMusic", true),
+        ("QQLive", true),
+        ("WeChat", true),
+        ("Weixin", true),
+        ("TIM", true),
+        ("TencentMeeting", true),
+        ("WeGame", true),
+        // 下面这些是真游戏，**绝不能**被当成非游戏键
+        ("QQ飞车", false),
+        ("QQ炫舞", false),
+        ("QQ三国", false),
+        ("王者荣耀", false),
+        ("穿越火线", false),
+        ("地下城与勇士", false),
+    ] {
+        ck(
+            &mut fails,
+            scan::wegame_non_game_key(key).is_some() == expect,
+            &format!("键名「{key}」判为非游戏 = {expect}"),
+        );
+    }
+    for (exe, expect) in [
+        (r"C:\Program Files (x86)\Tencent\QQ\Bin\QQ.exe", true),
+        (r"C:\Program Files (x86)\Tencent\WeChat\WeChat.exe", true),
+        (r"D:\Tencent\QQMusic\QQMusic.exe", true),
+        // 真游戏的本体不能被误杀
+        (r"D:\Games\QQFeiche\QQFeiche.exe", false),
+        (
+            r"D:\Games\HogwartsLegacy\Phoenix\Binaries\Win64\HogwartsLegacy.exe",
+            false,
+        ),
+    ] {
+        ck(
+            &mut fails,
+            scan::non_game_exe(Path::new(exe)).is_some() == expect,
+            &format!("可执行文件 {exe} 判为非游戏 = {expect}"),
+        );
+    }
+    {
+        let qq_dir = Path::new(r"C:\Program Files (x86)\Tencent\QQ");
+        let qq_exe = Path::new(r"C:\Program Files (x86)\Tencent\QQ\Bin\QQ.exe");
+        let game_dir = Path::new(r"D:\Games\王者荣耀");
+        let game_exe = Path::new(r"D:\Games\王者荣耀\Game.exe");
+        ck(
+            &mut fails,
+            scan::wegame_verdict("QQMusic", Some(qq_dir), Some(qq_exe)).0
+                == scan::WegameVerdict::NonGameKey,
+            "QQ音乐：按键名跳过",
+        );
+        ck(
+            &mut fails,
+            scan::wegame_verdict("王者荣耀", Some(game_dir), Some(game_exe)).0
+                == scan::WegameVerdict::Game,
+            "真游戏：收下",
+        );
+        ck(
+            &mut fails,
+            scan::wegame_verdict("王者荣耀", None, None).0 == scan::WegameVerdict::NoDir,
+            "值里没有目录：跳过",
+        );
+        ck(
+            &mut fails,
+            scan::wegame_verdict("王者荣耀", Some(game_dir), None).0
+                == scan::WegameVerdict::NoRenderExe,
+            "目录里没有可执行文件：跳过",
+        );
+        ck(
+            &mut fails,
+            scan::wegame_verdict("某个名字", Some(qq_dir), Some(qq_exe)).0
+                == scan::WegameVerdict::NonGameExe,
+            "目录里只有 QQ.exe：跳过",
+        );
+        ck(
+            &mut fails,
+            scan::wegame_verdict("王者荣耀", Some(game_dir), Some(game_exe))
+                .1
+                .contains("收下"),
+            "判定理由写进了日志里",
+        );
+    }
+
+    println!("\n--- 日志脱敏（用户要发给别人的东西）---");
+    {
+        let red = util::redact(r"C:\Users\Somebody\AppData\Local\Temp\x.txt");
+        ck(
+            &mut fails,
+            !red.contains("Somebody") && red.contains("<user>"),
+            "路径里的用户名被换成 <user>",
+        );
+        ck(
+            &mut fails,
+            util::redact(r"D:\SteamLibrary\steamapps\common\X\x.exe")
+                .contains("steamapps"),
+            "非用户目录的路径保持原样（排查要用）",
+        );
+        if let Ok(profile) = std::env::var("USERPROFILE") {
+            if !profile.is_empty() {
+                let p = format!("{profile}\\Downloads\\a.txt");
+                let r2 = util::redact(&p);
+                ck(
+                    &mut fails,
+                    !r2.contains(&profile) && r2.contains("%USERPROFILE%"),
+                    "用户目录整段被换成 %USERPROFILE%",
+                );
+            }
+        }
+    }
+
     if !fails.is_empty() {
         println!("\n  ★ 有 {} 项断言失败", fails.len());
         for f in &fails {
@@ -3569,7 +3683,8 @@ impl App {
             s.push_str(l);
             s.push('\n');
         }
-        s
+        // 这段是给用户复制出去发的：把用户名换掉（见 util::redact）
+        util::redact(&s)
     }
 
     /// 记一条日志：既进界面的操作日志，也写磁盘日志。
@@ -6521,7 +6636,10 @@ fn install_cjk_font(ctx: &egui::Context) {
     if std::env::var_os("DLSSG_NO_CJK_FONT").is_some() {
         return;
     }
-    const CANDIDATES: [&str; 3] = ["simhei.ttf", "msyh.ttc", "simsun.ttc"];
+    // 界面字体优先「微软雅黑」：它是 Windows 现在的界面字体，小字号下比黑体清楚得多。
+    // 字体改成只读映射之后，文件大一点不再等于多占内存（只有真正用到的字形页会被调入），
+    // 所以这里可以先把「好看」排在「文件小」前面。
+    const CANDIDATES: [&str; 3] = ["msyh.ttc", "simhei.ttf", "simsun.ttc"];
 
     let Some(font_dir) = windows_fonts_dir() else {
         return;

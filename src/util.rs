@@ -37,6 +37,43 @@ pub fn git_blob_sha1(data: &[u8]) -> String {
     to_hex(&h.finalize())
 }
 
+/// 把路径里的 Windows 用户名换成 `<user>`，好让用户放心把日志发给别人。
+///
+/// 只动这一处：目录名要留着 —— 「Tencent\\QQ」「steamapps\\common\\…」这些名字正是
+/// 排查时真正要看的东西。算得上个人信息的只有用户名、以及它所在的那层用户目录。
+/// 两条路都堵：先按 %USERPROFILE% 整段替换，再用 `\Users\<名字>\` 的形状兜底
+/// （环境变量缺失、或者日志来自别人机器时也能生效）。
+pub fn redact(s: &str) -> String {
+    let mut out = s.to_owned();
+    if let Some(p) = std::env::var_os("USERPROFILE") {
+        let p = p.to_string_lossy().to_string();
+        if p.len() > 3 {
+            out = out.replace(&p, "%USERPROFILE%");
+        }
+    }
+    redact_users_segment(&out)
+}
+
+/// `\Users\<名字>\` 里的那一段名字换成 `<user>`。
+fn redact_users_segment(s: &str) -> String {
+    const MARK: &str = "\\Users\\";
+    // 只做 ASCII 小写，字节长度不变，所以下面按字节切是安全的
+    let lower = s.to_ascii_lowercase();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0usize;
+    while i < s.len() {
+        let Some(rel) = lower[i..].find(&MARK.to_ascii_lowercase()) else { break };
+        let name_start = i + rel + MARK.len();
+        out.push_str(&s[i..name_start]);
+        let rest = &s[name_start..];
+        let name_end = rest.find('\\').map(|k| name_start + k).unwrap_or(s.len());
+        out.push_str("<user>");
+        i = name_end;
+    }
+    out.push_str(&s[i..]);
+    out
+}
+
 pub fn app_data_dir() -> Result<PathBuf> {
     let base = directories::BaseDirs::new().context("无法定位用户目录")?;
     let d = base.data_dir().join("FrameGen-Manager");

@@ -623,12 +623,144 @@ pub fn wegame_name_from_key(key: &str) -> String {
     }
 }
 
-/// 这些 Tencent 子键明显不是 WeGame 游戏（客户端、聊天工具之类）。
+/// 这些 Tencent 子键明显不是 WeGame 游戏（客户端、聊天工具、播放器、办公工具）。
 ///
-/// 只做**精确匹配**，不做前缀匹配 —— 免得把「QQ飞车」这种真游戏一起误杀。
-const WEGAME_NON_GAME_KEYS: [&str; 9] = [
-    "WeGame", "wegame", "QQ", "QQNT", "QQProtect", "WeChat", "Weixin", "TIM", "TencentDocs",
+/// **只做精确匹配**，不做前缀匹配 —— 免得把「QQ飞车」「QQ炫舞」这种真游戏一起误杀。
+/// 用户反馈「WeGame 列表里出现无关软件」时，先往这里加：加错名字只是不生效，
+/// 不会误伤真游戏。
+const WEGAME_NON_GAME_KEYS: [(&str, &str); 20] = [
+    ("WeGame", "WeGame 客户端本体"),
+    ("wegame", "WeGame 客户端本体"),
+    ("WeGameX", "WeGame 国际版客户端"),
+    ("QQ", "QQ 客户端"),
+    ("QQNT", "QQ 新版客户端"),
+    ("TencentQQ", "QQ 客户端"),
+    ("QQProtect", "QQ 安全组件"),
+    ("WeChat", "微信"),
+    ("Weixin", "微信"),
+    ("TIM", "TIM"),
+    ("QQMusic", "QQ 音乐"),
+    ("QQPlayer", "腾讯播放器"),
+    ("QQLive", "腾讯视频"),
+    ("TencentVideo", "腾讯视频"),
+    ("TencentMeeting", "腾讯会议"),
+    ("TXMeeting", "腾讯会议"),
+    ("QQBrowser", "QQ 浏览器"),
+    ("QQPinyin", "QQ 输入法"),
+    ("QQInput", "QQ 输入法"),
+    ("TencentDocs", "腾讯文档"),
 ];
+
+/// 挑中的「渲染 EXE」如果是这些程序，说明那个目录根本不是游戏。
+///
+/// 按主名精确匹配（去掉 .exe、转小写）。这里只放**不可能是游戏本体**的名字 ——
+/// 所以不放 update / setup 这类通用词。
+const NON_GAME_EXE_STEMS: [(&str, &str); 17] = [
+    ("qq", "QQ"),
+    ("qqnt", "QQ 新版客户端"),
+    ("qqprotect", "QQ 安全组件"),
+    ("wechat", "微信"),
+    ("weixin", "微信"),
+    ("tim", "TIM"),
+    ("wegame", "WeGame 客户端"),
+    ("wegamex", "WeGame 客户端"),
+    ("qqmusic", "QQ 音乐"),
+    ("qqplayer", "腾讯播放器"),
+    ("qqlive", "腾讯视频"),
+    ("tencentvideo", "腾讯视频"),
+    ("tencentmeeting", "腾讯会议"),
+    ("txmeeting", "腾讯会议"),
+    ("qqbrowser", "QQ 浏览器"),
+    ("qqpinyin", "QQ 输入法"),
+    ("tencentdocs", "腾讯文档"),
+];
+
+/// 一条 WeGame 候选的判定结果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WegameVerdict {
+    /// 当成游戏收下
+    Game,
+    /// 键名是已知的非游戏产品
+    NonGameKey,
+    /// 值里没读出任何存在的目录
+    NoDir,
+    /// 目录里找不到像样的可执行文件
+    NoRenderExe,
+    /// 挑中的可执行文件是已知的非游戏程序
+    NonGameExe,
+}
+
+impl WegameVerdict {
+    pub fn label(self) -> &'static str {
+        match self {
+            WegameVerdict::Game => "收下",
+            WegameVerdict::NonGameKey => "跳过：非游戏键",
+            WegameVerdict::NoDir => "跳过：没有目录",
+            WegameVerdict::NoRenderExe => "跳过：没有可执行文件",
+            WegameVerdict::NonGameExe => "跳过：可执行文件是非游戏程序",
+        }
+    }
+}
+
+/// 键名是不是已知的非游戏产品；是的话返回它的标签（给日志用）。
+pub fn wegame_non_game_key(key: &str) -> Option<&'static str> {
+    WEGAME_NON_GAME_KEYS
+        .iter()
+        .find(|(n, _)| key.eq_ignore_ascii_case(n))
+        .map(|(_, label)| *label)
+}
+
+/// 可执行文件是不是已知的非游戏程序；是的话返回它的标签。
+pub fn non_game_exe(exe: &Path) -> Option<&'static str> {
+    let stem = exe.file_stem()?.to_str()?.to_ascii_lowercase();
+    NON_GAME_EXE_STEMS
+        .iter()
+        .find(|(n, _)| stem == *n)
+        .map(|(_, label)| *label)
+}
+
+/// WeGame 一条候选怎么判 —— **不碰注册表、不碰磁盘的纯函数**。
+///
+/// 抽出来是为了能在自测里用构造数据覆盖真实世界的例子（真游戏 / QQ / 微信 /
+/// QQ音乐 / 腾讯会议…）：开发机上没装 WeGame，这些规则否则根本没法验证。
+/// 返回 (判定, 给日志的一句话理由)。
+pub fn wegame_verdict(
+    key_name: &str,
+    dir: Option<&Path>,
+    render_exe: Option<&Path>,
+) -> (WegameVerdict, String) {
+    if let Some(label) = wegame_non_game_key(key_name) {
+        return (
+            WegameVerdict::NonGameKey,
+            format!("跳过：键名「{key_name}」是已知的非游戏产品（{label}）"),
+        );
+    }
+    let Some(dir) = dir else {
+        return (
+            WegameVerdict::NoDir,
+            "跳过：这个键的所有值都没指向一个存在的目录".to_owned(),
+        );
+    };
+    let Some(exe) = render_exe else {
+        return (
+            WegameVerdict::NoRenderExe,
+            format!("跳过：{} 里找不到像样的可执行文件", dir.display()),
+        );
+    };
+    if let Some(label) = non_game_exe(exe) {
+        return (
+            WegameVerdict::NonGameExe,
+            format!(
+                "跳过：挑中的可执行文件 {} 是已知的非游戏程序（{label}）",
+                exe.display()
+            ),
+        );
+    }
+    (
+        WegameVerdict::Game,
+        format!("收下：目录 {}，可执行文件 {}", dir.display(), exe.display()),
+    )
+}
 
 /// WeGame 自己装没装。
 ///
@@ -669,24 +801,23 @@ pub fn scan_wegame_notes(notes: &mut Vec<String>) -> Vec<GameEntry> {
     }
     let mut out: Vec<GameEntry> = Vec::new();
     let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
-    let (mut keys, mut non_game, mut no_dir, mut no_exe) = (0usize, 0usize, 0usize, 0usize);
+    let (mut keys, mut non_game, mut no_dir, mut no_exe, mut non_game_exe) =
+        (0usize, 0usize, 0usize, 0usize, 0usize);
+    // 每个候选都记一行证据（哪个键、哪个值、哪个目录、挑中哪个 exe、为什么这样判），
+    // 用户报「选出无关软件」时看这几行就够。给个上限：畸形注册表不该把日志刷爆。
+    const DETAIL_CAP: usize = 80;
+    let mut detailed = 0usize;
 
     for root in WEGAME_REG_ROOTS {
         let Ok(k) = hklm.open_subkey(root) else { continue };
         for key_name in k.enum_keys().flatten() {
-            // 客户端 / 聊天工具之类的键不是游戏
             keys += 1;
-            if WEGAME_NON_GAME_KEYS
-                .iter()
-                .any(|n| key_name.eq_ignore_ascii_case(n))
-            {
-                non_game += 1;
-                continue;
-            }
             let Ok(gk) = k.open_subkey(&key_name) else { continue };
 
             let mut dir: Option<PathBuf> = None;
+            let mut dir_value: Option<String> = None;
             let mut weak: Option<PathBuf> = None;
+            let mut weak_value: Option<String> = None;
             let mut display: Option<String> = None;
 
             for (vname, _) in gk.enum_values().flatten() {
@@ -702,25 +833,58 @@ pub fn scan_wegame_notes(notes: &mut Vec<String>) -> Vec<GameEntry> {
                 if let Some(d) = wegame_existing_dir(s) {
                     if wegame_value_is_path_like(&vname) && dir.is_none() {
                         dir = Some(d);
+                        dir_value = Some(vname.clone());
                     } else if weak.is_none() {
                         weak = Some(d);
+                        weak_value = Some(vname.clone());
                     }
                 }
             }
 
-            let Some(dir) = dir.or(weak) else {
-                no_dir += 1;
-                continue;
+            // 名字像路径的值优先；没有就用任何一个能落到真实目录的值兜底
+            let (chosen, chosen_value) = match (dir, weak) {
+                (Some(d), _) => (Some(d), dir_value),
+                (None, Some(d)) => (Some(d), weak_value),
+                (None, None) => (None, None),
             };
-            // 必须有能找到的游戏程序 —— 这一条把绝大多数噪音挡在外面
-            if find_render_exe(&dir).is_none() {
-                no_exe += 1;
-                continue;
+            let render = chosen.as_deref().and_then(find_render_exe);
+            let (verdict, why) = wegame_verdict(&key_name, chosen.as_deref(), render.as_deref());
+
+            if detailed < DETAIL_CAP {
+                detailed += 1;
+                note(
+                    notes,
+                    format!(
+                        "WeGame 候选 [{root}\\{key_name}] 判定={} 目录={} 来自值={} 可执行文件={} —— {}",
+                        verdict.label(),
+                        chosen
+                            .as_deref()
+                            .map(|p| p.display().to_string())
+                            .unwrap_or_else(|| "无".to_owned()),
+                        chosen_value.as_deref().unwrap_or("无"),
+                        render
+                            .as_deref()
+                            .map(|p| p.display().to_string())
+                            .unwrap_or_else(|| "无".to_owned()),
+                        why
+                    ),
+                );
             }
-            let name = display
-                .filter(|n| !n.trim().is_empty())
-                .unwrap_or_else(|| wegame_name_from_key(&key_name));
-            push_wegame(&mut out, name, dir);
+
+            match verdict {
+                WegameVerdict::Game => {
+                    if let Some(d) = chosen {
+                        let name = display
+                            .filter(|n| !n.trim().is_empty())
+                            .unwrap_or_else(|| wegame_name_from_key(&key_name));
+                        push_wegame(&mut out, name, d);
+                    }
+                }
+                WegameVerdict::NonGameKey => non_game += 1,
+                WegameVerdict::NoDir => no_dir += 1,
+                WegameVerdict::NoRenderExe => no_exe += 1,
+                WegameVerdict::NonGameExe => non_game_exe += 1,
+            }
         }
     }
 
@@ -729,12 +893,37 @@ pub fn scan_wegame_notes(notes: &mut Vec<String>) -> Vec<GameEntry> {
         let Ok(rd) = std::fs::read_dir(base.join("apps")) else { continue };
         for e in rd.flatten() {
             let p = e.path();
-            if !p.is_dir() || find_render_exe(&p).is_none() {
+            if !p.is_dir() {
                 continue;
             }
             let name = e.file_name().to_string_lossy().to_string();
-            if !name.trim().is_empty() {
-                push_wegame(&mut out, name, p);
+            let render = find_render_exe(&p);
+            let (verdict, why) = wegame_verdict(&name, Some(&p), render.as_deref());
+            if detailed < DETAIL_CAP {
+                detailed += 1;
+                note(
+                    notes,
+                    format!(
+                        "WeGame apps 目录 [{}] 判定={} 可执行文件={} —— {}",
+                        p.display(),
+                        verdict.label(),
+                        render
+                            .as_deref()
+                            .map(|x| x.display().to_string())
+                            .unwrap_or_else(|| "无".to_owned()),
+                        why
+                    ),
+                );
+            }
+            match verdict {
+                WegameVerdict::Game => {
+                    if !name.trim().is_empty() {
+                        push_wegame(&mut out, name, p);
+                    }
+                }
+                WegameVerdict::NonGameExe => non_game_exe += 1,
+                WegameVerdict::NoRenderExe => no_exe += 1,
+                _ => {}
             }
         }
     }
@@ -742,9 +931,10 @@ pub fn scan_wegame_notes(notes: &mut Vec<String>) -> Vec<GameEntry> {
     note(
         notes,
         format!(
-            "WeGame 扫描完成：看了 {keys} 个注册表项，收下 {} 个游戏，跳过 {}（非游戏键 {non_game}、没读到目录 {no_dir}、目录里找不到游戏程序 {no_exe}）",
+            "WeGame 扫描完成：看了 {keys} 个注册表项，收下 {} 个游戏，跳过 {}（非游戏键 {non_game}、没读到目录 {no_dir}、目录里找不到可执行文件 {no_exe}、可执行文件是非游戏程序 {non_game_exe}{}）",
             out.len(),
-            non_game + no_dir + no_exe
+            non_game + no_dir + no_exe + non_game_exe,
+            if keys > detailed { "；候选明细另有上限，只记了前 80 条" } else { "" }
         ),
     );
     out

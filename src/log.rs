@@ -108,7 +108,8 @@ pub fn rotate(d: &Path) -> PathBuf {
 pub fn line(msg: &str) {
     let Some(m) = FILE.get() else { return };
     let Ok(mut f) = m.lock() else { return };
-    let _ = writeln!(f, "[{}] {}", clock(), msg);
+    // 日志是用户要发给别人的东西：写盘前把用户名换掉（见 util::redact）。
+    let _ = writeln!(f, "[{}] {}", clock(), util::redact(msg));
     let _ = f.flush();
 }
 
