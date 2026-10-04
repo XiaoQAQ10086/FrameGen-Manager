@@ -28,6 +28,27 @@ pub fn sha256_file(path: &Path) -> Result<String> {
     Ok(sha256_hex(&data))
 }
 
+/// 从文件算 git blob sha1（流式）。下载走的就是这条：几十 MB 的运行库
+/// 不必为了算一个哈希再读进内存一遍。
+pub fn git_blob_sha1_file(path: &Path) -> Result<String> {
+    use std::io::Read;
+    let len = std::fs::metadata(path)
+        .with_context(|| format!("读取文件失败: {}", path.display()))?
+        .len();
+    let mut h = Sha1::new();
+    h.update(format!("blob {len}\0").as_bytes());
+    let mut f = std::fs::File::open(path).with_context(|| format!("读取文件失败: {}", path.display()))?;
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let n = f.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        h.update(&buf[..n]);
+    }
+    Ok(to_hex(&h.finalize()))
+}
+
 /// git 的 blob 对象哈希 = sha1("blob <字节数>\0" + 内容)。
 /// 可以直接和 GitHub contents API 返回的 sha 字段比对，确认下载内容与仓库一致。
 pub fn git_blob_sha1(data: &[u8]) -> String {
@@ -88,8 +109,13 @@ pub fn legacy_app_data_dir() -> Option<PathBuf> {
     Some(base.data_dir().join("DLSSG-Manager"))
 }
 
+/// 备份根目录**只解析一次**。每次调用重新判断可写性的话，同一份程序在不同的
+/// 运行方式下（提权 / 非提权、网络盘临时不可用）会解析到不同目录 —— 部署写在 A、
+/// 还原去找 B，结果是「没有找到部署记录」，用户再也还原不回去。
+static BACKUPS_ROOT: OnceLock<PathBuf> = OnceLock::new();
+
 pub fn backups_dir() -> Result<PathBuf> {
-    let d = default_backups_dir();
+    let d = BACKUPS_ROOT.get_or_init(default_backups_dir).clone();
     std::fs::create_dir_all(&d).with_context(|| format!("创建备份目录失败: {}", d.display()))?;
     Ok(d)
 }
@@ -272,6 +298,8 @@ pub fn load_config() -> AppConfig {
 }
 
 pub fn save_config(cfg: &AppConfig) -> Result<()> {
+    // 配置可能改了资产目录位置：让缓存失效，否则界面还在用旧路径
+    forget_assets_dir();
     let p = config_path();
     if let Some(parent) = p.parent() {
         std::fs::create_dir_all(parent)?;
@@ -294,11 +322,35 @@ pub fn default_asset_dir() -> PathBuf {
         .unwrap_or_else(|_| PathBuf::from("assets"))
 }
 
+/// 资产目录的缓存。界面每帧都要显示它、还要拿它拼路径 —— 不缓存的话就是每帧一次
+/// 读配置文件 + 一次 create_dir_all（60 FPS 下每秒上百次系统调用，网络盘/机械盘上
+/// 明显拖慢界面）。
+static ASSETS_DIR: OnceLock<std::sync::Mutex<Option<PathBuf>>> = OnceLock::new();
+
+fn assets_cache() -> &'static std::sync::Mutex<Option<PathBuf>> {
+    ASSETS_DIR.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+/// 用户在界面上改了资产目录位置之后调用，让下一次重新解析。
+pub fn forget_assets_dir() {
+    if let Ok(mut g) = assets_cache().lock() {
+        *g = None;
+    }
+}
+
 /// 实际使用的资产目录：用户在界面上改过就用改过的，否则用默认位置。
 pub fn assets_dir() -> Result<PathBuf> {
+    if let Ok(g) = assets_cache().lock() {
+        if let Some(d) = g.as_ref() {
+            return Ok(d.clone());
+        }
+    }
     let d = load_config().asset_dir.unwrap_or_else(default_asset_dir);
     std::fs::create_dir_all(&d)
         .with_context(|| format!("创建资产目录失败: {}", d.display()))?;
+    if let Ok(mut g) = assets_cache().lock() {
+        *g = Some(d.clone());
+    }
     Ok(d)
 }
 
@@ -310,6 +362,30 @@ pub fn dir_key(dir: &Path) -> String {
         .trim_end_matches('\\')
         .to_lowercase();
     sha256_hex(s.as_bytes())[..16].to_string()
+}
+
+/// 需要时把路径转成 Win32 的「verbatim」形式（\\?\ 前缀），绕开 260 字符上限。
+///
+/// 什么时候需要：游戏装在很深的目录里（Steam 库 + 长中文目录名），
+/// 部署目标加上临时文件名就可能超过 MAX_PATH —— 那时 WriteFile/CopyFile 会直接失败，
+/// 用户看到的是「写不进去」但不知道为什么。短路径保持原样，免得改变别的语义。
+pub fn long_path(p: &Path) -> PathBuf {
+    let s = p.to_string_lossy();
+    if !p.is_absolute() || s.len() <= 240 {
+        return p.to_path_buf();
+    }
+    // 前缀用字符拼出来，源码里就不必到处写反斜杠转义
+    let bs = '\\';
+    let unc: String = [bs, bs].iter().collect();
+    let verbatim: String = [bs, bs, '?', bs].iter().collect();
+    if s.starts_with(&verbatim) {
+        return p.to_path_buf();
+    }
+    // UNC：{verbatim}UNC{bs}server{bs}share；本地盘：{verbatim}C:{bs}...
+    if let Some(rest) = s.strip_prefix(&unc) {
+        return PathBuf::from(format!("{verbatim}UNC{bs}{rest}"));
+    }
+    PathBuf::from(format!("{verbatim}{s}"))
 }
 
 /// 原子替换：MoveFileExW(REPLACE_EXISTING | WRITE_THROUGH)。
@@ -324,8 +400,9 @@ pub fn atomic_replace(src: &Path, dst: &Path) -> Result<()> {
         p.as_os_str().encode_wide().chain(std::iter::once(0)).collect()
     }
 
-    let s = wide(src);
-    let d = wide(dst);
+    // 长路径加 verbatim 前缀，否则深目录下的游戏根本写不进去
+    let s = wide(&long_path(src));
+    let d = wide(&long_path(dst));
     let ok = unsafe {
         MoveFileExW(
             s.as_ptr(),
@@ -352,13 +429,25 @@ pub fn clear_motw(path: &Path) {
 }
 
 /// 独占方式试打开，用来判断文件是否被占用（游戏在运行）。
-pub fn is_locked(path: &Path) -> bool {
+/// 目标文件现在能不能写。**三态**：只说「被占用」会让用户一直去关游戏，
+/// 而实际可能只是文件带了只读属性。
+pub enum LockState {
+    Free,
+    InUse,
+    NoAccess,
+}
+
+pub fn lock_state(path: &Path) -> LockState {
     use std::fs::OpenOptions;
     use std::os::windows::fs::OpenOptionsExt;
     // dwShareMode = 0 -> 独占
     match OpenOptions::new().read(true).write(true).share_mode(0).open(path) {
-        Ok(_) => false,
-        Err(e) => e.raw_os_error() == Some(32), // ERROR_SHARING_VIOLATION
+        Ok(_) => LockState::Free,
+        Err(e) => match e.raw_os_error() {
+            Some(32) | Some(33) => LockState::InUse, // 共享冲突 / 区域锁
+            Some(5) => LockState::NoAccess,          // 只读属性或权限不足
+            _ => LockState::Free,
+        },
     }
 }
 

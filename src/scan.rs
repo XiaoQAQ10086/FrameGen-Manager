@@ -623,6 +623,18 @@ pub fn wegame_name_from_key(key: &str) -> String {
     }
 }
 
+/// 一个目录的归一化 key：小写、统一用反斜杠、去掉末尾分隔符。
+///
+/// 用途是**比较两个路径是不是同一个目录** —— 忽略清单、去重、手动条目查重都得用它。
+/// 直接拿 display() 的字符串比会漏：D:\Games\X、d:/games/x、D:\Games\X\ 这三种写法
+/// 在用户和各个启动器的记录里都出现过。
+pub fn path_key(p: &std::path::Path) -> String {
+    p.to_string_lossy()
+        .replace('/', "\\")
+        .trim_end_matches('\\')
+        .to_lowercase()
+}
+
 /// 这些 Tencent 子键明显不是 WeGame 游戏（客户端、聊天工具、播放器、办公工具）。
 ///
 /// **只做精确匹配**，不做前缀匹配 —— 免得把「QQ飞车」「QQ炫舞」这种真游戏一起误杀。
@@ -867,7 +879,11 @@ pub fn scan_wegame_notes(notes: &mut Vec<String>) -> Vec<GameEntry> {
     if !wegame_installed() {
         note(
             notes,
-            "WeGame：本机没装（Tencent 下没有 WeGame 的安装目录），跳过".to_owned(),
+            // 措辞要老实：我们只是**没找到**安装痕迹，不等于用户没装。
+            // 写成确定的「本机没装」会让真装了 WeGame 的用户以为功能不支持，
+            // 于是根本不会来反馈「扫不到」。
+            "WeGame：没找到 WeGame 的安装痕迹（Tencent 注册表和 Program Files 下都没有），已跳过 ——              如果确实装了 WeGame，可以用「选择目录」把游戏手动加进库"
+                .to_owned(),
         );
         return Vec::new();
     }
@@ -1030,7 +1046,9 @@ fn wegame_existing_dir(s: &str) -> Option<PathBuf> {
 }
 
 fn push_wegame(out: &mut Vec<GameEntry>, name: String, dir: PathBuf) {
-    if out.iter().any(|g| g.install_dir == dir) {
+    // 用归一化 key 比：同一个目录在注册表里的写法可能大小写/斜杠不同
+    let key = path_key(&dir);
+    if out.iter().any(|g| path_key(&g.install_dir) == key) {
         return;
     }
     out.push(GameEntry {
@@ -1539,6 +1557,9 @@ pub enum GpuRoute {
     /// GTX 16 系：和 RTX 20 系同是 Turing，但**没有 Tensor Core** —— DLSS 全系功能在
     /// 硬件上就跑不了，换哪个版本都没用。单独一条路，并且禁止部署。
     Gtx16,
+    /// Pascal 及更早（GTX 10 系等）、MX、Quadro/Tesla：同样没有 Tensor Core，
+    /// 部署了也不会生效。以前这些都落到 Unknown 而被静默放行。
+    NoTensorCore,
     /// RTX 40 / 50 系：原生支持帧生成，不需要本 Mod
     NotNeeded,
     /// AMD / Intel / 核显：不适用
@@ -1553,6 +1574,7 @@ impl GpuRoute {
             GpuRoute::Sm86 => "RTX 30 系 (SM86)",
             GpuRoute::Sm75 => "RTX 20 系 (SM75)",
             GpuRoute::Gtx16 => "GTX 16 系（无 Tensor Core）",
+            GpuRoute::NoTensorCore => "不支持帧生成的旧卡（无 Tensor Core）",
             GpuRoute::NotNeeded => "RTX 40 / 50 系",
             GpuRoute::Unsupported => "非 NVIDIA 显卡",
             GpuRoute::Unknown => "未能识别",
@@ -1621,8 +1643,31 @@ pub fn classify_gpu(name: &str) -> GpuRoute {
     if n.contains("GTX 16") {
         return GpuRoute::Gtx16;
     }
+    // RTX 2050 是 GA107（Ampere），只是名字落在 "RTX 20" 这个子串里 ——
+    // 先单独挑出来，否则界面会告诉用户「你是 Turing / SM75」，是错的。
+    if n.contains("RTX 2050") {
+        return GpuRoute::Sm86;
+    }
     if n.contains("RTX 20") {
         return GpuRoute::Sm75;
+    }
+    // Pascal 及更早、MX、Quadro/Tesla：都没有 Tensor Core，和 GTX 16 系同一种处境。
+    // 不分出来的话它们会落到 Unknown —— 而闸门对 Unknown 是放行的，用户会白忙一场。
+    if n.contains("GTX 10")
+        || n.contains("GTX 9")
+        || n.contains("GTX 7")
+        || n.contains("GT 10")
+        || n.contains("GT 9")
+        || n.contains("GT 7")
+        || n.contains("GT 6")
+        || n.contains("MX1")
+        || n.contains("MX2")
+        || n.contains("MX3")
+        || n.contains("MX4")
+        || n.contains("QUADRO")
+        || n.contains("TESLA")
+    {
+        return GpuRoute::NoTensorCore;
     }
     GpuRoute::Unknown
 }
@@ -1776,6 +1821,10 @@ pub fn scan_all_notes() -> (Vec<GameEntry>, Vec<String>) {
     let mut all = scan_steam_notes(&mut notes);
     all.extend(scan_epic_notes(&mut notes));
     all.extend(scan_wegame_notes(&mut notes));
+    // 同一个目录可能被两个来源收录（Steam + Epic、或和一个手动条目重了）。
+    // 按归一化路径去重，先出现的优先 —— 上面的调用顺序就是 Steam -> Epic -> WeGame。
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    all.retain(|g| seen.insert(path_key(&g.install_dir)));
     all.sort_by_key(|g| g.name.to_lowercase());
     note(
         &mut notes,

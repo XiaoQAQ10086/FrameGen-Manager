@@ -34,6 +34,9 @@ pub struct AcHit {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AcReport {
     pub hits: Vec<AcHit>,
+    /// 目录太多，这次没扫完。**界面必须如实说**：没检出 ≠ 干净。
+    #[serde(default)]
+    pub truncated: bool,
 }
 
 impl AcReport {
@@ -63,6 +66,7 @@ impl AcReport {
     }
 
     pub fn merge(&mut self, other: AcReport) {
+        self.truncated |= other.truncated;
         for h in other.hits {
             if !self.hits.iter().any(|x| x.name == h.name) {
                 self.hits.push(h);
@@ -116,13 +120,24 @@ pub fn scan_system() -> AcReport {
             })
             .unwrap_or((0, 0xFF));
 
-        let tier = if ty == SERVICE_TYPE_KERNEL_DRIVER {
+        // Start=4 = 已禁用：注册项还留着，但驱动不会再加载。卸载游戏后残留的注册项
+        // 就是这种 —— 一直当成内核级会让用户以为自己机器上跑着反作弊（长期误报）。
+        let disabled = start == 4;
+        let tier = if disabled {
+            AcTier::UserMode
+        } else if ty == SERVICE_TYPE_KERNEL_DRIVER {
             AcTier::Kernel
         } else {
             *default_tier
         };
 
-        let kind = if ty == SERVICE_TYPE_KERNEL_DRIVER { "内核驱动" } else { "服务" };
+        let kind = if disabled {
+            "已禁用的残留注册项"
+        } else if ty == SERVICE_TYPE_KERNEL_DRIVER {
+            "内核驱动"
+        } else {
+            "服务"
+        };
         report.push(
             label,
             tier,
@@ -133,39 +148,69 @@ pub fn scan_system() -> AcReport {
     report
 }
 
-/// 游戏目录里出现的反作弊目录名
-const DIR_MARKERS: &[(&str, &str)] = &[
-    ("EasyAntiCheat", "Easy Anti-Cheat (EAC)"),
-    ("EasyAntiCheat_EOS", "Easy Anti-Cheat (EOS)"),
-    ("BattlEye", "BattlEye"),
-    ("GameGuard", "nProtect GameGuard"),
-    ("XignCode", "XignCode3"),
+/// 游戏目录里出现的反作弊目录名。
+///
+/// 这些**一律按用户态**记：光有一个同名目录不能证明内核驱动装上了（那可能只是
+/// 卸载残留、或者只是启动器）。真正算内核级的证据是下面的 .sys 文件。
+/// 以前这里也按内核级记，于是只剩一个 `BEService.exe`（用户态服务）的游戏也会弹
+/// 「内核级反作弊 / 封号风险」—— 同一个东西在服务表里我们标的是用户态，两边自相矛盾。
+const DIR_MARKERS: &[(&str, &str, AcTier)] = &[
+    ("EasyAntiCheat", "Easy Anti-Cheat (EAC)", AcTier::UserMode),
+    ("EasyAntiCheat_EOS", "Easy Anti-Cheat (EOS)", AcTier::UserMode),
+    ("BattlEye", "BattlEye", AcTier::UserMode),
+    ("GameGuard", "nProtect GameGuard", AcTier::UserMode),
+    ("XignCode", "XignCode3", AcTier::UserMode),
 ];
 
-/// 游戏目录里出现的反作弊文件名
-const FILE_MARKERS: &[(&str, &str)] = &[
-    ("EasyAntiCheat.sys", "EAC 内核驱动"),
-    ("EasyAntiCheat_EOS.sys", "EAC EOS 内核驱动"),
-    ("BEDaisy.sys", "BattlEye 内核驱动"),
-    ("BEService.exe", "BattlEye 服务"),
-    ("start_protected_game.exe", "EAC 受保护启动器"),
-    ("vgk.sys", "Riot Vanguard 内核驱动"),
-    ("x3.xem", "XignCode3"),
+/// 游戏目录里出现的反作弊文件名，带各自的等级：`.sys` 才是内核驱动，其余是用户态组件。
+const FILE_MARKERS: &[(&str, &str, AcTier)] = &[
+    ("EasyAntiCheat.sys", "EAC 内核驱动", AcTier::Kernel),
+    ("EasyAntiCheat_EOS.sys", "EAC EOS 内核驱动", AcTier::Kernel),
+    ("BEDaisy.sys", "BattlEye 内核驱动", AcTier::Kernel),
+    ("vgk.sys", "Riot Vanguard 内核驱动", AcTier::Kernel),
+    ("BEService.exe", "BattlEye 服务", AcTier::UserMode),
+    ("start_protected_game.exe", "EAC 受保护启动器", AcTier::UserMode),
+    ("x3.xem", "XignCode3", AcTier::UserMode),
 ];
 
 fn check_flat(dir: &Path, report: &mut AcReport) {
-    for (name, label) in DIR_MARKERS {
+    for (name, label, tier) in DIR_MARKERS {
         let p = dir.join(name);
         if p.is_dir() {
-            report.push(label, AcTier::Kernel, format!("目录存在: {}", p.display()));
+            report.push(label, *tier, format!("目录存在: {}", p.display()));
         }
     }
-    for (name, label) in FILE_MARKERS {
+    for (name, label, tier) in FILE_MARKERS {
         let p = dir.join(name);
         if p.is_file() {
-            report.push(label, AcTier::Kernel, format!("文件存在: {}", p.display()));
+            report.push(label, *tier, format!("文件存在: {}", p.display()));
         }
     }
+}
+
+/// 「大家一起用的」目录 —— 它不是某个游戏的安装根，反作弊的祖先扫描到这些地方就停。
+fn is_shared_root(p: &Path) -> bool {
+    // 盘根
+    if p.parent().is_none() {
+        return true;
+    }
+    let name = p
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    matches!(
+        name.as_str(),
+        "common"
+            | "steamapps"
+            | "program files"
+            | "program files (x86)"
+            | "windows"
+            | "users"
+            | "programdata"
+            | "appdata"
+            | "games"
+    )
 }
 
 /// 扫描部署目标目录：自身 + 最多 4 级祖先（EAC/BattlEye 通常装在游戏根目录，
@@ -183,9 +228,16 @@ pub fn scan_game_dir(dir: &Path) -> AcReport {
         }
     }
 
+    // 往上看最多 4 级（EAC / BattlEye 常装在游戏根目录，而部署目标可能是
+    // ...\Binaries\Win64）。**扫到「大家一起用的」目录就停**：
+    // C:\Program Files (x86)\EasyAntiCheat 这种机器级目录会让每一个游戏都被判成
+    // 内核级反作弊 —— 那是误报，而且反复误报会让用户对真警告一起脱敏。
     let mut cur = dir.parent();
     for _ in 0..4 {
         let Some(p) = cur else { break };
+        if is_shared_root(p) {
+            break;
+        }
         check_flat(p, &mut report);
         cur = p.parent();
     }
@@ -199,20 +251,28 @@ pub fn scan_game_dir(dir: &Path) -> AcReport {
 /// 有 4000 个目录的上限，避免在超大游戏目录上卡住。
 pub fn scan_deep(dir: &Path) -> AcReport {
     let mut report = scan_game_dir(dir);
-    let mut visited = 0usize;
+    // 上限按**目录数**算。以前把文件也算进去，于是 Asset/Content 很多的大游戏目录
+    // 会在看到 BattlEye/EasyAntiCheat 之前就截断 —— 闸门静默放行，偏偏那正是最该拦的
+    // 场景。截断时要打标记，让界面说「没扫完」而不是「没检出」。
+    let mut dirs = 0usize;
     for entry in walkdir::WalkDir::new(dir)
         .max_depth(4)
         .follow_links(false)
         .into_iter()
         .filter_map(|e| e.ok())
     {
-        visited += 1;
-        if visited > 4000 {
+        if !entry.file_type().is_dir() {
+            continue;
+        }
+        dirs += 1;
+        if dirs > MAX_SCAN_DIRS {
+            report.truncated = true;
             break;
         }
-        if entry.file_type().is_dir() {
-            check_flat(entry.path(), &mut report);
-        }
+        check_flat(entry.path(), &mut report);
     }
     report
 }
+
+/// 一次深度扫描最多看多少个目录。只数目录，不数文件。
+pub const MAX_SCAN_DIRS: usize = 4000;

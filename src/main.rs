@@ -364,7 +364,12 @@ fn main() -> eframe::Result<()> {
     if let Some(pos) = argv_z.iter().position(|a| a == "--ziptest") {
         let zip = PathBuf::from(argv_z.get(pos + 1).cloned().unwrap_or_default());
         let out = PathBuf::from(argv_z.get(pos + 2).cloned().unwrap_or_default());
-        match update::zip_extract_dll(&zip, &out) {
+        // 要解哪个条目 = 输出文件名（例：--ziptest a.zip version.dll）
+        let want = out
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_default();
+        match update::zip_extract_dll(&zip, &out, &want) {
             Ok(name) => {
                 let id = scan::identify_dll(&out);
                 let sz = std::fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
@@ -420,6 +425,7 @@ fn main() -> eframe::Result<()> {
             update::DEFAULT_BACKUP_PREFIX,
         ) {
             Ok(dl) => {
+                let _ = update::commit_download(&dest);
                 // 通过标准是「长度对得上」。有些镜像（比如现在的 gh-proxy.com）
                 // 不转发 GitHub 的 ETag，拿不到就没法比指纹 —— 那是镜像的特性，
                 // 不是下载失败。代理 DLL 由签名校验兜底，ini 走官方优先不受影响。
@@ -801,8 +807,11 @@ fn speedtest() {
             },
         },
         Some(&remote.etag),
-        "",
-        true,
+        update::SourcePolicy {
+            prefix: "",
+            prefer_mirror: true,
+            official_only: false,
+        },
         // 和界面里一样：代理 DLL 必须带本项目签名
         &|p: &Path| {
             let id = scan::identify_dll(p);
@@ -955,6 +964,10 @@ fn gpu_gate(route: scan::GpuRoute) -> Option<&'static str> {
         scan::GpuRoute::Gtx16 => {
             Some("GTX 16 系没有 Tensor Core，DLSS 帧生成在硬件上就不支持（换哪个版本都没用）")
         }
+        // Pascal 及更早、MX、Quadro/Tesla：同上，硬件就不支持，拦下来别让用户白忙
+        scan::GpuRoute::NoTensorCore => {
+            Some("这块显卡没有 Tensor Core（Pascal 及更早 / MX / Quadro），DLSS 帧生成在硬件上就不支持")
+        }
         _ => None,
     }
 }
@@ -1025,7 +1038,11 @@ fn sourcetest() -> usize {
     );
     let el = t0.elapsed().as_secs_f64();
     let msg1 = match &r1 {
-        Ok(_) => "成功".to_owned(),
+        Ok(_) => {
+            // download() 只写到 .part：校验通过后才落盘（和线上路径一致）
+            let _ = update::commit_download(&d1);
+            "成功".to_owned()
+        }
         Err(e) => e.to_string(),
     };
     ck(&mut fails, r1.is_ok(), &format!("慢源照样下完（{el:.1} 秒）：{msg1}"));
@@ -1063,6 +1080,9 @@ fn sourcetest() -> usize {
         "本地小源",
     );
     println!("-- 小文件 --");
+    if r2.is_ok() {
+        let _ = update::commit_download(&d2);
+    }
     ck(&mut fails, r2.is_ok(), "512 KB 的文件正常下完");
     ck(
         &mut fails,
@@ -1582,7 +1602,16 @@ fn selftest() -> usize {
         ("NVIDIA GeForce GTX 1630", scan::GpuRoute::Gtx16),
         ("NVIDIA GeForce RTX 4070", scan::GpuRoute::NotNeeded),
         ("AMD Radeon RX 6800 XT", scan::GpuRoute::Unsupported),
-        ("NVIDIA GeForce GT 1030", scan::GpuRoute::Unknown),
+        // Pascal 及更早 / MX / Quadro：都没有 Tensor Core，装上也白装 ——
+        // 以前这些落到 Unknown 会被闸门静默放行（用户按流程做完发现没效果）。
+        ("NVIDIA GeForce GT 1030", scan::GpuRoute::NoTensorCore),
+        ("NVIDIA GeForce GTX 1060", scan::GpuRoute::NoTensorCore),
+        ("NVIDIA GeForce GTX 1080 Ti", scan::GpuRoute::NoTensorCore),
+        ("NVIDIA GeForce MX150", scan::GpuRoute::NoTensorCore),
+        ("NVIDIA Quadro P2000", scan::GpuRoute::NoTensorCore),
+        // 认不出来的（比如以后的新型号）仍然是 Unknown：**不能**当成旧卡去拦，
+        // 否则每出一代新卡用户都会被自己的工具挡住。
+        ("NVIDIA GeForce RTX 9090", scan::GpuRoute::Unknown),
     ] {
         ck(
             &mut fails,
@@ -2195,6 +2224,36 @@ fn selftest() -> usize {
         }
     }
 
+    // ---- 路径归一化 / 长路径 / 版本号归一 ----
+    println!("\n--- 路径与版本号工具 ---");
+    {
+        // 92 = 反斜杠，63 = '?'：用字节拼出来，源码里就不必写转义
+        let verbatim = String::from_utf8(vec![92u8, 92, 63, 92]).unwrap();
+        ck(
+            &mut fails,
+            scan::path_key(Path::new("D:/Games/X/")) == scan::path_key(Path::new("d:\\games\\x")),
+            "同一个目录的不同写法归一化后相同（忽略清单/去重靠它）",
+        );
+        ck(
+            &mut fails,
+            util::long_path(Path::new("C:\\short\\x.dll")) == PathBuf::from("C:\\short\\x.dll"),
+            "短路径不加 verbatim 前缀（免得改变别的语义）",
+        );
+        let deep = format!("C:\\{}\\x.dll", "a".repeat(250));
+        ck(
+            &mut fails,
+            util::long_path(Path::new(&deep))
+                .to_string_lossy()
+                .starts_with(&verbatim),
+            "超长路径自动加 verbatim 前缀（绕开 260 字符上限）",
+        );
+        ck(
+            &mut fails,
+            update::same_version_pub("0.3.5", "v0.3.5"),
+            "版本号 0.3.5 和 v0.3.5 算同一个版本（镜像回退时要求两家一致）",
+        );
+    }
+
     // ---- 导入时的「版本对照」 ----
     // 上游源码包里根目录和 archive/0.2.4/ 各有一份 README，版本号不同：挑错会出现
     // 「装的明明是当前版、界面却说这是 0.2.4」。
@@ -2325,8 +2384,11 @@ fn canceltest() -> usize {
             progress: &mut |_, _, _| {},
         },
         Some(&remote.etag),
-        "",
-        false,
+        update::SourcePolicy {
+            prefix: "",
+            prefer_mirror: false,
+            official_only: false,
+        },
         &|_p| Ok(()),
     );
 
@@ -2421,8 +2483,11 @@ fn downloadtest() -> usize {
             },
         },
         Some(&remote.etag),
-        "",
-        false,
+        update::SourcePolicy {
+            prefix: "",
+            prefer_mirror: false,
+            official_only: false,
+        },
         &|_p| Ok(()),
     ) {
         Ok(dl) => {
@@ -2758,9 +2823,17 @@ fn deploytest() -> usize {
 -- 反作弊闸门 --");
     let t3 = root.join("ac");
     let _ = fs::create_dir_all(t3.join("EasyAntiCheat"));
+    // 光有一个同名目录不算内核级：那可能只是卸载残留或启动器。
+    // （以前这里按内核级算，于是只剩一个用户态组件的游戏也会弹「封号风险」，
+    //   和同一份文件里服务表的判定自相矛盾。）
+    check!(
+        !anticheat::scan_deep(&t3).is_blocked(),
+        "只有 EasyAntiCheat 目录、没有驱动文件时算用户态，不阻止"
+    );
+    fs::write(t3.join("EasyAntiCheat").join("EasyAntiCheat.sys"), b"x").unwrap();
     check!(
         anticheat::scan_deep(&t3).is_blocked(),
-        "含 EasyAntiCheat 目录被判为内核级并阻止"
+        "目录里有 EasyAntiCheat.sys 才判内核级并阻止"
     );
     // scan_game_dir() 会顺带检查最多 4 级**祖先**目录（EAC / BattlEye 通常装在游戏
     // 根目录，而部署目标可能是 ...\Binaries\Win64）。所以这个「干净目录」必须放得足够深，
@@ -2777,9 +2850,12 @@ fn deploytest() -> usize {
     let t5 = root.join("anc").join("Binaries").join("Win64");
     let _ = fs::create_dir_all(&t5);
     let _ = fs::create_dir_all(root.join("anc").join("EasyAntiCheat"));
+    // 用 EAC 的真实布局：驱动文件就在**游戏根**目录里（部署目标在 Binaries\Win64 下面），
+    // 祖先扫描必须能靠它判出内核级。
+    fs::write(root.join("anc").join("EasyAntiCheat.sys"), b"x").unwrap();
     check!(
         anticheat::scan_deep(&t5).is_blocked(),
-        "标记在祖先目录（游戏根）时同样阻止部署"
+        "祖先目录里有驱动文件时同样阻止部署"
     );
 
     // ---- 已装过本项目：允许覆盖（这是「判断用户是否手动装过」的核心行为）----
@@ -3076,6 +3152,8 @@ enum Msg {
     ImportStaged(importer::StageResult, importer::Versions),
     /// 手动导入：写盘完成，带回给用户看的结果清单
     ImportDone(String),
+    /// 「存到游戏库」的后台分析结果（缓存行 + 拼好的列表行）
+    ManualAdded(Box<(scan::CachedRow, Option<GameRow>)>, String),
     UpdateChecked(UpdateSummary),
     /// 文案 / 总进度 / 总字节数（0 表示还没算出来）
     Progress(String, f32, u64),
@@ -3188,6 +3266,8 @@ struct App {
     kernel_ac_pending: Option<AcReport>,
     /// 用户这次选择了「仍要部署」。只对本次生效，部署完就清掉。
     allow_kernel_ac: bool,
+    /// 用户在等后台反作弊扫描；扫完自动继续部署（避免在 UI 线程里遍历整个游戏目录）
+    deploy_after_scan: bool,
     /// 用户在「另一个代理」弹窗里定下来的选择，等真正部署时用
 
     // ---- 硬件加速 GPU 计划（DLSS 帧生成的系统前提，只读 + 跳转，绝不写注册表）
@@ -3333,6 +3413,7 @@ impl App {
             confirm_old_driver: false,
             kernel_ac_pending: None,
             allow_kernel_ac: false,
+            deploy_after_scan: false,
                 hags_fake: match std::env::var("DLSSG_FAKE_HAGS").ok().as_deref() {
                 Some("on") | Some("2") => Some(gpu::HagsState::Enabled),
                 Some("off") | Some("1") => Some(gpu::HagsState::Disabled),
@@ -3496,33 +3577,37 @@ impl App {
             return;
         }
         // 用户又把它加回来了，就别再忽略它
-        let key = dir.display().to_string();
+        let key = scan::path_key(&dir);
         self.ignored.retain(|s| s != &key);
         let entry = scan::manual_entry(&dir);
         let name = entry.name.clone();
-        let cached = scan::CachedRow {
-            entry,
-            render_exe: scan::find_render_exe(&dir),
-            ac: self
-                .ac_target
-                .as_ref()
-                .map(|r| r.verdict())
-                .unwrap_or(AcTier::None),
-        };
-        if let Some(row) = Self::build_cached_row(&cached, true) {
-            self.games.push(row);
-        }
-        self.manual.push(cached);
-        self.scanned = true;
-        self.status = format!("已把「{name}」存进游戏库");
-        self.note(format!("存进游戏库：{}", dir.display()));
-        self.persist_library();
+        let ac_tier = self
+            .ac_target
+            .as_ref()
+            .map(|r| r.verdict())
+            .unwrap_or(AcTier::None);
+        // 找渲染 EXE 要遍历整个游戏目录（最多 3 万项）、建行还要扫反作弊和读部署状态。
+        // 这些**不能**在 UI 线程里做：大目录或网络盘上窗口会直接被系统标成「未响应」。
+        self.busy = true;
+        self.status = format!("正在分析「{name}」...");
+        self.spawn(move |tx, ctx| {
+            let cached = scan::CachedRow {
+                entry,
+                render_exe: scan::find_render_exe(&dir),
+                ac: ac_tier,
+            };
+            let row = App::build_cached_row(&cached, true);
+            let _ = tx.send(Msg::ManualAdded(Box::new((cached, row)), name));
+            ctx.request_repaint();
+        });
     }
 
     /// 把这个目录从游戏库移除（扫描出来的和手动加的都能移），并记进忽略清单，
     /// 这样重新扫描也不会再冒出来。只动列表，游戏目录里的文件一律不碰。
     fn remove_from_library(&mut self, dir: &Path) {
-        let key = dir.display().to_string();
+        // 归一化 key：D:\Games\X 和 d:/games/x/ 是同一个目录。用原样字符串比，
+        // 用户「移除了、下次扫描又冒出来」就是这么来的。
+        let key = scan::path_key(dir);
         self.manual.retain(|c| c.entry.install_dir != dir);
         self.games.retain(|r| r.entry.install_dir != dir);
         if !self.ignored.iter().any(|s| s == &key) {
@@ -3535,7 +3620,7 @@ impl App {
 
     /// 某个目录是不是被用户忽略过
     fn is_ignored(&self, dir: &Path) -> bool {
-        let key = dir.display().to_string();
+        let key = scan::path_key(dir);
         self.ignored.iter().any(|s| s == &key)
     }
 
@@ -3913,11 +3998,38 @@ impl App {
                 };
             }
             Msg::AcScanned(dir, rep) => {
-                self.ac_scanning = false;
+                // **只有最新一次扫描的结果才配清掉「分析中」。**连续换目录时，
+                // 前一个目录的结果先回来会把提示提前撤掉，界面说「选择目录后自动检测」
+                // 而实际上第二个目录还在扫。
+                if self.game_dir.is_none() {
+                    self.ac_scanning = false;
+                }
                 // 用户可能已经换了目录，过期的结果丢掉
                 if self.game_dir.as_deref() == Some(dir.as_path()) {
+                    // 这一份就是当前目录的结果：这时清「分析中」才是对的
+                    self.ac_scanning = false;
                     self.ac_target = Some(rep);
+                    // 有人在等这次扫描才敢部署（do_deploy 判断要遍历目录就先挂起了）
+                    if self.deploy_after_scan {
+                        self.deploy_after_scan = false;
+                        self.do_deploy();
+                    }
+                } else if self.deploy_after_scan {
+                    // 目录已经换了：这次结果没用，别把用户永远挂在「稍后继续」上
+                    self.deploy_after_scan = false;
+                    self.status = "部署目录已改变，请重新点「部署」".to_owned();
                 }
+            }
+            Msg::ManualAdded(payload, name) => {
+                let (cached, row) = *payload;
+                if let Some(row) = row {
+                    self.games.push(row);
+                }
+                self.manual.push(cached);
+                self.scanned = true;
+                self.persist_library();
+                self.note(format!("存进游戏库：{name}"));
+                self.finish_busy(format!("已把「{name}」存进游戏库"));
             }
             Msg::ImportStaged(res, versions) => {
                 self.import_notes = res.notes;
@@ -3975,6 +4087,9 @@ impl App {
             Msg::SelfUpdateFailed(e) => {
                 self.progress = None;
                 self.busy = false;
+                // **必须清掉取消句柄**：任务已经结束了，留着它会让「下载 / 更新资产」
+                // 被「取消下载」顶掉，用户只能重启程序才能再下载资产。
+                self.cancel = None;
                 self.status = format!("自动更新失败：{e}");
                 self.note("已为你打开发布页，可以手动下载新版".to_owned());
                 if let Err(e2) = util::open_url(update::RELEASES_URL) {
@@ -4065,6 +4180,11 @@ impl App {
                 }
             }
             Msg::Failed(e) => {
+                // 任务失败也要把「本次部署」的状态清干净：否则下一次任意任务完成时会
+                // 拼上这次失败的部署说明、还会弹硬件加速提示（因果全错）。
+                self.deploy_in_flight = false;
+                self.deploy_notes.clear();
+                self.allow_kernel_ac = false;
                 // 走统一收尾：漏了清 import_busy 的话，导入失败后那个转圈会一直转
                 let m = format!("错误: {e}");
                 self.note(m.clone());
@@ -4282,6 +4402,10 @@ impl App {
             self.finish_busy("没有可导入的文件");
             return;
         }
+        // 置忙：确认弹窗那一步已经把 busy 清成 false 了，不置的话用户在写入期间
+        // 还能点下载/部署 —— 两边会同时 read-modify-write 同一份资产记录。
+        self.busy = true;
+        self.import_busy = true;
         self.status = format!("正在写入 {} 个文件 ...", keep.len());
         let notes = self.import_notes.clone();
         self.spawn(move |tx, ctx| {
@@ -4579,8 +4703,13 @@ impl App {
                             },
                         },
                         Some(&it.etag),
-                        &prefix,
-                        is_dll,
+                        update::SourcePolicy {
+                            prefix: &prefix,
+                            prefer_mirror: is_dll,
+                            // 没有签名可验的 ini：**只允许官方源**。镜像可以不返回 ETag，
+                            // 那样指纹比对整段被跳过，等于把来路不明的配置写进游戏目录。
+                            official_only: !is_dll,
+                        },
                         &verifier,
                     )?;
 
@@ -4670,8 +4799,16 @@ impl App {
                 };
                 update::stage_self_update(&c, &v, &cancel, &mut cb)
             })();
+            // 和 start_download 一样：用户自己点的取消不是「失败」，别把它报成失败
+            // 还顺手打开浏览器（那会让用户以为程序出问题了）。
             let _ = tx.send(match r {
                 Ok(s) => Msg::SelfUpdateStaged(Box::new(s)),
+                Err(e)
+                    if cancel.load(Ordering::Relaxed)
+                        || e.to_string().contains(update::CANCELLED_MSG) =>
+                {
+                    Msg::Cancelled
+                }
                 Err(e) => Msg::SelfUpdateFailed(format!("{e:#}")),
             });
         });
@@ -4696,14 +4833,33 @@ impl App {
         cmd.arg("/SILENT")
             .arg("/NORESTART")
             .arg(format!("/DIR={}", dir.display()));
+        self.status = "正在安装新版本...".to_owned();
         match cmd.spawn() {
-            Ok(_) => {
+            Ok(mut child) => {
                 log::line(&format!(
                     "自更新：已启动安装程序 {}（装到 {}）",
                     installer.display(),
                     dir.display()
                 ));
-                self.ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                // **等它退出并看退出码。**以前 spawn 完就关自己：安装包被杀软拦下、
+                // UAC 被点「否」、目标目录不可写时，用户只看到程序自己关了 ——
+                // 没有任何提示，也不知道其实还是旧版（下次启动照样提示有更新）。
+                match child.wait() {
+                    Ok(st) if st.success() => {
+                        self.ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                    Ok(st) => {
+                        self.finish_busy(format!(
+                            "安装程序退出码 {st}：可能被杀软拦下或权限不足，本程序没有更新，请手动安装 {}",
+                            installer.display()
+                        ));
+                        open_in_explorer(&dir);
+                    }
+                    Err(e) => {
+                        self.finish_busy(format!("等安装程序结束失败：{e}（请手动安装）"));
+                        open_in_explorer(&dir);
+                    }
+                }
             }
             Err(e) => {
                 self.status = format!("启动更新安装程序失败：{e}");
@@ -4743,6 +4899,11 @@ impl App {
         }
         self.speed_testing = true;
         self.busy = true;
+        // 清掉上一次下载留下的字节数/速度/剩余时间：测速的进度回调不带 total，
+        // 不清的话进度区会挂着上次那条「15.0 MB / 15.0 MB · 0.00 MB/s」的假数据。
+        self.dl_started = None;
+        self.dl_total = 0;
+        self.dl_done = 0;
         self.status = "正在测速（每个源拉 512 KB，最多几秒）...".to_owned();
         self.spawn(|tx, ctx| {
             let cancel = AtomicBool::new(false);
@@ -4807,9 +4968,28 @@ impl App {
         // 反作弊闸门：检出内核级时**先弹窗问一句**，而不是直接拦死。
         // 用户明确要求可以继续 —— 但默认动作仍然是「取消部署」，而且不管选哪个
         // 都会写进日志，将来真出问题能追溯。
-        let ac = anticheat::scan_deep(&dir);
+        // **不在 UI 线程里扫目录**：scan_deep 要遍历整个游戏目录（网络盘上能卡几十秒，
+        // 窗口会被系统标成「未响应」）。用后台那次的结果；还没有就让后台去扫，
+        // 扫完自动接着走（见 Msg::AcScanned 里的 deploy_after_scan）。
+        let ac = match self.ac_target.clone() {
+            Some(rep) => rep,
+            None => {
+                if !self.ac_scanning {
+                    self.start_ac_scan(dir.clone());
+                }
+                self.deploy_after_scan = true;
+                self.status = "正在后台分析反作弊，稍后自动继续…".to_owned();
+                return;
+            }
+        };
         let blocked = ac.is_blocked();
-        if blocked && !self.allow_kernel_ac {
+        // 目录太多、反作弊没扫完时也要问一句：**没检出 ≠ 干净**。
+        let needs_confirm = blocked || ac.truncated;
+        // 「仅本次生效」的开关取出来就复位：不复位的话它会在部署失败后一直留着，
+        // 下一个内核级游戏会**静默跳过封号风险确认**。
+        let allow_kernel_ac = self.allow_kernel_ac;
+        self.allow_kernel_ac = false;
+        if needs_confirm && !allow_kernel_ac {
             self.ac_target = Some(ac.clone());
             self.kernel_ac_pending = Some(ac);
             return;
@@ -5200,6 +5380,7 @@ impl eframe::App for App {
                                 scan::GpuRoute::Sm86 => ("SM86 路由", theme::OK),
                                 scan::GpuRoute::Sm75 => ("SM75 路由", theme::OK),
                                 scan::GpuRoute::Gtx16 => ("不支持", theme::DANGER),
+                                scan::GpuRoute::NoTensorCore => ("不支持（无 Tensor Core）", theme::DANGER),
                                 scan::GpuRoute::NotNeeded => ("不需要本 Mod", theme::WARN),
                                 scan::GpuRoute::Unsupported => ("不适用", theme::DANGER),
                                 scan::GpuRoute::Unknown => ("未识别", theme::NEUTRAL),
@@ -6499,7 +6680,14 @@ impl eframe::App for App {
             let ctx = self.ctx.clone();
             let mut go = false;
             let mut cancel = false;
-            egui::Window::new("该游戏检测到内核级反作弊")
+            // 没扫完时标题和说明都要换，别让用户以为真的检出了什么
+            let only_truncated = ac.hits.is_empty() && ac.truncated;
+            let title = if only_truncated {
+                "反作弊扫描没有扫完"
+            } else {
+                "该游戏检测到内核级反作弊"
+            };
+            egui::Window::new(title)
                 .collapsible(false)
                 .resizable(false)
                 .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
@@ -6515,6 +6703,13 @@ impl eframe::App for App {
                         if !h.evidence.is_empty() {
                             ui.label(theme::hint(h.evidence.clone()));
                         }
+                    }
+                    if ac.truncated {
+                        ui.label(theme::hint(format!(
+                            "这个游戏目录太大，反作弊扫描只看了前 {} 个目录就停了 —— 没检出不等于没有，请你自行确认。",
+                            anticheat::MAX_SCAN_DIRS
+                        )));
+                        ui.add_space(4.0);
                     }
                     ui.add_space(6.0);
                     ui.label(

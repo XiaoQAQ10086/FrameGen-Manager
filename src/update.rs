@@ -130,8 +130,10 @@ pub fn client() -> Result<reqwest::blocking::Client> {
         // reqwest 的阻塞读每调用一次就重新计时，所以只要服务器还在往外吐字节，
         // 多慢都能慢慢下完 —— 用户线路慢不该被掐断。
         // （按「平均速度低于 300 KB/s 就换源」会把慢线路掐断，只下到四分之一。）
-        // 它现在只兜底一件事：源彻底不动了 —— 连续 300 秒一个字节都没有才判它死。
-        .timeout(Duration::from_secs(300))
+        // 它现在只兜底一件事：源彻底不动了 —— 连续 60 秒一个字节都没有才判它死。
+        // 这个值同时也是「点取消之后最长还要等多久」：读卡住时取消要等这次读返回，
+        // 300 秒会让用户以为程序死了（界面上的按钮全是灰的）。
+        .timeout(Duration::from_secs(60))
         // 连接超时别设太长：源被墙时每个候选都要空等这么久。
         // 能用的源 1 秒内就连上了，8 秒足够宽容。
         .connect_timeout(Duration::from_secs(8))
@@ -230,25 +232,65 @@ pub const RELEASES_URL: &str = "https://github.com/XiaoQAQ10086/FrameGen-Manager
 /// 不一样，所以这里改成**所有源都问、取最大的版本号**。
 pub fn fetch_latest_self_version(client: &reqwest::blocking::Client) -> Option<String> {
     let official = format!("https://raw.githubusercontent.com/{SELF_REPO}/main/Cargo.toml");
-    let mut urls = vec![official.clone()];
+    let mut sources = vec![(official.clone(), true)];
     for m in mirrors("") {
-        urls.push(format!("{m}{official}"));
+        sources.push((format!("{m}{official}"), false));
     }
 
-    // 所有源**并发**问，取报出来的最大版本号。
-    // 并发是为了让总耗时约等于最慢的那一个请求，而不是几个请求相加。
+    // 所有源**并发**问（总耗时约等于最慢那个，而不是相加）。
     let (tx, rx) = std::sync::mpsc::channel();
-    for url in urls {
+    for (url, is_official) in sources {
         let c = client.clone();
         let tx = tx.clone();
         std::thread::spawn(move || {
-            let _ = tx.send(fetch_self_version_one(&c, &url));
+            let _ = tx.send((is_official, fetch_self_version_one(&c, &url)));
         });
     }
     // 把主线程手里这个发送端丢掉，rx.iter() 才会在那些线程都结束后收完
     drop(tx);
 
-    pick_latest(rx.iter().flatten())
+    let mut mirror_heard: Vec<String> = Vec::new();
+    for (is_official, v) in rx.iter() {
+        let Some(v) = v else { continue };
+        if parse_version(&v).is_none() {
+            continue;
+        }
+        if is_official {
+            // **官方源说了算。** 镜像只是加速通道，不该有资格宣布版本号 ——
+            // 以前这里是「所有源取最大的那个」，等于任何一个镜像都能让程序去下载
+            // 并静默执行它指定的安装包。代价是官方 raw 缓存偶尔落后几分钟：
+            // 那只是晚一会儿看到更新提示，比上面那条路好得多。
+            return Some(v);
+        }
+        mirror_heard.push(v);
+    }
+
+    // 官方 raw 拿不到时（国内常见）才退到镜像，而且要求**至少两个镜像报同一个版本**：
+    // 单个镜像被控或返回错内容时，不足以让程序去下载并执行它指定的东西。
+    let mut best: Option<String> = None;
+    for v in &mirror_heard {
+        let agree = mirror_heard.iter().filter(|x| same_version(x, v)).count();
+        if agree < 2 {
+            continue;
+        }
+        if best.as_ref().map(|b| is_newer(v, b)).unwrap_or(true) {
+            best = Some(v.clone());
+        }
+    }
+    best
+}
+
+/// 给自测用的入口（见上的说明）。
+pub fn same_version_pub(a: &str, b: &str) -> bool {
+    same_version(a, b)
+}
+
+/// 两个版本号是不是同一个版本（解析不出来的都算不同）。
+fn same_version(a: &str, b: &str) -> bool {
+    match (parse_version(a), parse_version(b)) {
+        (Some(x), Some(y)) => x == y,
+        _ => false,
+    }
 }
 
 /// 从一组候选里挑出**最大**的版本号。解析不出来的直接忽略 ——
@@ -574,6 +616,16 @@ pub fn local_is_current(
         .unwrap_or(false)
 }
 
+/// 校验通过后，把下载好的 .part 落到正式位置。
+///
+/// download() 只负责写到 .part —— 内容校验（签名/大小）必须在替换之前完成，
+/// 否则「所有源都校验失败」时坏内容已经把资产目录里那份好文件顶掉了。
+pub fn commit_download(dest: &Path) -> Result<()> {
+    util::atomic_replace(&part_path(dest), dest)?;
+    util::clear_motw(dest);
+    Ok(())
+}
+
 /// 一次下载的「写到哪、谁能叫停、进度报给谁」。
 ///
 /// 捆成一个结构体的唯一原因是**别再让参数表无节制地长下去** ——
@@ -585,6 +637,18 @@ pub struct Sink<'a> {
     pub cancel: &'a AtomicBool,
     /// 进度回调：(已下字节, 总字节[0 = 未知], 正在用哪个源)
     pub progress: &'a mut dyn FnMut(u64, u64, &str),
+}
+
+/// 这个文件允许从哪些源拿。和 Sink 一样，捆起来是为了别让参数表无节制地长。
+#[derive(Clone, Copy)]
+pub struct SourcePolicy<'a> {
+    /// 用户指定的镜像前缀（空 = 自动挑）
+    pub prefix: &'a str,
+    /// 下载时先试镜像。DLL 走这条：镜像快几十倍，内容真实性由签名兜底。
+    pub prefer_mirror: bool,
+    /// **只允许官方源。** 没有签名可验的文件（dlssg_sm86.ini、SHA256SUMS.txt）必须走这条：
+    /// 镜像可以不返回 ETag，那时指纹比对整段被跳过，等于把一份没人校验过的内容装进去。
+    pub official_only: bool,
 }
 
 /// 自动选源下载一个仓库文件。这就是界面上「下载 / 更新资产」走的路径，
@@ -606,12 +670,16 @@ pub fn download_auto(
     repo_path: &str,
     sink: Sink<'_>,
     expect_etag: Option<&str>,
-    custom_prefix: &str,
-    prefer_mirror: bool,
+    policy: SourcePolicy<'_>,
     verify: &dyn Fn(&Path) -> Result<()>,
 ) -> Result<Downloaded> {
     let official = official_url(repo_path);
-    let ms = mirrors(custom_prefix);
+    let ms = if policy.official_only {
+        Vec::new()
+    } else {
+        mirrors(policy.prefix)
+    };
+    let prefer_mirror = policy.prefer_mirror;
     let (dest, cancel) = (sink.dest, sink.cancel);
     try_sources(&official, &ms, prefer_mirror, Some(cancel), |url, src| {
         let t0 = Instant::now();
@@ -630,18 +698,23 @@ pub fn download_auto(
         let secs = t0.elapsed().as_secs_f64();
         match r {
             Ok(dl) => {
+                let tmp = part_path(dest);
+                // 先校验临时文件，再替换目标：任何源失败都不会破坏已有的好文件
+                if let Err(e) = verify(&tmp) {
+                    crate::log::line(&format!(
+                        "校验失败 {repo_path} <- {}：{e}",
+                        source_label(src)
+                    ));
+                    let _ = std::fs::remove_file(&tmp);
+                    return Err(e);
+                }
                 crate::log::line(&format!(
                     "下载成功 {repo_path} <- {}  {} 字节  {secs:.1}s",
                     source_label(src),
                     dl.bytes
                 ));
-                if let Err(e) = verify(dest) {
-                    crate::log::line(&format!(
-                        "校验失败 {repo_path} <- {}：{e}",
-                        source_label(src)
-                    ));
-                    return Err(e);
-                }
+                let _ = &tmp;
+                commit_download(dest)?;
                 Ok(dl)
             }
             Err(e) => {
@@ -699,6 +772,11 @@ pub fn download(
     let mut req = client.get(url);
     if resume > 0 {
         req = req.header("Range", format!("bytes={resume}-"));
+        // If-Range：远端内容已经变了就别续传，否则会拼出「旧头 + 新尾」的混合文件。
+        // 服务端不按它回 206 时下面的分支会把 resume 归零、从头下。
+        if let Some(exp) = expect_etag {
+            req = req.header("If-Range", exp);
+        }
     }
     let mut resp = req
         .send()
@@ -706,6 +784,11 @@ pub fn download(
     let status = resp.status();
     if status == reqwest::StatusCode::PARTIAL_CONTENT && resume > 0 {
         crate::log::line(&format!("断点续传 {repo_path}：从 {resume} 字节接着下"));
+    } else if status == reqwest::StatusCode::RANGE_NOT_SATISFIABLE && resume > 0 {
+        // 上次那条 .part 已经比远端内容还长（远端变小了）：它没用了，丢掉重下，
+        // 否则每个源都会在这里失败、用户点多少次都下不动。
+        let _ = std::fs::remove_file(&tmp);
+        bail!("上次没下完的临时文件已过期，已丢弃：请再点一次下载");
     } else if status.is_success() {
         // 服务器不支持 Range（回 200），只能从头下
         resume = 0;
@@ -719,19 +802,22 @@ pub fn download(
         .map(|n| n + resume)
         .unwrap_or(0);
 
-    let mut buf: Vec<u8> = Vec::with_capacity(total as usize);
+    // **流式写盘**：以前是把整份内容收进 Vec（nvngx_dlss.dll 有 56 MB，
+    // 增长期间还可能翻倍）。现在边下边写 .part，内存占用与文件大小无关；
+    // 校验和在下完之后从文件算。
     if resume > 0 {
-        if let Ok(old) = std::fs::read(&tmp) {
-            buf = old;
-        }
-        if buf.len() as u64 != resume {
-            buf.clear();
+        // .part 大小和 Range 起点对不上（被别人动过）就重下
+        let real = std::fs::metadata(&tmp).map(|m| m.len()).unwrap_or(0);
+        if real != resume {
             resume = 0;
         }
     }
-    if resume == 0 {
+    let mut out = if resume > 0 {
+        std::fs::OpenOptions::new().append(true).open(&tmp)?
+    } else {
         let _ = std::fs::remove_file(&tmp);
-    }
+        std::fs::File::create(&tmp)?
+    };
     let mut chunk = vec![0u8; 64 * 1024];
     let mut got: u64 = resume;
     // 只记总耗时，供下完后记录测速值用 —— 不再按速度拦任何东西。
@@ -749,10 +835,15 @@ pub fn download(
         if n == 0 {
             break;
         }
-        buf.extend_from_slice(&chunk[..n]);
+        use std::io::Write;
+        out.write_all(&chunk[..n])
+            .map_err(|e| anyhow::anyhow!("写临时文件失败：{e}"))?;
         got += n as u64;
         progress(got, total, &tag);
     }
+    use std::io::Write;
+    out.flush()?;
+    drop(out);
 
     // 指纹比对：下载响应说的必须是同一份内容
     if let (Some(exp), Some(got)) = (expect_etag, &resp_etag) {
@@ -764,25 +855,22 @@ pub fn download(
         }
     }
     // 长度比对：防截断
-    if total > 0 && buf.len() as u64 != total {
+    if total > 0 && got != total {
         let _ = std::fs::remove_file(&tmp);
-        bail!(
-            "下载不完整：{repo_path} 期望 {total} 字节，实际只收到 {} 字节，已丢弃",
-            buf.len()
-        );
+        bail!("下载不完整：{repo_path} 期望 {total} 字节，实际只收到 {got} 字节，已丢弃");
     }
 
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(&tmp, &buf)?;
-    util::atomic_replace(&tmp, dest)?;
-    util::clear_motw(dest);
-    record_download_speed(source, buf.len() as u64, t0.elapsed().as_secs_f64());
+    // 只写临时文件，**不**替换目标：内容校验交给调用方（download_auto / download_with_mirror），
+    // 校验通过才 atomic_replace。否则「所有源都校验失败」时，坏内容已经把资产目录里
+    // 那份好文件顶掉了 —— 镜像返回 HTML 错误页就是这么把可用资产弄坏的。
+    record_download_speed(source, got, t0.elapsed().as_secs_f64());
     Ok(Downloaded {
-        bytes: buf.len() as u64,
-        sha256: util::sha256_hex(&buf),
-        blob_sha: util::git_blob_sha1(&buf),
+        bytes: got,
+        sha256: util::sha256_file(&tmp).unwrap_or_default(),
+        blob_sha: util::git_blob_sha1_file(&tmp).unwrap_or_default(),
         etag: resp_etag,
     })
 }
@@ -820,22 +908,37 @@ fn legacy_state_paths() -> Vec<PathBuf> {
     out
 }
 
-fn read_state(p: &Path) -> Option<UpdateState> {
-    std::fs::read_to_string(p)
-        .ok()
-        .and_then(|t| serde_json::from_str(&t).ok())
+/// 读记录。Ok(Some) = 读到了；Ok(None) = 没有这个文件；Err = 文件在但坏了。
+fn read_state(p: &Path) -> std::result::Result<Option<UpdateState>, String> {
+    if !p.is_file() {
+        return Ok(None);
+    }
+    let text = std::fs::read_to_string(p).map_err(|e| e.to_string())?;
+    match serde_json::from_str::<UpdateState>(&text) {
+        Ok(st) => Ok(Some(st)),
+        Err(e) => Err(e.to_string()),
+    }
 }
 
 pub fn load_state() -> UpdateState {
     if let Ok(p) = state_path() {
-        if let Some(st) = read_state(&p) {
-            return st;
+        match read_state(&p) {
+            Ok(Some(st)) => return st,
+            // 记录坏了**不能静默当成「没有记录」**：下一次保存会用空记录把它覆盖掉，
+            // 用户再也查不出「为什么所有资产都被要求重新下载」。留一份 .corrupt 证据。
+            Err(e) => {
+                crate::log::line(&format!(
+                    "下载记录解析失败（{e}）：已留一份 update_state.json.corrupt，本次按空记录处理"
+                ));
+                let _ = std::fs::rename(&p, p.with_extension("json.corrupt"));
+            }
+            Ok(None) => {}
         }
     }
     // 老版本留下的记录：读出来顺手迁到新位置。用户升级上来不该因为「记录换了地方」
     // 就重新下载一遍资产。老文件不删 —— 万一用户想退回去用老版本，那边还能用。
     for old in legacy_state_paths() {
-        if let Some(st) = read_state(&old) {
+        if let Ok(Some(st)) = read_state(&old) {
             let _ = save_state(&st);
             crate::log::line(&format!(
                 "下载记录已从 {} 迁到资产目录（记录跟着资产走，换机器不用重下）",
@@ -848,8 +951,12 @@ pub fn load_state() -> UpdateState {
 }
 
 pub fn save_state(state: &UpdateState) -> Result<()> {
-    std::fs::write(state_path()?, serde_json::to_string_pretty(state)?)?;
-    Ok(())
+    // **原子写。**直接 write 会先把原文件截断：中途断电/被杀就只剩半截 JSON，
+    // 下次启动所有资产都会被判成「需要重新下载」（白下十几 MB）。
+    let p = state_path()?;
+    let tmp = p.with_extension("json.tmp");
+    std::fs::write(&tmp, serde_json::to_string_pretty(state)?)?;
+    crate::util::atomic_replace(&tmp, &p).context("保存下载记录失败")
 }
 
 pub fn asset_path(name: &str) -> Result<PathBuf> {
@@ -1274,8 +1381,14 @@ fn download_with_mirror(
     dest: &Path,
     cancel: &AtomicBool,
     progress: &mut dyn FnMut(u64, u64, &str),
+    // 只允许官方源。**没有签名可验的文件（SHA256SUMS.txt）必须走这条**：
+    // 哈希清单和安装包如果来自同一个镜像，那份校验就等于自己给自己发证。
+    official_only: bool,
+    // 期望的字节数（发布 API 报的大小）；给 Some 时对不上就丢弃并换源。
+    // 这是没有官方指纹可比时唯一能挡住「换个内容塞进来」的廉价信号。
+    expect_bytes: Option<u64>,
 ) -> Result<u64> {
-    let ms = mirrors("");
+    let ms = if official_only { Vec::new() } else { mirrors("") };
     // 报错/日志里用来称呼这个文件（比如 nvngx_dlssg_310.9.1.zip）
     let label = dest.file_name().and_then(|n| n.to_str()).unwrap_or("运行库");
     // 依次试每个镜像，最后兜底官方源。只看能不能下完，不看速度 ——
@@ -1298,6 +1411,20 @@ fn download_with_mirror(
             src,
         ) {
             Ok(dl) => {
+                let tmp = part_path(dest);
+                if let Some(want) = expect_bytes {
+                    let got = std::fs::metadata(&tmp).map(|m| m.len()).unwrap_or(0);
+                    if got != want {
+                        let _ = std::fs::remove_file(&tmp);
+                        crate::log::line(&format!(
+                            "大小不符 {} <- {}：期望 {want} 字节，实际 {got} 字节，已丢弃",
+                            dest.display(),
+                            source_label(src)
+                        ));
+                        return Err(anyhow::anyhow!("字节数不符（期望 {want}，实际 {got}）"));
+                    }
+                }
+                commit_download(dest)?;
                 crate::log::line(&format!(
                     "下载成功 {} <- {}  {} 字节  {:.1}s",
                     dest.display(),
@@ -1386,7 +1513,10 @@ pub fn stage_self_update(
     let sums_path = work.join("SHA256SUMS.txt");
     let dest = work.join(&setup);
 
-    // 1) 发布时给出的 SHA256 清单（很小，走镜像就行）
+    // 1) 发布时给出的 SHA256 清单。**只走官方源，不走镜像。**
+    //    以前这里和安装包一样走镜像：于是「哈希」和「被哈希的文件」来自同一台
+    //    第三方镜像，那份校验等于自己给自己发证 —— 镜像换掉两个文件就能通过，
+    //    而下一步是静默执行安装包。清单只有几百字节，走官方源不慢。
     progress(0, 0, "SHA256SUMS.txt");
     download_with_mirror(
         client,
@@ -1394,8 +1524,10 @@ pub fn stage_self_update(
         &sums_path,
         cancel,
         progress,
+        true,
+        None,
     )
-    .context("下载 SHA256SUMS.txt 失败")?;
+    .context("下载 SHA256SUMS.txt 失败（校验和必须来自官方源，不能走镜像；网络不通时请到发布页手动下载）")?;
     let sums = std::fs::read_to_string(&sums_path).context("读 SHA256SUMS.txt 失败")?;
     let want = parse_sha256sums(&sums, &setup).with_context(|| {
         format!("这次发布的 SHA256SUMS.txt 里没有 {setup}（老版本没带这个文件），只能手动下载安装包")
@@ -1412,6 +1544,8 @@ pub fn stage_self_update(
         &dest,
         cancel,
         progress,
+        false,
+        None,
     )
     .with_context(|| format!("下载 {setup} 失败"))?;
     crate::log::line("自更新：安装程序来自发布资产（镜像）");
@@ -1590,6 +1724,10 @@ pub struct ZipMeta {
     pub name: String,
     pub method: u16,
     pub comp_size: u64,
+    /// 解压后的字节数（来自中央目录）。用来给解压设上限（解压炸弹）。
+    pub uncomp_size: u64,
+    /// 中央目录里的 CRC32。解压完要对一遍 —— 内容坏了要当场发现。
+    pub crc32: u32,
     pub local_off: usize,
 }
 
@@ -1632,7 +1770,13 @@ pub fn zip_list(zip_path: &Path) -> Result<Vec<ZipMeta>> {
         bail!("zip 中央目录偏移越界");
     }
 
-    let mut cd = vec![0u8; len - cd_off];
+    // 中央目录理论上可以很大，但绝不可能是几百 MB。给个上限，
+    // 免得一个畸形 zip 让这里直接申请巨量内存（分配失败 = 进程直接 abort）。
+    let cd_len = len - cd_off;
+    if cd_len > 64 * 1024 * 1024 {
+        bail!("zip 中央目录异常大（{cd_len} 字节），拒绝解析");
+    }
+    let mut cd = vec![0u8; cd_len];
     f.seek(SeekFrom::Start(cd_off as u64))?;
     f.read_exact(&mut cd)?;
 
@@ -1643,7 +1787,14 @@ pub fn zip_list(zip_path: &Path) -> Result<Vec<ZipMeta>> {
             break;
         }
         let method = rd_u16le(&cd, p + 10);
+        let crc32 = rd_u32le(&cd, p + 16);
         let comp_size = rd_u32le(&cd, p + 20) as u64;
+        let uncomp_size = rd_u32le(&cd, p + 24) as u64;
+        // zip64 把真实值放在扩展段、这里留 0xFFFFFFFF 哨兵。本程序不支持 zip64：
+        // 与其按哨兵去解压出垃圾，不如明确报错（注释一直这么写，实现以前没做）。
+        if comp_size == 0xFFFF_FFFF || uncomp_size == 0xFFFF_FFFF {
+            bail!("这个 zip 用了 zip64 格式，本程序不支持（请用普通 zip 重新打包）");
+        }
         let name_len = rd_u16le(&cd, p + 28) as usize;
         let extra_len = rd_u16le(&cd, p + 30) as usize;
         let comment_len = rd_u16le(&cd, p + 32) as usize;
@@ -1656,9 +1807,19 @@ pub fn zip_list(zip_path: &Path) -> Result<Vec<ZipMeta>> {
             name,
             method,
             comp_size,
+            uncomp_size,
+            crc32,
             local_off,
         });
         p += 46 + name_len + extra_len + comment_len;
+    }
+    // 条目数对不上说明中央目录被截断/被别的工具改过：静默少解析几个文件
+    // 会让用户看到「导入成功」而其实要的文件根本没被看到。
+    if out.len() != count {
+        bail!(
+            "zip 中央目录不完整（声明 {count} 个条目，只解出 {} 个）",
+            out.len()
+        );
     }
     Ok(out)
 }
@@ -1685,25 +1846,82 @@ pub fn zip_extract_to(zip_path: &Path, meta: &ZipMeta, dest: &Path) -> Result<u6
     let mut out = std::fs::File::create(dest)
         .with_context(|| format!("创建 {}", dest.display()))?;
     let limited = f.take(meta.comp_size);
+    // 解压炸弹：只限压缩输入是不够的（deflate 最大能膨胀上千倍）。
+    // 输出一旦超过上限就当场停手并删掉半成品，别把用户磁盘写满。
+    // 上限取「硬上限」和「中央目录声明的解压后大小」里更小的那个：
+    // 声明得小、实际很大（解压炸弹）时也会当场停手。
+    let (n, got_crc) = {
+        let mut capped = LimitedWriter {
+            inner: &mut out,
+            left: MAX_EXTRACT_BYTES.min(meta.uncomp_size.max(1)),
+            crc: flate2::Crc::new(),
+        };
     let n = match meta.method {
-        0 => std::io::copy(&mut { limited }, &mut out)?,
+        0 => std::io::copy(&mut { limited }, &mut capped)?,
         8 => {
             let mut dec = flate2::read::DeflateDecoder::new(limited);
-            std::io::copy(&mut dec, &mut out)?
+            std::io::copy(&mut dec, &mut capped)?
         }
-        m => bail!("不支持的 zip 压缩方式 {m}"),
+        m => bail!("不支持的 zip 压缩方式 {m}（只支持存储和 deflate）"),
+        };
+        (n, capped.crc.sum())
     };
     out.flush()?;
+    // CRC 对不上说明内容坏了（中央目录的 CRC 是解压后内容的校验和）
+    if meta.crc32 != 0 && got_crc != meta.crc32 {
+        drop(out);
+        let _ = std::fs::remove_file(dest);
+        bail!(
+            "解压出来的内容和 zip 记录对不上（CRC32 {:08X} != {:08X}），已丢弃",
+            got_crc,
+            meta.crc32
+        );
+    }
     Ok(n)
 }
 
-/// 从 zip 里解出第一个 .dll 到 out_path，返回该条目名。
-pub fn zip_extract_dll(zip_path: &Path, out_path: &Path) -> Result<String> {
+/// 解压输出的硬上限。DLSS 运行库最大约 56 MB，256 MB 足够宽松。
+const MAX_EXTRACT_BYTES: u64 = 256 * 1024 * 1024;
+
+/// 带上限的写出器：超限就报错，同时算 CRC32。
+struct LimitedWriter<W: std::io::Write> {
+    inner: W,
+    left: u64,
+    crc: flate2::Crc,
+}
+
+impl<W: std::io::Write> std::io::Write for LimitedWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if buf.len() as u64 > self.left {
+            return Err(std::io::Error::other(
+                "解压结果超过上限（可能是解压炸弹），已中止",
+            ));
+        }
+        self.crc.update(buf);
+        self.left -= buf.len() as u64;
+        self.inner.write(buf)
+    }
+    fn flush(&mut self) -> std::io::Result<()> { self.inner.flush() }
+}
+
+/// 从 zip 里解出**指定名字**的 .dll 到 out_path，返回该条目名。
+///
+/// 必须点名：以前取「第一个 .dll」，于是任何第三方包只要塞一个别的 NVIDIA 签名
+/// DLL（旧版、或系统里别的 DLL 改名）就能顶替要装的运行库。
+pub fn zip_extract_dll(zip_path: &Path, out_path: &Path, want: &str) -> Result<String> {
     let list = zip_list(zip_path)?;
+    let want_l = want.to_ascii_lowercase();
     let meta = list
         .iter()
-        .find(|m| !m.name.ends_with('/') && m.name.to_ascii_lowercase().ends_with(".dll"))
-        .context("zip 里没有 .dll 文件")?;
+        .find(|m| {
+            !m.name.ends_with('/')
+                && m.name
+                    .rsplit(['/', '\\'])
+                    .next()
+                    .map(|b| b.eq_ignore_ascii_case(&want_l))
+                    .unwrap_or(false)
+        })
+        .with_context(|| format!("zip 里没有 {want}"))?;
     let tmp = part_path(out_path);
     let n = zip_extract_to(zip_path, meta, &tmp)?;
     if n == 0 {
@@ -1822,7 +2040,9 @@ pub fn ensure_dlss_runtime(
                     frac(done + got),
                 );
             };
-            download_with_mirror(client, &step.url, &zip_path, cancel, &mut relay)
+            // 运行库包没有官方指纹可比（发布 API 只给大小），所以这里至少把
+            // 「发布侧报的字节数」当一道闸：内容换了个大小不一样的就直接丢弃换源。
+            download_with_mirror(client, &step.url, &zip_path, cancel, &mut relay, false, Some(step.size))
         };
 
         let got_bytes: u64 = match direct {
@@ -1852,7 +2072,15 @@ pub fn ensure_dlss_runtime(
                         frac(done + got),
                     );
                 };
-                download_with_mirror(client, &asset.url, &zip_path, cancel, &mut relay)?
+                download_with_mirror(
+                    client,
+                    &asset.url,
+                    &zip_path,
+                    cancel,
+                    &mut relay,
+                    false,
+                    Some(asset.size),
+                )?
             }
         };
         done += got_bytes;
@@ -1861,7 +2089,8 @@ pub fn ensure_dlss_runtime(
             format!("第 {step_no}/{} 步 · 解压 {label} ...", ctx.total_steps),
             frac(done),
         );
-        let extracted = zip_extract_dll(&zip_path, &dest)?;
+        // 点名要哪一份：不接受「包里第一个 .dll」，否则塞个别的 NVIDIA 签名 DLL 就能顶替
+        let extracted = zip_extract_dll(&zip_path, &dest, step.dll_name)?;
         // 按用户要求：解压完就删掉压缩包
         let _ = std::fs::remove_file(&zip_path);
 

@@ -20,12 +20,13 @@ use windows_sys::Win32::Security::Cryptography::{
     CryptQueryObject,
     CERT_FIND_SUBJECT_CERT, CERT_INFO, CERT_NAME_SIMPLE_DISPLAY_TYPE, CERT_QUERY_CONTENT_FLAG_PKCS7_SIGNED_EMBED,
     CERT_QUERY_FORMAT_FLAG_BINARY, CERT_QUERY_OBJECT_FILE, CERT_SHA1_HASH_PROP_ID,
-    CMSG_SIGNER_INFO, CMSG_SIGNER_INFO_PARAM, HCERTSTORE, PKCS_7_ASN_ENCODING, X509_ASN_ENCODING,
+    CMSG_SIGNER_COUNT_PARAM, CMSG_SIGNER_INFO, CMSG_SIGNER_INFO_PARAM, HCERTSTORE,
+    PKCS_7_ASN_ENCODING, X509_ASN_ENCODING,
 };
 use windows_sys::Win32::Security::WinTrust::{
     WinVerifyTrust, WINTRUST_ACTION_GENERIC_VERIFY_V2, WINTRUST_DATA, WINTRUST_DATA_0,
     WINTRUST_FILE_INFO,
-    WTD_CACHE_ONLY_URL_RETRIEVAL, WTD_CHOICE_FILE, WTD_DISABLE_MD2_MD4, WTD_REVOKE_NONE,
+    WTD_CACHE_ONLY_URL_RETRIEVAL, WTD_CHOICE_FILE, WTD_DISABLE_MD2_MD4, WTD_REVOKE_WHOLECHAIN,
     WTD_STATEACTION_CLOSE, WTD_STATEACTION_VERIFY, WTD_UI_NONE,
 };
 
@@ -160,7 +161,9 @@ fn winverify(path: &Path) -> SigState {
         let mut data = WINTRUST_DATA {
             cbStruct: std::mem::size_of::<WINTRUST_DATA>() as u32,
             dwUIChoice: WTD_UI_NONE,
-            fdwRevocationChecks: WTD_REVOKE_NONE,
+            // 整条链查吊销。仍然只用本地缓存（见 WTD_CACHE_ONLY_URL_RETRIEVAL），
+            // 所以离线不会卡住；缓存里说「已吊销」时会真正拦下来。
+            fdwRevocationChecks: WTD_REVOKE_WHOLECHAIN,
             dwUnionChoice: WTD_CHOICE_FILE,
             Anonymous: WINTRUST_DATA_0 { pFile: &mut file_info },
             dwStateAction: WTD_STATEACTION_VERIFY,
@@ -233,6 +236,25 @@ fn signer_cert(path: &Path) -> Result<(String, String)> {
 
         // 1. SignerInfo
         let mut cb: u32 = 0;
+        // 多签名的文件不能用「第 0 个签名者」代表它的身份：一份坏签名 + 一份自签有效
+        // 就能让「身份」和「内容有效性」分别成立。这里直接拒绝，宁可不放行。
+        let mut signers: u32 = 0;
+        let mut cb_cnt = std::mem::size_of::<u32>() as u32;
+        if CryptMsgGetParam(
+            msg,
+            CMSG_SIGNER_COUNT_PARAM,
+            0,
+            &mut signers as *mut u32 as *mut core::ffi::c_void,
+            &mut cb_cnt,
+        ) == 0
+        {
+            CertCloseStore(store, 0);
+            bail!("读不出签名数量");
+        }
+        if signers != 1 {
+            CertCloseStore(store, 0);
+            bail!("这个文件有 {signers} 个签名，无法确认身份");
+        }
         if CryptMsgGetParam(
             msg,
             CMSG_SIGNER_INFO_PARAM,
@@ -338,19 +360,17 @@ pub fn verify_file(path: &Path) -> VerifyReport {
     };
 
     let kind = if thumbprint.is_empty() {
-        // 拿不到指纹时只能靠主体名兜底（NVIDIA 那串名字别人签不出来，因为要公开 CA）
-        if subject.to_ascii_lowercase().contains("nvidia") {
-            SignerKind::Nvidia
-        } else {
-            SignerKind::Other
-        }
+        // **拿不到证书指纹就没法证明身份**，老实落到 Other（会走「让用户确认」那一档）。
+        // 以前这里拿「主体名里含 nvidia」兜底 —— 那意味着任何人只要能申请到一张
+        // 名字里带 nvidia 的公开 CA 证书，就能冒充 NVIDIA 官方签名。
+        let _ = &subject;
+        SignerKind::Other
     } else if thumbprint.eq_ignore_ascii_case(AUTHOR_CERT_PROXY)
         || (!AUTHOR_CERT_NATIVE.is_empty() && thumbprint.eq_ignore_ascii_case(AUTHOR_CERT_NATIVE))
     {
         SignerKind::Author
-    } else if thumbprint.eq_ignore_ascii_case(NVIDIA_CERT)
-        || subject.to_ascii_lowercase().contains("nvidia")
-    {
+    } else if thumbprint.eq_ignore_ascii_case(NVIDIA_CERT) {
+        // **只认指纹。**NVIDIA 换证书时改这个常量，别放宽判定。
         SignerKind::Nvidia
     } else {
         SignerKind::Other

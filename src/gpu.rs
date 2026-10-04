@@ -93,10 +93,30 @@ impl DriverInfo {
 }
 
 /// 调 nvidia-smi 问驱动自己。比读注册表权威，但要起一个进程（约 35ms）。
+/// nvidia-smi 的**绝对路径**。
+///
+/// 不能用裸文件名：Windows 会先在「exe 所在目录 / 当前目录」找同名程序 ——
+/// 便携版解压在哪个文件夹、用户从哪个目录启动，那个目录就能放一个假的
+/// nvidia-smi.exe 让本工具执行它（它的输出还会被当成显卡型号参与路由判断）。
+fn nvidia_smi_path() -> Option<std::path::PathBuf> {
+    let mut cands: Vec<std::path::PathBuf> = Vec::new();
+    if let Ok(root) = std::env::var("SystemRoot") {
+        cands.push(std::path::Path::new(&root).join("System32\nvidia-smi.exe"));
+    }
+    cands.push(std::path::PathBuf::from(r"C:\Windows\System32\nvidia-smi.exe"));
+    if let Ok(pf) = std::env::var("ProgramFiles") {
+        cands.push(
+            std::path::Path::new(&pf)
+                .join(r"NVIDIA Corporation\NVSMI\nvidia-smi.exe"),
+        );
+    }
+    cands.into_iter().find(|p| p.is_file())
+}
+
 fn nvidia_smi_version() -> Option<String> {
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    let out = std::process::Command::new("nvidia-smi")
+    let out = std::process::Command::new(nvidia_smi_path()?)
         .args(["--query-gpu=driver_version", "--format=csv,noheader"])
         .creation_flags(CREATE_NO_WINDOW)
         .output()
@@ -119,7 +139,7 @@ fn nvidia_smi_version() -> Option<String> {
 pub fn nvidia_smi_gpu_name() -> Option<String> {
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    let out = std::process::Command::new("nvidia-smi")
+    let out = std::process::Command::new(nvidia_smi_path()?)
         .args(["--query-gpu=name", "--format=csv,noheader"])
         .creation_flags(CREATE_NO_WINDOW)
         .output()

@@ -270,10 +270,31 @@ fn classify(kind: Kind, name: String, tmp: PathBuf, from: String) -> Result<Stag
                 Err(e) => (false, format!("配置文件看起来不对：{e}")),
             }
         }
-        Kind::Proxy | Kind::Runtime => {
+        Kind::Proxy => {
             let rep = verify::verify_file(&tmp);
             let ok = rep.content_trusted();
             (ok, format!("{}（{} 字节）", rep.summary(), bytes))
+        }
+        Kind::Runtime => {
+            // 运行库**必须**是 NVIDIA 官方签名。作者自签的 DLL 被改个名字塞进来，
+            // content_trusted() 也会放行（作者签名本来就信），但装进游戏目录的
+            // 根本不是 DLSS 运行库。
+            let rep = verify::verify_file(&tmp);
+            let nvidia =
+                rep.kind == verify::SignerKind::Nvidia && rep.sig == verify::SigState::Trusted;
+            (
+                nvidia,
+                format!(
+                    "{}（{} 字节）{}",
+                    rep.summary(),
+                    bytes,
+                    if nvidia {
+                        ""
+                    } else {
+                        " —— 运行库必须是 NVIDIA 官方签名，这份不是"
+                    }
+                ),
+            )
         }
     };
     Ok(Staged {
@@ -356,7 +377,16 @@ pub fn stage(
             progress(format!("{pack}：已看 {seen}/{n}，正在校验 {base} ..."), frac);
             let tmp = work_dir.join(format!("s{si}-{uniq}-{base}"));
             uniq += 1;
-            let n = update::zip_extract_to(p, meta, &tmp)?;
+            // 单个条目解压失败（压缩方式不支持、本地头损坏）只跳过它，
+            // 别让整次导入白做 —— 别人用 7z 重打包过的 zip 很常见。
+            let n = match update::zip_extract_to(p, meta, &tmp) {
+                Ok(n) => n,
+                Err(e) => {
+                    let _ = std::fs::remove_file(&tmp);
+                    progress(format!("{} 解压失败，已跳过：{e}", meta.name), frac);
+                    continue;
+                }
+            };
             if n == 0 {
                 let _ = std::fs::remove_file(&tmp);
                 continue;

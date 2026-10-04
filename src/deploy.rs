@@ -108,6 +108,41 @@ fn manifest_path(dir: &Path) -> Result<PathBuf> {
     Ok(util::backups_dir()?.join(util::dir_key(dir)).join("manifest.json"))
 }
 
+/// manifest 的状态。**「文件在但读不出来」必须和「压根没有这份文件」分开**：
+/// 前者意味着我们可能把一个已部署目录当成从未部署过，那就会把我们自己放进去的
+/// 文件记成「游戏原件」覆盖掉真正的原件 —— 后果是原件永久丢失。
+pub enum ManifestState {
+    Missing,
+    Ok(Box<BackupManifest>),
+    Broken(String),
+}
+
+/// 严格读一次 manifest：能区分「没有」和「坏了」。
+pub fn manifest_state(dir: &Path) -> ManifestState {
+    let Ok(p) = manifest_path(dir) else {
+        return ManifestState::Missing;
+    };
+    if !p.is_file() {
+        return ManifestState::Missing;
+    }
+    let text = match std::fs::read_to_string(&p) {
+        Ok(t) => t,
+        Err(e) => return ManifestState::Broken(e.to_string()),
+    };
+    match serde_json::from_str::<BackupManifest>(&text) {
+        Ok(m) => ManifestState::Ok(Box::new(m)),
+        Err(e) => ManifestState::Broken(e.to_string()),
+    }
+}
+
+/// 写 manifest：**必须原子**。非原子写中途崩溃会留下半截 JSON，
+/// 下次就被当成「没部署过」（见 manifest_state 的说明）。
+fn write_manifest(base: &Path, m: &BackupManifest) -> Result<()> {
+    let tmp = base.join("manifest.json.tmp");
+    std::fs::write(&tmp, serde_json::to_string_pretty(m)?)?;
+    util::atomic_replace(&tmp, &base.join("manifest.json"))
+}
+
 pub fn load_manifest(dir: &Path) -> Option<BackupManifest> {
     let p = manifest_path(dir).ok()?;
     let t = std::fs::read_to_string(p).ok()?;
@@ -222,7 +257,18 @@ pub fn deploy(
         }
     }
 
-    let existing_manifest = load_manifest(target_dir);
+    // 记录读不出来就**不要**接着部署：那会把我们自己上次放进去的文件当成游戏原件
+    // 覆盖掉真正的备份。停下来让用户处理，比悄悄毁掉原件强。
+    let existing_manifest = match manifest_state(target_dir) {
+        ManifestState::Missing => None,
+        ManifestState::Ok(m) => Some(*m),
+        ManifestState::Broken(e) => bail!(
+            "这个目录的部署记录读不出来（{e}）。为免把游戏原件当成本工具的文件覆盖掉，已停止部署：请把 {} 改名或删除后再试。",
+            manifest_path(target_dir)
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|_| "记录文件".to_owned())
+        ),
+    };
 
     // 1. 冲突检查
     //
@@ -290,23 +336,37 @@ pub fn deploy(
     // 2. 占用检查
     for f in files {
         let p = target_dir.join(&f.dest_name);
-        if p.exists() && util::is_locked(&p) {
-            bail!("{} 正被占用，请先完全退出游戏。", f.dest_name);
+        if p.exists() {
+            match util::lock_state(&p) {
+                util::LockState::InUse => {
+                    bail!("{} 正被占用，请先完全退出游戏。", f.dest_name)
+                }
+                util::LockState::NoAccess => bail!(
+                    "{} 现在写不进去：文件带了只读属性，或者权限不足。去掉只读 / 换个可写的游戏目录再试。",
+                    f.dest_name
+                ),
+                util::LockState::Free => {}
+            }
         }
     }
 
     // 3. 读源文件并算哈希
-    let mut payload: Vec<(String, Vec<u8>, String)> = Vec::new();
+    // **不再把源文件整份读进内存**：代理 DLL 30 MB，两个运行库加起来 60 多 MB，
+    // 全量入内存会让一次部署瞬时多占近 90 MB（和「轻量」的定位冲突）。
+    // 只算哈希，真正的内容在第 6 步按文件复制。
+    let mut payload: Vec<(String, PathBuf, String)> = Vec::new();
     for f in files {
-        let bytes = std::fs::read(&f.src).with_context(|| format!("读取 {}", f.src.display()))?;
-        let sha = util::sha256_hex(&bytes);
-        payload.push((f.dest_name.clone(), bytes, sha));
+        let sha = util::sha256_file(&f.src)
+            .with_context(|| format!("读取 {}", f.src.display()))?;
+        payload.push((f.dest_name.clone(), f.src.clone(), sha));
     }
 
     let key = util::dir_key(target_dir);
     let base = util::backups_dir()?.join(&key);
     let files_dir = base.join("files");
     std::fs::create_dir_all(&files_dir)?;
+    // 从这里开始就在动这个目录的备份了：先拿锁，避免两个实例同时写同一份记录
+    let _lock = DirLock::acquire(&base)?;
 
     // 4. 备份
     //
@@ -401,17 +461,22 @@ pub fn deploy(
         proxy_name: proxy.to_owned(),
         files: entries,
     };
-    std::fs::write(
-        base.join("manifest.json"),
-        serde_json::to_string_pretty(&manifest)?,
-    )?;
+    write_manifest(&base, &manifest)?;
 
-    // 6. 原子写入
-    for (name, bytes, _sha) in &payload {
+    // 6. 原子写入。**中途失败也要回滚**：manifest 已经落盘了，只写一半会让界面
+    //    显示「已部署」而文件其实是混的。回滚的成败如实写进错误信息。
+    for (name, src, _sha) in &payload {
         let dst = target_dir.join(name);
         let tmp = target_dir.join(format!(".{}.tmp", name));
-        std::fs::write(&tmp, bytes).with_context(|| format!("写入临时文件 {}", tmp.display()))?;
-        util::atomic_replace(&tmp, &dst)?;
+        let step = std::fs::copy(src, &tmp)
+            .with_context(|| format!("写入临时文件 {}", tmp.display()))
+            .and_then(|_| util::atomic_replace(&tmp, &dst));
+        if let Err(e) = step {
+            let _ = std::fs::remove_file(&tmp);
+            // 直接走内部函数：锁已经在本函数手里，不能再抢一次
+            let rb = restore_with(&manifest);
+            return Err(anyhow::anyhow!("{e}；回滚{}", rollback_text(&rb)));
+        }
         util::clear_motw(&dst);
     }
 
@@ -419,8 +484,8 @@ pub fn deploy(
     for (name, _bytes, sha) in &payload {
         let got = util::sha256_file(&target_dir.join(name))?;
         if got != *sha {
-            let _ = restore(target_dir);
-            bail!("{} 部署后校验失败，已自动回滚。", name);
+            let rb = restore_with(&manifest);
+            bail!("{} 部署后校验失败；回滚{}", name, rollback_text(&rb));
         }
     }
 
@@ -439,11 +504,16 @@ pub fn deploy(
     let mut removed: Vec<String> = Vec::new();
     let mut carried: Vec<BackupEntry> = Vec::new();
     let mut kept_record: Vec<String> = Vec::new();
+    // 移不掉的（被占用 / 只读 / 权限）：必须说出来，而且记录要留着 ——
+    // 否则界面显示「已部署」、目录里却还立着本项目的旧代理，「还原」也清不掉。
+    let mut failed_remove: Vec<String> = Vec::new();
 
     for name in &extra_removed {
         let p = target_dir.join(name);
         if std::fs::remove_file(&p).is_ok() {
             kept_record.push(name.clone());
+        } else {
+            failed_remove.push(name.clone());
         }
     }
 
@@ -469,18 +539,26 @@ pub fn deploy(
             let mut keep_record = false;
             match action {
                 OrphanAction::Keep => {
-                    // 文件不在了、或者还写着我们的东西但没被当成代理处理：
-                    // 只要有原件备份，这条记录就得传下去
-                    keep_record = has_backup && (!present || still_ours);
+                    // 只要有原件备份，这条记录**必须**传下去：还原收尾会把整个备份
+                    // 目录删掉，记录一丢，那份原件就永久拿不回来了。
+                    // （以前这里还要求「文件不在了或还是我们那份」，于是用户自己改过
+                    //   那个文件时记录被丢掉、备份被连带删除 —— 和本文件的约定相反。）
+                    keep_record = has_backup;
                 }
                 OrphanAction::Remove => {
                     if std::fs::remove_file(&p).is_ok() {
                         removed.push(e.rel_path.clone());
+                    } else {
+                        // 删不掉：记录留着，下次还原还能处理它
+                        failed_remove.push(e.rel_path.clone());
+                        keep_record = has_backup;
                     }
                 }
                 OrphanAction::RemoveButKeepRecord => {
                     if std::fs::remove_file(&p).is_ok() {
                         kept_record.push(e.rel_path.clone());
+                    } else {
+                        failed_remove.push(e.rel_path.clone());
                     }
                     keep_record = has_backup;
                 }
@@ -503,16 +581,20 @@ pub fn deploy(
             kept_record.join("、")
         ));
     }
+    if !failed_remove.is_empty() {
+        notes.push(format!(
+            "没能移出这些旧代理入口（可能正被占用或只读）：{} —— 本次记录已保留，下次点「还原」仍可处理",
+            failed_remove.join("、")
+        ));
+    }
+
     if !carried.is_empty() {
         // 把记录补进刚落盘的新 manifest，否则「还原」找不到它们
         manifest
             .files
             .retain(|m| !carried.iter().any(|c| c.rel_path == m.rel_path));
         manifest.files.extend(carried);
-        std::fs::write(
-            base.join("manifest.json"),
-            serde_json::to_string_pretty(&manifest)?,
-        )?;
+        write_manifest(&base, &manifest)?;
     }
 
     let names: Vec<&str> = payload.iter().map(|(n, _, _)| n.as_str()).collect();
@@ -529,20 +611,50 @@ pub fn deploy(
     Ok(msg)
 }
 
+/// 「这个游戏目录正在被操作」的锁文件。
+///
+/// 两个实例（或两个解压目录）同时部署/还原同一个游戏目录时，会往同一份 manifest
+/// 和同一批 .bak 上写 —— 互相覆盖之后原件就找不回来了。UI 里的 busy 只挡得住同一个进程。
+struct DirLock(PathBuf);
+
+impl DirLock {
+    fn acquire(base: &Path) -> Result<Self> {
+        std::fs::create_dir_all(base)?;
+        let p = base.join(".lock");
+        match std::fs::OpenOptions::new().write(true).create_new(true).open(&p) {
+            Ok(_) => Ok(DirLock(p)),
+            Err(_) => bail!(
+                "另一个窗口正在操作这个游戏目录（{}）。等它结束、或者删掉这个文件再试。",
+                p.display()
+            ),
+        }
+    }
+}
+
+impl Drop for DirLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// 把回滚的成败说清楚。以前无论成败都写「已自动回滚」—— 回滚失败时那是撒谎。
+fn rollback_text(r: &Result<String>) -> String {
+    match r {
+        Ok(m) => format!("成功（{m}）"),
+        Err(e) => {
+            format!("**失败**：{e}（游戏目录可能停在半部署状态，请点「还原」再试一次）")
+        }
+    }
+}
+
 fn restore_with(manifest: &BackupManifest) -> Result<String> {
     let target_dir = manifest.game_dir.as_path();
     let base = util::backups_dir()?.join(&manifest.game_key);
 
-    // 移除本次部署的文件
-    for e in &manifest.files {
-        let p = target_dir.join(&e.rel_path);
-        if p.is_file() {
-            std::fs::remove_file(&p).with_context(|| format!("移除 {}", p.display()))?;
-        }
-    }
-
-    // 还原备份
-    let mut restored = 0usize;
+    // 1) 先把所有备份读出来校验完。**任何一份坏了都要在动游戏目录之前中止** ——
+    //    以前是先无条件删掉部署文件、再逐个读备份：备份坏掉时游戏目录已经被删了
+    //    一半，原件又没放回去，留下一个半残的游戏目录。
+    let mut plan: Vec<(&BackupEntry, Vec<u8>)> = Vec::new();
     for e in &manifest.files {
         if !e.existed_before {
             continue;
@@ -552,27 +664,72 @@ fn restore_with(manifest: &BackupManifest) -> Result<String> {
         let bytes = std::fs::read(&src).with_context(|| format!("读取备份 {}", src.display()))?;
         if let Some(orig) = &e.original_sha256 {
             if util::sha256_hex(&bytes) != *orig {
-                bail!("备份 {} 自身已损坏，中止还原", bn);
+                bail!("备份 {bn} 自身已损坏，中止还原（游戏目录一个字都没动）");
             }
         }
-        let dst = target_dir.join(&e.rel_path);
-        let tmp = target_dir.join(format!(".{}.tmp", e.rel_path));
-        std::fs::write(&tmp, &bytes)?;
-        util::atomic_replace(&tmp, &dst)?;
-        restored += 1;
+        plan.push((e, bytes));
     }
 
+    // 2) 只删「确认还是我们部署的那一份」的文件。用户换成别的 mod、或游戏更新
+    //    了自己那份 nvngx_dlssg.dll 之后，那个文件已经不是我们的了 —— 删掉它
+    //    等于替用户丢文件，而且没有备份能救。
+    let mut ours: Vec<String> = Vec::new();
+    let mut skipped: Vec<String> = Vec::new();
+    for e in &manifest.files {
+        let p = target_dir.join(&e.rel_path);
+        if !p.is_file() {
+            continue;
+        }
+        let still_ours = !e.deployed_sha256.is_empty()
+            && util::sha256_file(&p)
+                .map(|h| h == e.deployed_sha256)
+                .unwrap_or(false);
+        if still_ours {
+            ours.push(e.rel_path.clone());
+        } else {
+            skipped.push(e.rel_path.clone());
+        }
+    }
+
+    // 3) 先把原件放回去，再删我们放进去的那些。顺序反过来的话，中途失败会留下
+    //    「我们的删了、原件也没回来」的状态。
+    let mut restored = 0usize;
+    for (e, bytes) in &plan {
+        let dst = target_dir.join(&e.rel_path);
+        let tmp = target_dir.join(format!(".{}.tmp", e.rel_path));
+        std::fs::write(&tmp, bytes)?;
+        if let Err(e) = util::atomic_replace(&tmp, &dst) {
+            // 失败时别把半成品留在游戏目录里（有的游戏/反作弊会扫目录里的未知文件）
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e);
+        }
+        restored += 1;
+        ours.retain(|n| n != &e.rel_path);
+    }
+    for name in &ours {
+        let _ = std::fs::remove_file(target_dir.join(name));
+    }
+
+    // 4) 有文件被改过就保留备份目录、如实说明：别把「原件还在」这一点也弄丢
+    if !skipped.is_empty() {
+        return Ok(format!(
+            "部分还原：恢复 {restored} 个原始文件；{} 个文件的内容已不是本工具部署的那份，为避免误删已跳过（{}）。备份保留在 {}，确认不需要了可以手动删除。",
+            skipped.len(),
+            skipped.join("、"),
+            base.display()
+        ));
+    }
     let _ = std::fs::remove_dir_all(&base);
-    Ok(format!(
-        "已还原：移除 {} 个部署文件，恢复 {} 个原始文件",
-        manifest.files.len(),
-        restored
-    ))
+    Ok(format!("已还原：恢复 {restored} 个原始文件"))
 }
 
 pub fn restore(target_dir: &Path) -> Result<String> {
     let Some(m) = load_manifest(target_dir) else {
         bail!("没有找到本工具对该目录的部署记录（{}）", target_dir.display());
     };
+    // 和 deploy 用同一把锁：两个实例同时读写同一份备份会互相覆盖 ——
+    // 那正是「原件找不回来」的典型路径。加在读到记录之后，
+    // 这样「本来就没部署过」的目录不会平白多一个锁文件。
+    let _lock = DirLock::acquire(&util::backups_dir()?.join(&m.game_key))?;
     restore_with(&m)
 }
