@@ -1589,7 +1589,9 @@ impl GraphicsApi {
             GraphicsApi::Dx9 => "DX9",
             GraphicsApi::Vulkan => "Vulkan",
             GraphicsApi::OpenGl => "OpenGL",
-            GraphicsApi::Unknown => "图形 API 未知",
+            // 只写「未知」：日志里是 "API=未知"、徽章里是 "图形 API：未知"，',
+            // 自带前缀会变成「图形 API：图形 API 未知」（截图里出现过）。
+            GraphicsApi::Unknown => "未知",
         }
     }
 
@@ -1629,6 +1631,28 @@ pub enum GameEngine {
 }
 
 impl GameEngine {
+    /// 徽章里用的短名字：徽章要带标签，太长会把整行撑开。
+    pub fn short(self) -> &'static str {
+        match self {
+            GameEngine::Unreal4 => "UE4",
+            GameEngine::Unreal5 => "UE5",
+            GameEngine::Unity => "Unity",
+            GameEngine::Source2 => "Source 2",
+            GameEngine::Source => "Source",
+            GameEngine::Creation => "Creation",
+            GameEngine::ReEngine => "RE Engine",
+            GameEngine::CryEngine => "CryEngine",
+            GameEngine::Rage => "RAGE",
+            GameEngine::Anvil => "Anvil",
+            GameEngine::Frostbite => "Frostbite",
+            GameEngine::Godot => "Godot",
+            GameEngine::GameMaker => "GameMaker",
+            GameEngine::RpgMaker => "RPG Maker",
+            GameEngine::MonoGame => "MonoGame",
+            GameEngine::Unknown => "未知",
+        }
+    }
+
     pub fn label(self) -> &'static str {
         match self {
             GameEngine::Unreal4 => "Unreal Engine 4",

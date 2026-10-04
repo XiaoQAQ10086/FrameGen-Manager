@@ -6796,6 +6796,38 @@ impl eframe::App for App {
                             );
                             theme::badge(ui, row.ac.label(), color);
                                 });
+                                // 图形 API / 引擎单独占一行：**带标签的高亮徽章**。
+                                // 放进上面那一行会被「入口被占用: xxx.dll」这类长徽章
+                                // 挤出面板宽度，等于没显示（截图验证时发现的）。
+                                // horizontal_wrapped：窗口窄时两个徽章换行，不会被裁掉
+                                ui.horizontal_wrapped(|ui| {
+                                    if row.tech_scanned {
+                                        // API 的颜色本身就是结论：能跑帧生成 / 不能 / 认不出
+                                        let api_color = match row.api.frame_gen_possible() {
+                                            Some(true) => theme::OK,
+                                            Some(false) => theme::WARN,
+                                            None => theme::NEUTRAL,
+                                        };
+                                        theme::badge(
+                                            ui,
+                                            &format!("图形 API：{}", row.api.label()),
+                                            api_color,
+                                        );
+                                        theme::badge(
+                                            ui,
+                                            &format!("游戏引擎：{}", row.engine.short()),
+                                            theme::ACCENT,
+                                        );
+                                        if row.streamline {
+                                            theme::badge(ui, "自带帧生成", theme::OK);
+                                        }
+                                    } else {
+                                        // 还没算（旧缓存，后台补算中）：明说「检测中」，
+                                        // 别先把「未知」摆出来当结论。
+                                        theme::badge(ui, "图形 API：检测中…", theme::NEUTRAL);
+                                        theme::badge(ui, "游戏引擎：检测中…", theme::NEUTRAL);
+                                    }
+                                });
                                 ui.label(theme::path_text(
                                     row.entry.install_dir.display().to_string(),
                                 ));
@@ -6814,19 +6846,7 @@ impl eframe::App for App {
                         // 这不只是「看着有用」：帧生成只在 DX12 / Vulkan 下存在，
                         // DX11 及更早的游戏装上也白装 —— 提前说清能省用户一次白忙。
                         {
-                            let mut tech: Vec<String> = Vec::new();
-                            if row.api != scan::GraphicsApi::Unknown {
-                                tech.push(row.api.label().to_owned());
-                            }
-                            if row.engine != scan::GameEngine::Unknown {
-                                tech.push(row.engine.label().to_owned());
-                            }
-                            if row.streamline {
-                                tech.push("游戏自带帧生成 (Streamline)".to_owned());
-                            }
-                            if !tech.is_empty() {
-                                ui.label(theme::hint(tech.join("  ·  ")));
-                            }
+                            // 徽章已经说明了「是什么」，这里只补「所以呢」。
                             if row.api.frame_gen_possible() == Some(false) {
                                 ui.label(
                                     egui::RichText::new(format!(
