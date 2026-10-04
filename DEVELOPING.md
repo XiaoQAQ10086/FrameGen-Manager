@@ -683,6 +683,49 @@ exe 主名也进名单。**加错名字只是不生效，不会误伤真游戏**
   看不清楚。**12px 是这些提示文字的下限**，再小就别怪用户看不清。
 - 判定依据是 WCAG 对比度：正文最低 4.5:1，7:1 是更严的一档。
 
+### 图形 API 与引擎识别（扫描时顺带做）
+
+扫描每个游戏时会顺手判出三件事，显示在游戏库那一行上：**图形 API**、**引擎**、
+**是否自带帧生成（Streamline）**。最后一项对本工具最关键：上游 Mod 靠游戏自带的
+Streamline 工作，**游戏没有它就装了也不会生效** —— 界面会直接给一句橙色提示
+「游戏不自带帧生成！安装无效」，省用户一次白忙。
+
+判定都在 `scan.rs`，逻辑与 I/O 分开：
+
+* `api_from_names(imports, siblings)` —— 纯函数。DX12 > Vulkan > DX11 > DX10 > DX9 > OpenGL；
+  **只有 dxgi.dll 不算数**（10/11/12 都用它）。
+* `engine_from_facts(&LayoutFacts)` —— 纯函数。只用游戏自己带的文件做证据：
+  `*-Win64-Shipping.exe`（+ `.utoc` 判 UE5）、`UnityPlayer.dll`/`*_Data`、`engine2.dll`、
+  `engine.dll`+`vstdlib.dll`、`CrySystem.dll`、`re_chunk_*.pak`、`data.win`、`nw.dll`/RGSS、
+  `MonoGame.Framework.dll`/`XNA*`、`*.pck`，以及根目录资源扩展名 `.rpf`（RAGE）、
+  `.forge`（Anvil）、`.cas`+`.sb`+`.toc` 三选二（Frostbite）、`.ba2`/`.bsa`（Creation）。
+  **认不出来就报 Unknown，不猜** —— 猜错比不报更坏。
+* `detect_tech_report(exe)` —— 负责 I/O：读 PE 导入表、列 exe 同目录、往上看根目录的
+  资源扩展名、在有界的候选路径里找 Streamline，最后返回 `TechReport`（含**判定依据**）。
+
+**两层判定，别删掉第二层。** 很多引擎的游戏 exe 只是个壳：实测一个 Unity 试玩版，
+主 exe 只有 0.6 MB、导入表里只有 `kernel32.dll` + `unityplayer.dll`，真正的渲染在
+`UnityPlayer.dll` 里。所以主 exe 判不出来时，会再去看 `UnityPlayer.dll` / `engine2.dll` /
+`engine.dll` / `CrySystem.dll` 自己的导入表。
+
+**Streamline 的搜索是有界的**（`find_streamline_marker`）：EXE 同目录、`Binaries\Win64`、
+`Engine\Binaries\ThirdParty\NVIDIA[\DLSS]`，往上最多三层。UE 游戏常把它放在后面那几个
+位置 —— 只查 exe 同目录会把「其实自带帧生成」的游戏误报成「安装无效」，而那是很重的结论。
+仍然是尽力而为：**要是用户反馈某游戏其实自带却被提示无效，先看日志里那一行依据**
+（下一步就是把新的真实路径补进候选表）。
+
+**每个游戏在日志里都留一行判定依据**，形如：
+
+    图形/引擎 [游戏名] API=DX12 引擎=Unity 自带帧生成=false | 导入表 2 项；
+    unityplayer.dll 的导入表命中 -> DX12；同目录 16 个文件、根目录扩展名 4 种；
+    同目录可疑文件 [...]; 没找到 Streamline 痕迹（导入表 + exe 同目录 + 几个固定候选路径）；
+    引擎判定：命中 -> Unity
+
+这行就是给「用户说认错了」用的：看到什么、据此得出什么，一眼可查。
+另外 `cargo run -- --techtest <渲染 EXE>` 能单独跑一次判定并打印同一份依据。
+
+结果会**存进游戏库缓存**（`CachedRow` 的三个字段），启动时直接用，不重算；
+计算发生在后台线程（和找渲染 EXE 同一条路径），不占 UI。
 ## 审计之后的新规矩（2026-10-04）
 
 一次全量审计（41 条）之后定下的几条不变量。**改代码前先看这一节** —— 这些都是踩过的坑，

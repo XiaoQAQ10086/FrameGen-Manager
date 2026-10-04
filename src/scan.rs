@@ -1609,6 +1609,12 @@ pub enum GameEngine {
     Creation,
     ReEngine,
     CryEngine,
+    /// GTA / 荒野大镖客：资源是 .rpf
+    Rage,
+    /// 刺客信条：资源是 .forge
+    Anvil,
+    /// 战地 / FIFA：Data 目录下的 .cas/.sb/.toc
+    Frostbite,
     Godot,
     GameMaker,
     RpgMaker,
@@ -1626,6 +1632,9 @@ impl GameEngine {
             GameEngine::Creation => "Creation Engine",
             GameEngine::ReEngine => "RE Engine",
             GameEngine::CryEngine => "CryEngine",
+            GameEngine::Rage => "RAGE",
+            GameEngine::Anvil => "Anvil",
+            GameEngine::Frostbite => "Frostbite",
             GameEngine::Godot => "Godot",
             GameEngine::GameMaker => "GameMaker",
             GameEngine::RpgMaker => "RPG Maker",
@@ -1644,6 +1653,8 @@ pub struct LayoutFacts {
     pub siblings: Vec<String>,
     /// 往上找 `<根>\Content\Paks` 时看到的扩展名（小写，如 utoc / pak）
     pub pak_kinds: Vec<String>,
+    /// 游戏根目录（以及它下面的 Data 目录）里出现过的扩展名（小写、去重）
+    pub root_exts: Vec<String>,
 }
 
 /// 从导入表 + 同目录文件判断图形 API。
@@ -1726,10 +1737,78 @@ pub fn engine_from_facts(f: &LayoutFacts) -> GameEngine {
     }
     // Creation Engine（Skyrim / Fallout）：资源是 Data 目录下的 .ba2 / .bsa，
     // 而 EXE 旁边通常能看到 Data 这个目录名。
-    if sib("data") && (sib_has(".ba2") || sib_has(".bsa")) {
+    // 下面这几条靠「资源文件的扩展名」认 —— 那些扩展名基本只有一家在用，
+    // 但仍然只用证据说话：拿不准的（比如 .pak 谁都用）一律不列。
+    let ext = |e: &str| f.root_exts.iter().any(|x| x == e);
+    if ext("rpf") {
+        return GameEngine::Rage;
+    }
+    if ext("forge") {
+        return GameEngine::Anvil;
+    }
+    // Frostbite：.cas / .sb / .toc 三选二才算（单个都可能在别家出现）
+    let frost = ["cas", "sb", "toc"].iter().filter(|e| ext(e)).count();
+    if frost >= 2 {
+        return GameEngine::Frostbite;
+    }
+    // Creation Engine（Skyrim / Fallout / Starfield）：.ba2 / .bsa 是它独有的
+    if ext("ba2") || ext("bsa") {
         return GameEngine::Creation;
     }
     GameEngine::Unknown
+}
+
+/// 在一些**固定的候选路径**里找 Streamline 的痕迹（有界，不做全盘搜索）。
+///
+/// 为什么需要：Streamline 不一定躺在渲染 EXE 旁边 —— UE 游戏常把它放在
+/// `<根>\Engine\Binaries\ThirdParty\NVIDIA\DLSS\` 下面。只看 exe 同目录会把
+/// 「其实自带帧生成」的游戏误判成「安装无效」，而那是个很重的结论。
+fn find_streamline_marker(exe: &Path) -> Option<String> {
+    let dir = exe.parent()?;
+    let mut cur = Some(dir);
+    for _ in 0..3 {
+        let Some(d) = cur else { break };
+        let candidates = [
+            d.to_path_buf(),
+            d.join("Binaries").join("Win64"),
+            d.join("Engine")
+                .join("Binaries")
+                .join("ThirdParty")
+                .join("NVIDIA")
+                .join("DLSS"),
+            d.join("Engine")
+                .join("Binaries")
+                .join("ThirdParty")
+                .join("NVIDIA"),
+        ];
+        for probe in candidates {
+            let Ok(rd) = std::fs::read_dir(&probe) else {
+                continue;
+            };
+            for e in rd.flatten().take(400) {
+                let n = e.file_name().to_string_lossy().to_lowercase();
+                if n.contains("sl.interposer")
+                    || n.contains("sl.dlss_g")
+                    || n.contains("nvngx_dlssg")
+                {
+                    // 拼路径用 join，免得在格式化字符串里写反斜杠
+                    return Some(probe.join(&n).display().to_string());
+                }
+            }
+        }
+        cur = d.parent();
+    }
+    None
+}
+
+/// 一次判定的完整结果，含**给人看的判定依据**（日志里要写清楚，便于后续开发）。
+#[derive(Debug, Clone)]
+pub struct TechReport {
+    pub api: GraphicsApi,
+    pub engine: GameEngine,
+    pub streamline: bool,
+    /// 判定依据：看过什么、命中了什么。写给日志，不是给界面。
+    pub evidence: Vec<String>,
 }
 
 /// 一次把三件事算出来：图形 API、引擎、以及**是否自带 Streamline（DLSS 帧生成）**。
@@ -1737,6 +1816,12 @@ pub fn engine_from_facts(f: &LayoutFacts) -> GameEngine {
 /// 最后一项对本工具最关键：上游 Mod 要求游戏自带 DLSS 帧生成（Streamline），
 /// 没有它装了也不会生效 —— 这比「引擎是什么」更有用。
 pub fn detect_tech(exe: &Path) -> (GraphicsApi, GameEngine, bool) {
+    let r = detect_tech_report(exe);
+    (r.api, r.engine, r.streamline)
+}
+
+/// 和 detect_tech 一样，但把**判定依据**一起带回来（写日志用）。
+pub fn detect_tech_report(exe: &Path) -> TechReport {
     let imports = pe_imports(exe);
     let mut siblings: Vec<String> = Vec::new();
     if let Some(dir) = exe.parent() {
@@ -1746,7 +1831,12 @@ pub fn detect_tech(exe: &Path) -> (GraphicsApi, GameEngine, bool) {
             }
         }
     }
+    let mut evidence: Vec<String> = Vec::new();
+    evidence.push(format!("导入表 {} 项", imports.len()));
     let mut api = api_from_names(&imports, &siblings);
+    if api != GraphicsApi::Unknown {
+        evidence.push(format!("主 exe 导入表命中 -> {}", api.label()));
+    }
     // 很多引擎（Unity 最典型）的游戏 exe 只是个壳：真正的渲染在引擎 DLL 里，
     // 所以主 exe 的导入表里根本没有 d3d*.dll。这时去看引擎 DLL 自己的导入表 ——
     // 实测一个 Unity 游戏：主 exe 0.6 MB（导入表没提 API），UnityPlayer.dll 里才有。
@@ -1759,9 +1849,13 @@ pub fn detect_tech(exe: &Path) -> (GraphicsApi, GameEngine, bool) {
             let dep = pe_imports(&dir.join(name));
             api = api_from_names(&dep, &siblings);
             if api != GraphicsApi::Unknown {
+                evidence.push(format!("{name} 的导入表命中 -> {}", api.label()));
                 break;
             }
         }
+    }
+    if api == GraphicsApi::Unknown {
+        evidence.push("导入表里没有 d3d*.dll / vulkan-1.dll".to_owned());
     }
     // UE5 的 IoStore：<根>\Content\Paks 下的 .utoc。往上看最多三层找它。
     let mut pak_kinds: Vec<String> = Vec::new();
@@ -1782,19 +1876,88 @@ pub fn detect_tech(exe: &Path) -> (GraphicsApi, GameEngine, bool) {
             cur = d.parent();
         }
     }
+    // 资源扩展名：游戏根目录 + 它的 Data 目录。用来认那些「靠资源格式说话」的引擎
+    // （.rpf = RAGE、.forge = Anvil、.ba2/.bsa = Creation…）。只看扩展名，不读内容。
+    let mut root_exts: Vec<String> = Vec::new();
+    if let Some(dir) = exe.parent() {
+        let mut cur = Some(dir);
+        for _ in 0..2 {
+            let Some(d) = cur else { break };
+            for sub in [d.to_path_buf(), d.join("Data")] {
+                if let Ok(rd) = std::fs::read_dir(&sub) {
+                    for e in rd.flatten().take(500) {
+                        let n = e.file_name().to_string_lossy().to_lowercase();
+                        if let Some((_, ext)) = n.rsplit_once('.') {
+                            if !ext.is_empty() && !root_exts.iter().any(|x| x == ext) {
+                                root_exts.push(ext.to_owned());
+                            }
+                        }
+                    }
+                }
+            }
+            cur = d.parent();
+        }
+    }
     let facts = LayoutFacts {
         exe_name: exe
             .file_name()
             .map(|s| s.to_string_lossy().to_lowercase())
             .unwrap_or_default(),
-        siblings,
+        siblings: siblings.clone(),
         pak_kinds,
+        root_exts: root_exts.clone(),
     };
     let engine = engine_from_facts(&facts);
+    evidence.push(format!(
+        "同目录 {} 个文件、根目录扩展名 {} 种",
+        siblings.len(),
+        root_exts.len()
+    ));
+    let mut relevant: Vec<&str> = Vec::new();
+    for x in &siblings {
+        if x.contains("unityplayer")
+            || x.starts_with("engine")
+            || x.contains("crysystem")
+            || x.contains("re_chunk")
+            || x.ends_with("_data")
+        {
+            relevant.push(x);
+        }
+    }
+    if !relevant.is_empty() {
+        evidence.push(format!("同目录可疑文件 {:?}", &relevant[..relevant.len().min(8)]));
+    }
     let streamline = imports.iter().any(|i| {
         i.contains("nvngx_dlssg") || i.contains("sl.interposer") || i.contains("sl.dlss_g")
     });
-    (api, engine, streamline)
+    // Streamline 也可能由引擎 DLL 带进来（游戏 exe 不直接导入它），一起看。
+    let mut streamline = streamline
+        || siblings.iter().any(|x| {
+            x.contains("sl.interposer") || x.contains("sl.dlss_g") || x.contains("nvngx_dlssg")
+        });
+    if !streamline {
+        if let Some(hit) = find_streamline_marker(exe) {
+            streamline = true;
+            evidence.push(format!("在 {hit} 找到 Streamline 痕迹"));
+        }
+    }
+    if streamline {
+        evidence.push("发现 Streamline / nvngx_dlssg 的痕迹".to_owned());
+    } else {
+        evidence.push("没找到 Streamline 痕迹（导入表 + exe 同目录 + 几个固定候选路径）".to_owned());
+    }
+    let engine_ev = if engine == GameEngine::Unknown {
+        "没找到任何引擎特征（按约定报未知，不猜）".to_owned()
+    } else {
+        format!("命中 -> {}", engine.label())
+    };
+    evidence.push(format!("引擎判定：{engine_ev}"));
+    TechReport {
+        api,
+        engine,
+        streamline,
+        evidence,
+    }
 }
 
 // ---------------------------------------------------------------- 显卡识别

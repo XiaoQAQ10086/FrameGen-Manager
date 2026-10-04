@@ -470,10 +470,14 @@ fn main() -> eframe::Result<()> {
     if let Some(pos) = argv.iter().position(|a| a == "--techtest") {
         let p = PathBuf::from(argv.get(pos + 1).cloned().unwrap_or_default());
         println!("== {} ==", p.display());
-        let (api, engine, streamline) = scan::detect_tech(&p);
-        println!("图形 API   = {}", api.label());
-        println!("引擎       = {}", engine.label());
-        println!("自带帧生成 = {streamline}");
+        let rep = scan::detect_tech_report(&p);
+        println!("图形 API   = {}", rep.api.label());
+        println!("引擎       = {}", rep.engine.label());
+        println!("自带帧生成 = {}", rep.streamline);
+        println!("判定依据:");
+        for e in &rep.evidence {
+            println!("  · {e}");
+        }
         println!("导入表({}) = {:?}", scan::pe_imports(&p).len(), scan::pe_imports(&p));
         return Ok(());
     }
@@ -2289,6 +2293,16 @@ fn selftest() -> usize {
                 exe_name: exe.to_lowercase(),
                 siblings: s(sib),
                 pak_kinds: s(pak),
+                root_exts: Vec::new(),
+            })
+        };
+        // 靠资源扩展名认的几家（RAGE / Anvil / Frostbite / Creation）
+        let eng_ext = |exts: &[&str]| {
+            scan::engine_from_facts(&scan::LayoutFacts {
+                exe_name: "game.exe".to_owned(),
+                siblings: Vec::new(),
+                pak_kinds: Vec::new(),
+                root_exts: s(exts),
             })
         };
         ck(
@@ -2325,6 +2339,36 @@ fn selftest() -> usize {
             &mut fails,
             eng("Mystery.exe", &["random.dll"], &[]) == scan::GameEngine::Unknown,
             "没有证据就报 Unknown，不猜",
+        );
+        ck(
+            &mut fails,
+            eng_ext(&["rpf", "dat"]) == scan::GameEngine::Rage,
+            "根目录有 .rpf -> RAGE（GTA / 荒野大镖客）",
+        );
+        ck(
+            &mut fails,
+            eng_ext(&["forge"]) == scan::GameEngine::Anvil,
+            "根目录有 .forge -> Anvil（刺客信条）",
+        );
+        ck(
+            &mut fails,
+            eng_ext(&["cas", "sb", "toc"]) == scan::GameEngine::Frostbite,
+            ".cas + .sb + .toc -> Frostbite（战地 / FIFA）",
+        );
+        ck(
+            &mut fails,
+            eng_ext(&["cas"]) == scan::GameEngine::Unknown,
+            "只有单个 .cas 不算 Frostbite（宁可报未知）",
+        );
+        ck(
+            &mut fails,
+            eng_ext(&["ba2"]) == scan::GameEngine::Creation,
+            ".ba2 -> Creation Engine（上古卷轴 / 辐射）",
+        );
+        ck(
+            &mut fails,
+            eng_ext(&["pak", "dat", "bin"]) == scan::GameEngine::Unknown,
+            "通用的 .pak/.dat 不算任何引擎",
         );
     }
 
@@ -3583,10 +3627,27 @@ impl App {
         // 启动时走缓存，不再重复读一遍。
         let (api, engine, streamline) = match known_tech {
             Some(t) => t,
-            None => render_exe
-                .as_deref()
-                .map(scan::detect_tech)
-                .unwrap_or((scan::GraphicsApi::Unknown, scan::GameEngine::Unknown, false)),
+            None => match render_exe.as_deref() {
+                Some(p) => {
+                    // 把判定依据写进日志：以后有用户报「引擎认错了」，看这一行就知道
+                    // 我们看到了什么、据此得出了什么。
+                    let rep = scan::detect_tech_report(p);
+                    log::line(&format!(
+                        "图形/引擎 [{}\\] API={} 引擎={} 自带帧生成={} | {}",
+                        entry.name,
+                        rep.api.label(),
+                        rep.engine.label(),
+                        rep.streamline,
+                        rep.evidence.join("；")
+                    ));
+                    (rep.api, rep.engine, rep.streamline)
+                }
+                None => (
+                    scan::GraphicsApi::Unknown,
+                    scan::GameEngine::Unknown,
+                    false,
+                ),
+            },
         };
         // 除了游戏根目录，还要看渲染 EXE 所在目录：
         // BattlEye 经常埋在 ...\Binaries\Win64\BattlEye，只看根目录会漏
@@ -6634,10 +6695,19 @@ impl eframe::App for App {
                             } else if row.streamline {
                                 ui.label(
                                     egui::RichText::new(
-                                        "这个游戏自带 DLSS 帧生成 —— 正是本 Mod 需要的条件",
+                                        "已检测到游戏自带帧生成 —— 正是本 Mod 需要的条件",
                                     )
                                     .size(12.0)
                                     .color(theme::OK),
+                                );
+                            } else {
+                                // 上游 Mod 靠游戏自带的 Streamline 工作：游戏没有它，装了也不会生效。
+                                // 这是「省一次白忙」的关键提示，所以用橙色。
+                                ui.label(
+                                    egui::RichText::new("游戏不自带帧生成！安装无效")
+                                        .size(12.0)
+                                        .color(theme::WARN)
+                                        .strong(),
                                 );
                             }
                         }
