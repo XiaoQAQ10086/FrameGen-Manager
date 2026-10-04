@@ -482,10 +482,16 @@ fn main() -> eframe::Result<()> {
         return Ok(());
     }
 
+    // 窗口大小：优先用上次记住的（用户拉宽过就按拉宽的来）。
+    // 默认也从 1060 加宽到 1180：右侧游戏库要同时放下「游戏名 + 若干徽章 +
+    // 很长的安装路径」，1060 会把名字和路径挤掉（用户反馈过）。
+    let saved_size = util::load_config().window_size.unwrap_or([1180.0, 830.0]);
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("FrameGen Manager")
-        // 卡片比原来的纯文本行高，默认窗口给大一点，四张卡片不用滚动就能看全
-        .with_inner_size([1060.0, 820.0])
+        .with_inner_size([
+            saved_size[0].max(880.0),
+            saved_size[1].max(560.0),
+        ])
         .with_min_inner_size([880.0, 560.0]);
     // 窗口/任务栏图标：取自本 exe 的图标资源（build.rs 把 packaging\app.ico 编了进去），
     // 取不到就照常启动
@@ -3480,6 +3486,9 @@ struct App {
     allow_kernel_ac: bool,
     /// 用户在等后台反作弊扫描；扫完自动继续部署（避免在 UI 线程里遍历整个游戏目录）
     deploy_after_scan: bool,
+    /// 当前窗口大小（逻辑点），和 win_tick 一起用于「记住用户拉的尺寸」
+    win_size: [f32; 2],
+    win_tick: std::time::Instant,
     /// 用户在「另一个代理」弹窗里定下来的选择，等真正部署时用
 
     // ---- 硬件加速 GPU 计划（DLSS 帧生成的系统前提，只读 + 跳转，绝不写注册表）
@@ -3626,6 +3635,8 @@ impl App {
             kernel_ac_pending: None,
             allow_kernel_ac: false,
             deploy_after_scan: false,
+            win_size: [1180.0, 830.0],
+            win_tick: std::time::Instant::now(),
                 hags_fake: match std::env::var("DLSSG_FAKE_HAGS").ok().as_deref() {
                 Some("on") | Some("2") => Some(gpu::HagsState::Enabled),
                 Some("off") | Some("1") => Some(gpu::HagsState::Disabled),
@@ -4648,6 +4659,8 @@ impl App {
             backup_prefix: self.backup_prefix.clone(),
             fg_optimized: self.fg_optimized,
             fg_frames: self.fg_frames,
+            // 顺手把当前窗口大小一起写上：这条保存路径**不能**把用户拉好的尺寸冲掉
+            window_size: Some(self.win_size),
         };
         if let Err(e) = util::save_config(&cfg) {
             self.note(format!("保存配置失败: {e}"));
@@ -5527,6 +5540,21 @@ fn deploy_color(s: &deploy::DeployState) -> egui::Color32 {
 
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // 窗口大小变了就记进配置：用户手动拉宽之后，下次启动要按这个大小打开。
+        // 以前窗口大小是写死的，用户每次都得重新拉（真实反馈：「改好比例后下次又恢复默认」）。
+        // 节流 2 秒写一次，避免拖动窗口时疯狂写盘。
+        if self.win_tick.elapsed() > std::time::Duration::from_secs(2) {
+            self.win_tick = std::time::Instant::now();
+            if let Some(r) = self.ctx.input(|i| i.viewport().inner_rect) {
+                let cur = [r.width().round(), r.height().round()];
+                if (cur[0] - self.win_size[0]).abs() > 1.0 || (cur[1] - self.win_size[1]).abs() > 1.0 {
+                    self.win_size = cur;
+                    let mut cfg = util::load_config();
+                    cfg.window_size = Some(cur);
+                    let _ = util::save_config(&cfg);
+                }
+            }
+        }
         while let Ok(m) = self.rx.try_recv() {
             self.handle(m);
         }

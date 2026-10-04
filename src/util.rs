@@ -208,6 +208,12 @@ pub struct AppConfig {
     /// 部署时写进 INI 的「倍率上限」（3 = 最高 4X 出厂默认；5 = 最高 6X）。
     #[serde(default = "default_fg_frames")]
     pub fg_frames: u8,
+    /// 上次用的**窗口大小**（逻辑点）。
+    ///
+    /// 以前窗口大小是写死的：用户嫌右侧游戏名/路径被挤掉、手动拉宽，下次启动又回到
+    /// 默认值，得反复调（真实反馈）。这里记住它，启动时按上次的大小打开。
+    #[serde(default)]
+    pub window_size: Option<[f32; 2]>,
 }
 
 // 这两个是**业务默认**（1 / 3），不是 u8 的类型默认（0），所以 AppConfig 的 Default
@@ -227,6 +233,7 @@ impl Default for AppConfig {
             backup_prefix: String::new(),
             fg_optimized: default_fg_optimized(),
             fg_frames: default_fg_frames(),
+            window_size: None,
         }
     }
 }
