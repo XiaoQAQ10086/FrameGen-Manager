@@ -1985,6 +1985,7 @@ fn selftest() -> usize {
                     api: scan::GraphicsApi::Unknown,
                     engine: scan::GameEngine::Unknown,
                     streamline: false,
+                    tech_scanned: false,
                 },
                 scan::CachedRow {
                     entry: GameEntry {
@@ -1998,6 +1999,7 @@ fn selftest() -> usize {
                     api: scan::GraphicsApi::Unknown,
                     engine: scan::GameEngine::Unknown,
                     streamline: false,
+                    tech_scanned: false,
                 },
             ],
             manual: vec![scan::CachedRow {
@@ -2007,6 +2009,7 @@ fn selftest() -> usize {
                 api: scan::GraphicsApi::Unknown,
                 engine: scan::GameEngine::Unknown,
                 streamline: false,
+                tech_scanned: false,
             }],
             ignored: vec![dead.display().to_string()],
         };
@@ -2247,6 +2250,53 @@ fn selftest() -> usize {
                 );
             }
         }
+    }
+
+    // ---- 旧缓存必须重新检测（真出现过的 bug）----
+    println!("\n--- 旧缓存兼容 ---");
+    {
+        let dir = std::env::temp_dir().join("fgm-techcache");
+        let _ = std::fs::create_dir_all(&dir);
+        let entry = GameEntry {
+            source: scan::Launcher::Steam,
+            app_id: "9".to_owned(),
+            name: "旧缓存游戏".to_owned(),
+            install_dir: dir.clone(),
+        };
+        // 老版本写的缓存：没有 tech_scanned 字段（反序列化后是 false），api/engine 是空
+        let old = scan::CachedRow {
+            entry: entry.clone(),
+            render_exe: None,
+            ac: AcTier::None,
+            api: scan::GraphicsApi::Unknown,
+            engine: scan::GameEngine::Unknown,
+            streamline: false,
+            tech_scanned: false,
+        };
+        let row = App::build_cached_row(&old, true).unwrap();
+        ck(
+            &mut fails,
+            !row.tech_scanned,
+            "老缓存（没算过）留给后台补算，而不是把「未知」当结论",
+        );
+        let fresh = scan::CachedRow {
+            entry,
+            render_exe: None,
+            ac: AcTier::None,
+            api: scan::GraphicsApi::Dx12,
+            engine: scan::GameEngine::Unity,
+            streamline: true,
+            tech_scanned: true,
+        };
+        let row2 = App::build_cached_row(&fresh, true).unwrap();
+        ck(
+            &mut fails,
+            row2.tech_scanned
+                && row2.api == scan::GraphicsApi::Dx12
+                && row2.engine == scan::GameEngine::Unity,
+            "算过的缓存直接用（启动不重复读 PE）",
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // ---- 图形 API 与引擎判定（用真实世界的例子构造数据）----
@@ -3199,6 +3249,8 @@ struct GameRow {
     api: scan::GraphicsApi,
     engine: scan::GameEngine,
     streamline: bool,
+    /// 上面三项是不是真的算过（false = 待后台补算）
+    tech_scanned: bool,
 }
 
 /// 选中游戏后「飞向游戏目录」的那张小卡片。
@@ -3241,6 +3293,7 @@ fn row_to_cached(r: &GameRow) -> scan::CachedRow {
         api: r.api,
         engine: r.engine,
         streamline: r.streamline,
+        tech_scanned: r.tech_scanned,
     }
 }
 
@@ -3309,6 +3362,8 @@ enum Msg {
     ImportDone(String),
     /// 「存到游戏库」的后台分析结果（缓存行 + 拼好的列表行）
     ManualAdded(Box<(scan::CachedRow, Option<GameRow>)>, String),
+    /// 旧缓存缺图形 API / 引擎，后台补算完了
+    TechFilled(Vec<(PathBuf, scan::TechReport)>),
     UpdateChecked(UpdateSummary),
     /// 文案 / 总进度 / 总字节数（0 表示还没算出来）
     Progress(String, f32, u64),
@@ -3608,6 +3663,9 @@ impl App {
         };
         // 上次扫过的游戏库直接摆出来，不用用户再点一次「扫描」
         app.load_cached_library();
+        // 注意：补算图形 API / 引擎**不能**放在这里 —— load_cached_library 是异步的，
+        // 它要等后台线程把行建好、发回 Msg::LibraryLoaded 之后 self.games 才有内容。
+        // 放这里的话 pending 永远是空的，补算一次都不会发生（这个坑踩过）。
         app
     }
 
@@ -3618,6 +3676,8 @@ impl App {
         manual: bool,
         known_exe: Option<PathBuf>,
         known_tech: Option<(scan::GraphicsApi, scan::GameEngine, bool)>,
+        // true = 现在就检测（后台线程里）；false = 先留空，等后台补（启动时用，别卡界面）
+        detect_now: bool,
     ) -> GameRow {
         let render_exe = match known_exe {
             Some(p) if p.is_file() => Some(p),
@@ -3625,8 +3685,16 @@ impl App {
         };
         // 图形 API / 引擎 / 有没有 Streamline：只在有渲染 EXE 时才算（要读 PE 导入表）。
         // 启动时走缓存，不再重复读一遍。
-        let (api, engine, streamline) = match known_tech {
-            Some(t) => t,
+        let (api, engine, streamline, tech_scanned) = match known_tech {
+            Some(t) => (t.0, t.1, t.2, true),
+            // 缓存里没有（旧缓存 / 从没算过）而且现在不算 -> 留空待补。
+            // 绝不能把 Unknown 当成结论：那就是「功能看起来没生效」的来源。
+            None if !detect_now => (
+                scan::GraphicsApi::Unknown,
+                scan::GameEngine::Unknown,
+                false,
+                false,
+            ),
             None => match render_exe.as_deref() {
                 Some(p) => {
                     // 把判定依据写进日志：以后有用户报「引擎认错了」，看这一行就知道
@@ -3640,11 +3708,13 @@ impl App {
                         rep.streamline,
                         rep.evidence.join("；")
                     ));
-                    (rep.api, rep.engine, rep.streamline)
+                    (rep.api, rep.engine, rep.streamline, true)
                 }
                 None => (
                     scan::GraphicsApi::Unknown,
                     scan::GameEngine::Unknown,
+                    false,
+                    // 连渲染 EXE 都没找到：不是「算过」，等以后找到再算
                     false,
                 ),
             },
@@ -3680,11 +3750,13 @@ impl App {
             api,
             engine,
             streamline,
+            tech_scanned,
         }
     }
 
     fn build_row(entry: GameEntry, manual: bool) -> GameRow {
-        Self::build_row_with(entry, manual, None, None)
+        // 扫描路径跑在后台线程里，直接算
+        Self::build_row_with(entry, manual, None, None, true)
     }
 
     /// 缓存条目 -> 界面行。安装目录已经不在的（游戏卸载了）扫出来的条目直接丢掉；
@@ -3693,13 +3765,54 @@ impl App {
         if !c.entry.install_dir.is_dir() && !manual {
             return None;
         }
+        // **只有真算过的缓存才直接用。**老缓存（没有 tech_scanned）留空，
+        // 交给后台补算 —— 把「未知」当成结论，用户就会看到功能没生效。
+        let known = if c.tech_scanned {
+            Some((c.api, c.engine, c.streamline))
+        } else {
+            None
+        };
         Some(Self::build_row_with(
             c.entry.clone(),
             manual,
             c.render_exe.clone(),
-            // 缓存里有就直接用，省掉一次 PE 读取 + 目录列举
-            Some((c.api, c.engine, c.streamline)),
+            known,
+            // 启动时不在 UI 线程里读 PE：留空，随后台一起补
+            false,
         ))
+    }
+
+    /// 缓存里没有图形 API / 引擎的（旧版本写的缓存），启动后在**后台**补算一遍。
+    ///
+    /// 为什么不在启动路径里直接算：读 PE 导入表 + 列目录是有 I/O 的，几百个游戏会让
+    /// 「打开就有界面」变慢。这里先把列表显示出来，算完再填进去、顺手写回缓存。
+    fn fill_cached_tech(&mut self) {
+        let pending: Vec<(PathBuf, PathBuf)> = self
+            .games
+            .iter()
+            .filter(|r| !r.tech_scanned)
+            .filter_map(|r| r.render_exe.clone().map(|e| (r.entry.install_dir.clone(), e)))
+            .collect();
+        if pending.is_empty() {
+            return;
+        }
+        self.spawn(move |tx, ctx| {
+            let mut out: Vec<(PathBuf, scan::TechReport)> = Vec::new();
+            for (dir, exe) in pending {
+                let rep = scan::detect_tech_report(&exe);
+                log::line(&format!(
+                    "图形/引擎（补算缓存）[{}] API={} 引擎={} 自带帧生成={} | {}",
+                    dir.display(),
+                    rep.api.label(),
+                    rep.engine.label(),
+                    rep.streamline,
+                    rep.evidence.join("；")
+                ));
+                out.push((dir, rep));
+            }
+            let _ = tx.send(Msg::TechFilled(out));
+            ctx.request_repaint();
+        });
     }
 
     /// 启动时把上次的扫描结果读出来显示。只读本地缓存：不联网、不在后台反复轮询，
@@ -3794,6 +3907,8 @@ impl App {
                 api,
                 engine,
                 streamline,
+                // 上面刚算过
+                tech_scanned: true,
             };
             let row = App::build_cached_row(&cached, true);
             let _ = tx.send(Msg::ManualAdded(Box::new((cached, row)), name));
@@ -4195,6 +4310,8 @@ impl App {
                 } else {
                     format!("已载入上次的扫描结果：{n} 个游戏（要刷新请点「扫描」）")
                 };
+                // 行到齐了 —— 现在才是补算图形 API / 引擎的时机（在后台，不卡界面）
+                self.fill_cached_tech();
             }
             Msg::AcScanned(dir, rep) => {
                 // **只有最新一次扫描的结果才配清掉「分析中」。**连续换目录时，
@@ -4217,6 +4334,33 @@ impl App {
                     // 目录已经换了：这次结果没用，别把用户永远挂在「稍后继续」上
                     self.deploy_after_scan = false;
                     self.status = "部署目录已改变，请重新点「部署」".to_owned();
+                }
+            }
+            Msg::TechFilled(list) => {
+                let mut changed = false;
+                for (dir, rep) in list {
+                    // 手动条目也一起更新，否则每次启动都要重算它们
+                    for c in self.manual.iter_mut() {
+                        if c.entry.install_dir == dir {
+                            c.api = rep.api;
+                            c.engine = rep.engine;
+                            c.streamline = rep.streamline;
+                            c.tech_scanned = true;
+                        }
+                    }
+                    for r in self.games.iter_mut() {
+                        if r.entry.install_dir == dir {
+                            r.api = rep.api;
+                            r.engine = rep.engine;
+                            r.streamline = rep.streamline;
+                            r.tech_scanned = true;
+                            changed = true;
+                        }
+                    }
+                }
+                if changed {
+                    // 写回缓存：下次启动直接就有，不用再算一遍
+                    self.persist_library();
                 }
             }
             Msg::ManualAdded(payload, name) => {

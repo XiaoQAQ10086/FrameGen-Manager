@@ -59,6 +59,13 @@ pub struct CachedRow {
     /// 游戏自带的导入表里有没有 Streamline（= 自带 DLSS 帧生成）
     #[serde(default)]
     pub streamline: bool,
+    /// 上面三项**是不是真的算过**。
+    ///
+    /// 加这个字段是因为踩过坑：老缓存里没有 api/engine 字段，反序列化后是默认值
+    /// （Unknown），而代码把「Unknown」当成「已经算过」→ 游戏库那一行永远不显示
+    /// 图形 API 和引擎，重新扫描也一样（用户看到的就是「功能没生效」）。
+    #[serde(default)]
+    pub tech_scanned: bool,
 }
 
 fn tier_none() -> crate::anticheat::AcTier {
