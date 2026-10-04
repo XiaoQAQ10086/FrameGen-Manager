@@ -2236,7 +2236,7 @@ fn selftest() -> usize {
         );
         ck(
             &mut fails,
-            util::long_path(Path::new("C:\\short\\x.dll")) == PathBuf::from("C:\\short\\x.dll"),
+            util::long_path(Path::new("C:\\short\\x.dll")).as_path() == Path::new("C:\\short\\x.dll"),
             "短路径不加 verbatim 前缀（免得改变别的语义）",
         );
         let deep = format!("C:\\{}\\x.dll", "a".repeat(250));
