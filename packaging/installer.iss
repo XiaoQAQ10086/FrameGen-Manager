@@ -35,6 +35,14 @@ OutputBaseFilename=FrameGen-Manager-v{#AppVersion}-setup
 Compression=lzma2/ultra64
 SolidCompression=yes
 WizardStyle=modern
+; **强制关闭正在运行的本程序。**
+; 为什么必须是 force：从旧版本升级时，发起更新的那个程序是老版本 —— 它可能卡在
+; 「等安装程序结束」上、处理不了关闭消息，Restart Manager 的优雅关闭就会失败，
+; Inno 只能弹出「中止/重试/忽略」框让用户自己处理（用户实测撞到过，还得手动关程序）。
+; force 走 RmForceShutdown 直接结束它，静默更新才能一路走完。
+; 本程序没有未保存的数据（设置/游戏库都是即时落盘），强制关闭不会丢东西。
+CloseApplications=force
+RestartApplications=yes
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 UninstallDisplayName={#AppName}
