@@ -4346,7 +4346,7 @@ impl App {
                     }
                     Ok(s) => {
                         self.finish_busy(format!(
-                            "安装程序退出码 {s}：可能被杀软拦下或权限不足，本程序没有更新，请手动安装 {}",
+                            "安装失败（{s}）：可能被杀软拦下、或目标目录写不进去。请先完全关闭本程序，再手动运行 {}",
                             installer.display()
                         ));
                         if let Some(d) = std::env::current_exe()
@@ -4357,7 +4357,7 @@ impl App {
                         }
                     }
                     Err(e) => {
-                        self.finish_busy(format!("等安装程序结束失败：{e}（请手动安装）"));
+                        self.finish_busy(format!("等待安装程序时出错：{e}。请手动运行安装包。"));
                     }
                 }
             }

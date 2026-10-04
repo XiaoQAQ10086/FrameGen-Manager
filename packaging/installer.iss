@@ -43,7 +43,7 @@ SetupIconFile=app.ico
 UninstallDisplayIcon={app}\{#AppExeName}
 
 [Languages]
-Name: "chinese"; MessagesFile: "compiler:Default.isl"
+Name: "chinesesimplified"; MessagesFile: "Languages\ChineseSimplified.isl"
 
 ; 安装程序自己的对话框文案：Inno 只自带英文（Default.isl），
 ; 这里手动覆盖最可能出现的几条 —— 尤其是「关不掉正在运行的程序」那一种，
