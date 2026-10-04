@@ -45,6 +45,21 @@ UninstallDisplayIcon={app}\{#AppExeName}
 [Languages]
 Name: "chinese"; MessagesFile: "compiler:Default.isl"
 
+; 安装程序自己的对话框文案：Inno 只自带英文（Default.isl），
+; 这里手动覆盖最可能出现的几条 —— 尤其是「关不掉正在运行的程序」那一种，
+; 用户以前撞上的是英文，看不懂。
+[Messages]
+SetupAppRunningError=安装程序检测到 %1 正在运行。%n%n请先把它全部关闭，然后点「确定」继续，或点「取消」退出安装。
+UninstallAppRunningError=卸载程序检测到 %1 正在运行。%n%n请先把它全部关闭，然后点「确定」继续，或点「取消」退出。
+ErrorCloseApplications=安装程序无法自动关闭所有正在使用相关文件的程序。%n%n请手动关闭它们后再继续。
+CloseApplications=自动关闭这些程序(&A)
+DontCloseApplications=不要关闭这些程序(&D)
+ErrorChangingAttr=修改已有文件的属性时出错：
+ErrorCopying=复制文件时出错：
+ErrorCreatingDir=创建目录时出错：
+ErrorCreatingFile=创建文件时出错：
+WindowsVersionNotSupported=本程序不支持你当前使用的 Windows 版本。
+
 [Tasks]
 Name: "desktopicon"; Description: "创建桌面快捷方式"; Flags: unchecked
 

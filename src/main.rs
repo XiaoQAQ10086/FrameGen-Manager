@@ -3364,6 +3364,8 @@ enum Msg {
     ManualAdded(Box<(scan::CachedRow, Option<GameRow>)>, String),
     /// 旧缓存缺图形 API / 引擎，后台补算完了
     TechFilled(Vec<(PathBuf, scan::TechReport)>),
+    /// 自更新的安装程序退出了（旁观线程发回来的，界面线程从不等它）
+    UpdateInstallerExited(std::io::Result<std::process::ExitStatus>, PathBuf),
     UpdateChecked(UpdateSummary),
     /// 文案 / 总进度 / 总字节数（0 表示还没算出来）
     Progress(String, f32, u64),
@@ -4336,6 +4338,29 @@ impl App {
                     self.status = "部署目录已改变，请重新点「部署」".to_owned();
                 }
             }
+            Msg::UpdateInstallerExited(st, installer) => {
+                match st {
+                    Ok(s) if s.success() => {
+                        // 装好了：关掉自己，让用户从新版本启动（安装程序通常也会自动拉起）
+                        self.ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                    Ok(s) => {
+                        self.finish_busy(format!(
+                            "安装程序退出码 {s}：可能被杀软拦下或权限不足，本程序没有更新，请手动安装 {}",
+                            installer.display()
+                        ));
+                        if let Some(d) = std::env::current_exe()
+                            .ok()
+                            .and_then(|p| p.parent().map(Path::to_path_buf))
+                        {
+                            open_in_explorer(&d);
+                        }
+                    }
+                    Err(e) => {
+                        self.finish_busy(format!("等安装程序结束失败：{e}（请手动安装）"));
+                    }
+                }
+            }
             Msg::TechFilled(list) => {
                 let mut changed = false;
                 for (dir, rep) in list {
@@ -5175,6 +5200,9 @@ impl App {
         let mut cmd = std::process::Command::new(installer);
         cmd.arg("/SILENT")
             .arg("/NORESTART")
+            // 静默模式下万一有话要说（比如关不掉正在运行的我们），按默认动作走。
+            // 否则用户会撞上一个他看不懂的**英文**对话框（真实反馈过）。
+            .arg("/SUPPRESSMSGBOXES")
             .arg(format!("/DIR={}", dir.display()));
         self.status = "正在安装新版本...".to_owned();
         match cmd.spawn() {
@@ -5184,25 +5212,17 @@ impl App {
                     installer.display(),
                     dir.display()
                 ));
-                // **等它退出并看退出码。**以前 spawn 完就关自己：安装包被杀软拦下、
-                // UAC 被点「否」、目标目录不可写时，用户只看到程序自己关了 ——
-                // 没有任何提示，也不知道其实还是旧版（下次启动照样提示有更新）。
-                match child.wait() {
-                    Ok(st) if st.success() => {
-                        self.ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                    }
-                    Ok(st) => {
-                        self.finish_busy(format!(
-                            "安装程序退出码 {st}：可能被杀软拦下或权限不足，本程序没有更新，请手动安装 {}",
-                            installer.display()
-                        ));
-                        open_in_explorer(&dir);
-                    }
-                    Err(e) => {
-                        self.finish_busy(format!("等安装程序结束失败：{e}（请手动安装）"));
-                        open_in_explorer(&dir);
-                    }
-                }
+                // **界面线程绝不能 wait()。**安装程序会通过 Restart Manager 请我们退出：
+                // 界面卡在 wait() 上就处理不了关闭消息，它关不掉正在运行的 exe，只能弹一个
+                // 「文件被占用 / 请选择操作」的英文对话框（用户报的就是这个）。
+                // 所以让一个旁观线程去 wait，结果用消息发回来 —— 界面始终可响应，
+                // 安装程序能顺利关掉我们，装完还会按 RestartApplications 把我们拉起来。
+                let (tx, ctx, inst) = (self.tx.clone(), self.ctx.clone(), installer.to_path_buf());
+                std::thread::spawn(move || {
+                    let st = child.wait();
+                    let _ = tx.send(Msg::UpdateInstallerExited(st, inst));
+                    ctx.request_repaint();
+                });
             }
             Err(e) => {
                 self.status = format!("启动更新安装程序失败：{e}");
