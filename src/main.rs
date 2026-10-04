@@ -6895,32 +6895,28 @@ impl eframe::App for App {
                         // DX11 及更早的游戏装上也白装 —— 提前说清能省用户一次白忙。
                         {
                             // 徽章已经说明了「是什么」，这里只补「所以呢」。
-                            if row.api.frame_gen_possible() == Some(false) {
-                                ui.label(
-                                    egui::RichText::new(format!(
-                                        "这个游戏是 {}：DLSS 帧生成在它上面不存在，装了也不会生效",
-                                        row.api.label()
-                                    ))
-                                    .size(12.0)
-                                    .color(theme::WARN),
-                                );
-                            } else if row.streamline {
-                                ui.label(
-                                    egui::RichText::new(
-                                        "已检测到游戏自带帧生成 —— 正是本 Mod 需要的条件",
-                                    )
-                                    .size(12.0)
-                                    .color(theme::OK),
-                                );
-                            } else {
-                                // 上游 Mod 靠游戏自带的 Streamline 工作：游戏没有它，装了也不会生效。
-                                // 这是「省一次白忙」的关键提示，所以用橙色。
-                                ui.label(
-                                    egui::RichText::new("游戏不自带帧生成！安装无效")
+                            // **只有真的检测过才下结论**：旧缓存刚启动时后台还在算，
+                            // 那时说「可能无效」等于拿未知当结论（这正是之前踩过的坑）。
+                            if row.tech_scanned {
+                                if row.streamline && row.api.frame_gen_possible() != Some(false) {
+                                    ui.label(
+                                        egui::RichText::new(
+                                            "已检测到游戏自带帧生成 —— 正是本 Mod 需要的条件",
+                                        )
                                         .size(12.0)
-                                        .color(theme::WARN)
-                                        .strong(),
-                                );
+                                        .color(theme::OK),
+                                    );
+                                } else {
+                                    // 两种情况合并成同一句：API 太老（帧生成在那上面不存在）
+                                    // 和「没检测到游戏自带 Streamline」。具体的「为什么」
+                                    // 由上面那行徽章表达（API 徽章的颜色 / 有没有「自带帧生成」）。
+                                    ui.label(
+                                        egui::RichText::new("该游戏可能部署帧生成无效")
+                                            .size(12.0)
+                                            .color(theme::WARN)
+                                            .strong(),
+                                    );
+                                }
                             }
                         }
                         ui.add_space(2.0);
