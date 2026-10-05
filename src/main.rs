@@ -6890,35 +6890,9 @@ impl eframe::App for App {
                                 None => theme::hint("渲染 EXE   未找到（可手动选择其所在目录）"),
                             });
                         }
-                        // 图形 API / 引擎 / 是否自带 DLSS 帧生成。
-                        // 这不只是「看着有用」：帧生成只在 DX12 / Vulkan 下存在，
-                        // DX11 及更早的游戏装上也白装 —— 提前说清能省用户一次白忙。
-                        {
-                            // 徽章已经说明了「是什么」，这里只补「所以呢」。
-                            // **只有真的检测过才下结论**：旧缓存刚启动时后台还在算，
-                            // 那时说「可能无效」等于拿未知当结论（这正是之前踩过的坑）。
-                            if row.tech_scanned {
-                                if row.streamline && row.api.frame_gen_possible() != Some(false) {
-                                    ui.label(
-                                        egui::RichText::new(
-                                            "已检测到游戏自带帧生成 —— 正是本 Mod 需要的条件",
-                                        )
-                                        .size(12.0)
-                                        .color(theme::OK),
-                                    );
-                                } else {
-                                    // 两种情况合并成同一句：API 太老（帧生成在那上面不存在）
-                                    // 和「没检测到游戏自带 Streamline」。具体的「为什么」
-                                    // 由上面那行徽章表达（API 徽章的颜色 / 有没有「自带帧生成」）。
-                                    ui.label(
-                                        egui::RichText::new("该游戏可能部署帧生成无效")
-                                            .size(12.0)
-                                            .color(theme::WARN)
-                                            .strong(),
-                                    );
-                                }
-                            }
-                        }
+                        // 这里以前会再跟一句结论文字（「该游戏可能部署帧生成无效」之类）。
+                        // 用户明确要求去掉：事实（图形 API、引擎、有没有自带帧生成）由上面那行
+                        // 徽章摆出来就够了，结论性的措辞容易被当成「我们保证装了没用」。
                         ui.add_space(2.0);
                         ui.horizontal(|ui| {
                             // 关键：部署目标必须是「渲染 EXE 所在目录」，不是游戏根目录。
