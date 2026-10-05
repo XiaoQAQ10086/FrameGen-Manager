@@ -195,6 +195,8 @@ A: 先在游戏卡片里点「还原」清理游戏目录，再删掉本程序�
     framegen-manager.json    设置
 
   想做成绿色便携版：整个文件夹拷走就行，东西全在里面。
+  窗口大小会被记住：拉到你觉得合适的比例之后，下次打开还是这个大小
+  （存在 framegen-manager.json 的 window_size 里；删掉那一项就回到默认大小）。
   程序目录不可写时（比如装在 C:\Program Files），备份和设置会自动回退到
   %APPDATA%\FrameGen-Manager\。
 
