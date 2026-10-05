@@ -210,3 +210,31 @@ RankFTW/rhi-repo 的 GitHub Releases，文件本身是 NVIDIA 官方签名（程
 校验签名者必须是 NVIDIA，不符就丢弃）。这两个文件的版权归 NVIDIA。
 
 本工具与 NVIDIA、sdli1995、RankFTW 均无关联。
+
+
+常见问题
+----------
+
+Q: 开着微星小飞机（MSI Afterburner / RTSS）时，一打开本程序就叠上来一个帧数显示，
+   挡住界面 —— 怎么关掉？
+
+A: 那个帧数是 RTSS（RivaTuner Statistics Server）画的，不是本程序画的。
+   本程序用 OpenGL 绘制界面，RTSS 默认会 hook 所有 3D 程序，于是把 OSD 也叠了上来。
+
+   一次性关掉（只影响本程序，不影响你玩游戏时的显示）：
+     1. 打开 RTSS（小飞机在托盘里的那个图标，或开始菜单里的
+        RivaTuner Statistics Server）；
+     2. 点左下角的「Add / 添加」，选中本程序（framegen-manager.exe）；
+     3. 在右侧把「Application detection level / 应用程序检测级别」设为 None（无），
+        并把「On-Screen Display support / 屏幕显示支持」设为 OFF。
+
+   只想临时关一下：在 Afterburner 的「OSD 显示切换键」上按一下（默认没绑定，
+   可以在 Afterburner 设置里绑一个热键）。
+
+   本程序不会去改别的软件的配置，所以这一步只能你自己做一次 —— 做一次就永久生效。
+
+Q: 界面卡住、窗口「未响应」？
+
+A: 请先确认版本不低于 0.9.15。旧版本在扫描大游戏目录、或点「部署」时会在界面线程里
+   遍历目录，遇到网络盘或超大目录会短暂卡住。新版本已经把这类工作移到后台。
+   如果仍旧复现，请把 logs\framegen.log 提供给作者。
