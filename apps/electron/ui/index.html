@@ -1,0 +1,199 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"/>
+<title>FrameGen Manager</title>
+<link rel="stylesheet" href="style.css"/>
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand"><span class="dot"></span><span>FrameGen Manager</span></div>
+  <div class="gpu" id="gpu" title="">一键为20和30系显卡部署帧生成及DLSS5（实验性功能）</div>
+  <div class="spacer"></div>
+  <nav class="tabs" id="tabs">
+    <button class="tab active" data-page="lib" type="button">帧生成</button>
+    <button class="tab" data-page="dlss5" type="button">DLSS5（实验性）</button>
+    <button class="tab" data-page="settings" type="button">设置</button>
+    <button class="tab" data-page="help" type="button">打赏赞助</button>
+  </nav>
+  <button class="btn" id="btn-check" type="button">检查更新</button>
+</header>
+
+<!-- ------------------------------------------------ 主页面：左侧栏 + 游戏库列表 -->
+<main class="page" id="page-lib">
+  <div class="layout">
+
+    <aside class="side">
+      <section class="panel">
+        <div class="ctitle">显卡驱动及系统设置</div>
+        <div class="chips" id="gpu-chips"><span class="chip gray">读取中…</span></div>
+        <div class="kv2"><span>驱动版本</span><b id="drv">-</b></div>
+        <div class="kv2"><span>硬件加速 GPU 计划</span><b id="hags">-</b></div>
+        <button class="btn wide" id="btn-hags" type="button">打开硬件加速GPU计划设置</button>
+        <div class="gate hidden" id="gpu-gate"></div>
+      </section>
+
+      <!-- 显卡名称伪装：从退役的 egui 版搬回来（core 里的 gpu::apply/restore 一直没删）。
+           只改 HKLM\...\Enum\PCI\<实例>\DeviceDesc 这一个值，改之前先把原值备份到备份目录；
+           名单只有 5060 / 5090 两档（core 的 PRESETS_UI），随时可还原。 -->
+      <section class="panel" id="panel-spoof">
+        <div class="ctitle">显卡名称伪装</div>
+        <div class="kv2"><span>当前显示</span><b id="spoof-cur">-</b></div>
+        <div class="kv2"><span>驱动记录</span><b id="spoof-drv">-</b></div>
+        <div class="row">
+          <select class="input" id="spoof-sel" title="只提供这两档，避免填错型号"></select>
+          <button class="btn primary" id="btn-spoof-apply" type="button">应用</button>
+        </div>
+        <button class="btn wide" id="btn-spoof-restore" type="button">还原为原来的名称</button>
+        <div class="hint" id="spoof-note">读取中…</div>
+      </section>
+
+      <section class="panel">
+        <div class="ctitle">资产文件夹</div>
+        <!-- 资产目录原先是单独一张卡，现在并到这里：它和资产本来就是一件事 -->
+        <!-- 并进上游资产之后没有卡片标题了，路径得自己说明是什么 -->
+        <div class="path" id="assets-dir">-</div>
+        <div class="row">
+          <button class="btn" id="btn-open-assets" type="button">打开文件夹</button>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="ctitle">帧生成Mod及帧生成运行库</div>
+        <div class="mods" id="mod-list"></div>
+      </section>
+
+      <!-- 日志：原来在设置页，现在挪到主页左栏最底下。日志是实时产生的，所以不要刷新按钮，
+           只留「复制」—— 复制出来的是「环境信息 + 日志尾部」，方便排查问题。 -->
+      <section class="panel">
+        <div class="ctitle">日志<span class="spacer"></span>
+          <button class="btn small" id="btn-log-copy" type="button">复制</button>
+        </div>
+        <pre class="log logslim" id="log-box">正在读取…</pre>
+      </section>
+    </aside>
+
+    <section class="content">
+      <div class="listhead">
+        <div class="lh-text">
+          <h1>游戏库</h1>
+          <div class="sub" id="lib-sub">正在载入…</div>
+        </div>
+        <div class="lh-actions">
+          <!-- 按钮 + 左上角的小问号（用户要求问号在按钮左上角）：
+               鼠标靠近问号弹出完整说明（原生 title 有延迟、样式也不受控，所以自己画） -->
+          <span class="pickwrap">
+            <button class="btn" id="btn-add-game" type="button" title="Steam / Epic / WeGame 扫不到的游戏，自己指一个目录">手动添加游戏exe启动根目录</button>
+            <span class="qmark" role="img" aria-label="说明" data-tip="当扫描游戏库时没有找到自己的游戏请在这里手动添加游戏exe启动根目录文件夹路径！请注意若选错路径会导致部署帧生成无效！">?</span>
+          </span>
+          <!-- 「已被移除的游戏」：原来这里是左栏一块常驻面板（一串路径），现在和 DLSS5 页
+               统一成同一个入口 —— 按钮 + 和游戏库一样的卡片（用户要求）。 -->
+          <button class="btn" id="btn-removed-games" type="button" title="看看从游戏库里移除过哪些游戏，可以放回来">已被移除的游戏</button>
+          <button class="btn primary" id="btn-scan" type="button" title="扫描 Steam / Epic / WeGame 的游戏库（只读）">扫描游戏库</button>
+        </div>
+      </div>
+      <div class="liblist" id="lib-list"></div>
+    </section>
+
+  </div>
+</main>
+
+<!-- ------------------------------------------------ DLSS5 页 -->
+<main class="page hidden" id="page-dlss5">
+  <div class="pagehead">
+    <h1>DLSS5 接入</h1>
+    <div class="warnbig">目前仅适用于自带DLSS的游戏开启DLSS5，老游戏以及不自带DLSS的游戏无法开启！</div>
+  </div>
+  <div class="toolbar">
+    <button class="btn primary" id="btn-dlss5-scan" type="button">扫描游戏库</button>
+    <button class="btn" id="btn-dlss5-removed" type="button">已被移除的游戏</button>
+    <!-- 扫不出来的游戏（或者扫出来的目录不对）用这个：直接指它的启动 exe，目录取 exe 所在那一层。
+         入库逻辑与「添加目录」是同一份，区别只在入口选的是文件还是文件夹。 -->
+    <button class="btn" id="btn-dlss5-pick" type="button" title="有些游戏扫不出来：直接指它的启动 exe，部署就落在 exe 所在的那一层">手动选择游戏根目录exe启动文件</button>
+    <div class="spacer"></div>
+  </div>
+  <section class="section">
+    <h2>自带 DLSS（可用 DLSS5）<span class="count" id="c-dlss">0</span></h2>
+    <div class="wall" id="wall-dlss"></div>
+  </section>
+  <section class="section">
+    <h2>其它 / 未知<span class="count" id="c-other">0</span></h2>
+    <div class="wall" id="wall-other"></div>
+  </section>
+</main>
+
+<!-- ------------------------------------------------ 设置页 -->
+<main class="page hidden" id="page-settings">
+  <div class="pagehead">
+    <h1>设置</h1>
+    <div class="sub">路径 · 日志 · 自更新</div>
+  </div>
+
+  <div class="stack">
+    <section class="panel">
+      <div class="ctitle">自更新</div>
+      <div class="kv2"><span>当前版本</span><b id="ver-cur">-</b></div>
+      <div class="kv2"><span>最新版本</span><b id="ver-latest">未检查</b></div>
+      <div class="row">
+        <button class="btn primary" id="btn-self-update" type="button">检查新版本</button>
+      </div>
+    </section>
+
+    <section class="panel">
+      <div class="ctitle">路径</div>
+      <div class="pathrow"><span>资产目录</span><code id="p-assets">-</code><button class="btn small" id="btn-open-p-assets" type="button">打开</button></div>
+      <div class="pathrow"><span>备份目录</span><code id="p-backups">-</code><button class="btn small" id="btn-open-p-backups" type="button">打开</button></div>
+      <div class="pathrow"><span>日志目录</span><code id="p-logs">-</code><button class="btn small" id="btn-open-p-logs" type="button">打开</button></div>
+    </section>
+
+  </div>
+</main>
+
+<!-- ------------------------------------------------ 使用说明 -->
+<main class="page hidden" id="page-help">
+  <div class="pagehead">
+    <h1>打赏赞助</h1>
+    <div class="sub">如果这个工具帮到了你，欢迎请作者喝杯奶茶</div>
+  </div>
+
+  <div class="donate">
+    <figure class="qr">
+      <img src="img/wechat.png" alt="微信收款码"/>
+      <figcaption>微信支付</figcaption>
+    </figure>
+    <figure class="qr">
+      <img src="img/alipay.jpg" alt="支付宝收款码"/>
+      <figcaption>支付宝</figcaption>
+    </figure>
+  </div>
+
+  <p class="donate-note">您的打赏是作者持续更新下去的动力(≧◡≦) ♡</p>
+</main>
+
+<!-- ------------------------------------------------ 页面内弹层容器（替代 alert / confirm） -->
+<!-- 更新弹窗：自更新的进度画在这里，不动底部那条进度条（用户要求） -->
+<div class="upd hidden" id="upd">
+  <div class="upd-card">
+    <div class="upd-title">正在下载新版本</div>
+    <div class="upd-bar"><div class="upd-fill" id="upd-fill"></div></div>
+    <div class="upd-msg" id="upd-msg">准备中…</div>
+    <div class="upd-foot">
+      <button class="btn danger" id="upd-stop" type="button">停止更新</button>
+    </div>
+  </div>
+</div>
+
+<!-- 全部弹层都挂在这里。**底部进度条也放在这一层里**（用户要求）：它原来在 #layers
+     外面（z-index 60），弹层一开就被变暗层盖住、还被 body.ov-open 一起模糊掉 ——
+     部署 DLSS5 时用户根本看不清进度。现在它在弹层栈最上面（z-index 2），永远清晰。 -->
+<div id="layers">
+  <div class="progressbar hidden" id="bar">
+    <div id="bar-fill"></div>
+    <span id="bar-text"></span>
+  </div>
+</div>
+
+<script src="app.js"></script>
+</body>
+</html>

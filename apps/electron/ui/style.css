@@ -1,0 +1,571 @@
+/* FrameGen Manager (Tauri) —— 整文件维护，禁止打补丁
+   观感：模糊玻璃（frosted glass）= 半透明面色 + backdrop-filter 模糊 + 发丝边 + 层次阴影，
+   底色是几团柔和的极光渐变 —— 玻璃后面得有东西可模糊，不然看不出是玻璃。
+   命名约定：
+     .panel  信息卡      .gcard 游戏库一行      .tile DLSS5 卡片墙
+     .ov     页面内弹层   .gate  显卡闸门提示    .stack 竖排卡片容器（控制间距）  */
+
+:root{
+  --bg1:#eef3fb; --bg2:#e2e9f5;
+  --surface:#ffffff; --surface-line:rgba(16,24,40,.07);
+  --glass:rgba(255,255,255,.62); --glass-strong:rgba(255,255,255,.78);
+  --glass-line:rgba(255,255,255,.62);
+  --ink:#151a21; --muted:#5b6675; --line:#dde3ec; --field:rgba(255,255,255,.75);
+  --accent:#76b900; --accent-edge:#68a600; --accent-ink:#101700;
+  --warn:#b26a00; --ok:#1b7f3b; --err:#c62828; --info:#3d6fe0;
+  --r-card:16px; --r-ctl:10px;
+  --sh-1:0 1px 2px rgba(16,24,40,.05), 0 10px 28px rgba(16,24,40,.10);
+  --sh-2:0 8px 20px rgba(16,24,40,.14), 0 28px 60px rgba(16,24,40,.18);
+  --gloss:inset 0 1px 0 rgba(255,255,255,.75);
+  /* 按钮要有自己的边和面：跟玻璃面板同色的话就「糊」在一起了（用户反馈） */
+  --btn-line:rgba(16,24,40,.18);
+  --btn-bg:linear-gradient(180deg,#ffffff,#eef2f8);
+  --btn-bg-hover:linear-gradient(180deg,#ffffff,#e3ebf7);
+  --chevron:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 12'><path d='M2 4.5 L6 8.5 L10 4.5' fill='none' stroke='%235b6675' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'/></svg>");
+  --blur:blur(16px) saturate(1.4);
+  --ease:cubic-bezier(.2,.9,.3,1);
+  /* 弹层过渡参数：都收在这里，改一个数就能调手感。
+     --ov-dim：变暗时长（快，点下去马上有反馈，不然会觉得"没反应"）
+     --ov-blur-in/out：模糊时长（慢，眼睛有个适应过程；退场比进场快才不拖沓）
+     --ov-r：模糊半径（轻一点，背景还认得出轮廓就不吓人） */
+  --ov-dim:70ms;
+  --ov-dim-out:60ms;
+  --ov-blur-in:120ms;
+  --ov-blur-out:60ms;
+  --ov-r:6px;
+  --ov-blur-delay:0ms;
+  /* 模糊用 ease-in-out（两头慢的 S 曲线）：前 100ms 几乎不动，
+}
+@media (prefers-color-scheme: dark){
+  :root{
+    --bg1:#0d1117; --bg2:#080b10;
+    --surface:#171d26; --surface-line:rgba(255,255,255,.07);
+    --glass:rgba(23,29,38,.62); --glass-strong:rgba(23,29,38,.80);
+    --glass-line:rgba(255,255,255,.10);
+    --ink:#e8edf5; --muted:#9aa8bb; --line:#28303c; --field:rgba(255,255,255,.06);
+    --sh-1:0 1px 2px rgba(0,0,0,.5), 0 10px 28px rgba(0,0,0,.45);
+    --sh-2:0 8px 20px rgba(0,0,0,.55), 0 28px 60px rgba(0,0,0,.5);
+    --gloss:inset 0 1px 0 rgba(255,255,255,.06);
+    --btn-line:rgba(255,255,255,.18);
+    --btn-bg:linear-gradient(180deg,#242c39,#1b222c);
+    --btn-bg-hover:linear-gradient(180deg,#2c3644,#212936);
+    --chevron:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 12'><path d='M2 4.5 L6 8.5 L10 4.5' fill='none' stroke='%239aa8bb' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'/></svg>");
+  }
+}
+
+*{box-sizing:border-box}
+html,body{margin:0;height:100%}
+body{
+  font:14px/1.5 "Microsoft YaHei UI","Microsoft YaHei","Segoe UI",system-ui,sans-serif;
+  color:var(--ink);
+  /* 几团柔和极光 + 底色：玻璃要透过它才看得出「糊」 */
+  background:
+    radial-gradient(1100px 560px at 10% -8%, rgba(118,185,0,.22), transparent 62%),
+    radial-gradient(980px 520px at 92% 2%, rgba(64,132,255,.20), transparent 62%),
+    radial-gradient(900px 600px at 80% 98%, rgba(178,84,255,.16), transparent 62%),
+    radial-gradient(820px 560px at 4% 94%, rgba(0,196,180,.18), transparent 62%),
+    linear-gradient(180deg,var(--bg1),var(--bg2));
+  background-attachment:fixed;
+  overflow:hidden;
+}
+::-webkit-scrollbar{width:10px;height:10px}
+::-webkit-scrollbar-thumb{background:rgba(120,134,156,.45);border-radius:999px;border:2px solid transparent;background-clip:content-box}
+::-webkit-scrollbar-thumb:hover{background:rgba(120,134,156,.7);background-clip:content-box}
+:focus-visible{outline:2px solid rgba(118,185,0,.55);outline-offset:2px;border-radius:6px}
+.hidden{display:none !important}
+.spacer{flex:1}
+.sub{color:var(--muted);font-size:12px}
+/* overflow-wrap:anywhere：说明里常带很长的注册表路径 / 目录路径，浏览器默认不在
+   路径中间断行，于是整段文字会**溢出卡片**（用户反馈显卡伪装卡片下面那行灰字）。
+   anywhere 让它在必要时从任意位置断开，中文和路径都安全。 */
+.hint{margin:8px 0 0;color:var(--muted);font-size:12.5px;white-space:pre-wrap;overflow-wrap:anywhere}
+.ok{color:var(--ok)} .warn{color:var(--warn)} .err{color:var(--err)}
+
+/* 玻璃面：半透明 + 发丝边 + 高光。
+   真 backdrop-filter 模糊挂在 body.glass 下（见文件末尾），由主进程在可用时加上这个类：
+     * GPU 渲染（--fgm-gpu / FGM_GPU=1）→ 加；
+     * 软件渲染 → 不加，保持「半透明 + 发丝边」的近似玻璃。
+   为什么这么分：Tauri/WebView2 时代实测「backdrop-filter 一铺开，点一下按钮整块客户区
+   就变黑且不恢复」，那时的结论是把真模糊只留给弹层背景与对话框。Electron 是另一套渲染
+   栈，GPU 下重测稳定（见 dev-only 的 A/B 记录 ab-*.png 与 CPU 数据），软件模式下仍保持
+   旧做法 —— 这样即使某台机器 GPU 有问题，外观也只是退化、不会坏。*/
+.glassish, .topbar, .panel, .dialog, .toast, .tabs, .gcard{
+  background:var(--glass);
+  border:1px solid var(--glass-line);
+  box-shadow:var(--sh-1), var(--gloss);
+}
+
+/* ---------------------------------------------------------------- 顶栏 */
+.topbar{
+  height:56px;display:flex;align-items:center;gap:10px;padding:0 16px;
+  background:color-mix(in srgb, var(--surface) 72%, transparent);
+  border:0;border-bottom:1px solid var(--glass-line);
+  position:sticky;top:0;z-index:5;box-shadow:0 1px 0 rgba(255,255,255,.35), 0 8px 24px rgba(16,24,40,.06);
+}
+.brand{font-weight:700;display:flex;align-items:center;gap:8px;white-space:nowrap}
+/* 品牌圆点：**不要**永久动画。
+   原来这里是 animation:pulse 2.6s infinite —— 一个永不停止的动画会让合成器一直重绘，
+   而顶栏是带 backdrop-filter 的毛玻璃图层，每帧都要重新模糊：实测待机静置 10 秒烧掉
+   66% 单核（用户明确要求"低内存 + 低开销"，这一条必须治）。改成悬停时才动一下。 */
+.dot{width:10px;height:10px;border-radius:50%;background:var(--accent);box-shadow:0 0 0 4px rgba(118,185,0,.18);transition:transform .2s var(--ease)}
+.brand:hover .dot{animation:pulse 1.6s var(--ease) 2}
+@keyframes pulse{0%,100%{box-shadow:0 0 0 4px rgba(118,185,0,.18)}50%{box-shadow:0 0 0 7px rgba(118,185,0,.08)}}
+/* 显卡那行要能放下完整型号 + 驱动版本：给足宽度，真放不下才省略（title 里还有全文） */
+.gpu{color:var(--muted);font-size:12.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:560px;min-width:0}
+.tabs{display:flex;gap:4px;padding:3px;border-radius:12px;flex:0 0 auto}
+.tab{border:0;background:transparent;color:var(--muted);padding:6px 12px;border-radius:9px;cursor:pointer;font:inherit;white-space:nowrap;
+  transition:background .2s var(--ease),color .2s,transform .2s var(--ease),box-shadow .2s}
+.tab:hover{color:var(--ink);transform:translateY(-1px)}
+.tab.active{background:var(--glass-strong);color:var(--ink);font-weight:700;box-shadow:var(--sh-1), var(--gloss)}
+
+/* ---------------------------------------------------------------- 控件 */
+.btn{
+  border:1px solid var(--btn-line);background:var(--btn-bg);color:var(--ink);
+  padding:7px 13px;border-radius:var(--r-ctl);cursor:pointer;font:inherit;white-space:nowrap;
+  box-shadow:0 1px 2px rgba(16,24,40,.06), inset 0 1px 0 rgba(255,255,255,.75);
+  transition:transform .16s var(--ease), box-shadow .2s var(--ease), background .2s var(--ease), border-color .2s;
+}
+.btn:hover{transform:translateY(-1px);box-shadow:0 6px 16px rgba(16,24,40,.14), inset 0 1px 0 rgba(255,255,255,.75);background:var(--btn-bg-hover)}
+.btn:active{transform:translateY(0) scale(.98)}
+.btn:disabled{opacity:.5;cursor:not-allowed;transform:none;box-shadow:none}
+.btn.ghost{background:transparent}
+.btn.primary{background:linear-gradient(180deg,#86cf0d,var(--accent));border-color:var(--accent-edge);color:var(--accent-ink);font-weight:700;
+  box-shadow:0 6px 18px rgba(118,185,0,.28), inset 0 1px 0 rgba(255,255,255,.35)}
+.btn.primary:hover{filter:brightness(1.05);box-shadow:0 8px 22px rgba(118,185,0,.34), inset 0 1px 0 rgba(255,255,255,.35)}
+.btn.danger{color:var(--err);border-color:rgba(198,40,40,.35)}
+.btn.small{padding:5px 10px;font-size:12.5px}
+.btn.wide{width:100%;margin-top:8px}
+.input{flex:1;padding:9px 12px;border-radius:var(--r-ctl);border:1px solid var(--glass-line);background:var(--field);color:var(--ink);font:inherit;
+  transition:border-color .2s, box-shadow .2s, background .2s}
+.input:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px rgba(118,185,0,.22);background:var(--surface)}
+/* 下拉框要有「面」和「边」，还要有自己的箭头 —— 之前太透明，看着像一行文字（用户反馈） */
+select.input{
+  padding:6px 30px 6px 10px;font-size:12.5px;flex:0 0 auto;min-width:150px;
+  background-color:var(--btn-bg);background-image:var(--chevron);
+  background-repeat:no-repeat;background-position:right 9px center;background-size:12px 12px;
+  border:1px solid var(--btn-line);color:var(--ink);cursor:pointer;appearance:none;-webkit-appearance:none;
+  box-shadow:0 1px 2px rgba(16,24,40,.06), inset 0 1px 0 rgba(255,255,255,.75);
+}
+select.input:hover{background-color:var(--btn-bg-hover)}
+select.input option{background:var(--surface);color:var(--ink)}
+
+/* ---------------------------------------------------------------- 页面骨架 */
+.page{padding:18px 22px 48px;max-width:1400px;margin:0 auto;height:calc(100vh - 56px);overflow-y:auto;animation:pageIn .34s var(--ease) both}
+@keyframes pageIn{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:none}}
+.pagehead{animation:riseIn .32s var(--ease) both;margin-bottom:16px}
+@keyframes riseIn{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
+.pagehead h1{margin:4px 0 2px;font-size:22px;letter-spacing:.2px}
+.pagehead .sub{color:var(--muted);font-size:12.5px}
+.toolbar{display:flex;gap:8px;margin:16px 0 22px;animation:riseIn .34s var(--ease) both;animation-delay:.04s}
+
+.layout{display:grid;grid-template-columns:300px 1fr;gap:18px;align-items:start}
+.side{display:flex;flex-direction:column;gap:14px;position:sticky;top:0}
+/* 竖排卡片：卡片之间要留出间距（使用说明/设置页的几张卡现在离得太近就是这里没管） */
+.stack{display:grid;gap:16px;align-items:start}
+.setgrid{display:grid;grid-template-columns:1fr 1fr;gap:16px;align-items:start}
+.setgrid .span2{grid-column:1 / -1}
+.removed{margin-top:16px}
+.count{background:rgba(118,185,0,.16);color:#3d6100;border-radius:999px;padding:1px 8px;font-size:11.5px;font-weight:400}
+
+/* ---------------------------------------------------------------- 信息卡 */
+.panel{border-radius:var(--r-card);padding:14px;animation:cardIn .34s var(--ease) both}
+.ctitle{font-weight:700;font-size:13px;margin-bottom:10px;display:flex;align-items:center;gap:7px}
+.ctitle::before{content:"";width:3px;height:13px;border-radius:2px;background:linear-gradient(180deg,#a6e04a,var(--accent));flex:0 0 auto}
+.chips{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:10px}
+.chip{font-size:11.5px;padding:3px 9px;border-radius:999px;background:rgba(118,185,0,.16);color:#3d6100;border:1px solid rgba(118,185,0,.28)}
+@media (prefers-color-scheme: dark){.chip{color:#c8f08a}.count{color:#c8f08a}}
+.chip.gray{background:rgba(120,134,156,.16);color:var(--muted);border-color:var(--glass-line)}
+.kv2{display:flex;justify-content:space-between;gap:10px;font-size:12.5px;margin:9px 0;color:var(--muted)}
+.kv2 b{color:var(--ink);font-weight:600;text-align:right}
+.path{font-family:Consolas,"Courier New",monospace;font-size:12px;color:var(--muted);word-break:break-all;background:rgba(120,134,156,.12);border-radius:10px;padding:8px 10px;margin-bottom:10px}
+.row{display:flex;gap:8px;margin-top:8px}
+.row .btn{flex:1}
+.mods{display:grid;gap:6px}
+.mod{
+  /* 三列网格：标签（最左，固定 44px）/ 文件名（占剩余，一行，超长省略）/ 体积（最右）。
+     以前是 flex + space-between，把标签塞在名字和体积中间 —— 行与行对不齐，
+     长文件名还会被挤到第二行（用户反馈）。放最左之后名字拿到的宽度最大。 */
+  display:grid;grid-template-columns:44px minmax(0,1fr) 68px;align-items:center;gap:10px;
+  font-size:12.5px;padding:6px 8px;border-radius:9px;background:rgba(255,255,255,.62);border:1px solid rgba(255,255,255,.65);box-shadow:0 1px 2px rgba(16,24,40,.06);
+}
+.mod > :only-child{grid-column:1 / -1}   /* 只有一句话的行（空态、错误）横跨整行 */
+.mod b{font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.gate{margin:8px 0 0;padding:8px 10px;border-radius:10px;font-size:12px;line-height:1.5;white-space:pre-wrap;
+  background:rgba(198,40,40,.10);border:1px solid rgba(198,40,40,.28);color:var(--err)}
+.setrow{display:flex;justify-content:space-between;align-items:center;gap:10px;margin:8px 0}
+.setrow > span{color:var(--muted);font-size:12.5px}
+/* 路径上面的小说明（资产文件夹那一处用） */
+/* 卡片里的小分组标题（帧生成 Mod 卡用） */
+.modgroup{font-size:11.5px;color:var(--muted);letter-spacing:.4px;margin:10px 0 2px;padding-top:8px;border-top:1px solid rgba(120,134,156,.18)}
+.modgroup:first-child{margin-top:2px;padding-top:0;border-top:0}
+
+/* 设置页不要铺满整个宽度：行内「标签 —— 值」离太远反而难读（用户反馈）。 */
+#page-settings .stack{max-width:760px;margin:0 auto}
+/* 侧栏里的日志框：矮一点，别把侧栏撑得老长 */
+.logslim{max-height:190px;overflow:auto;font-size:11.5px;margin:0}
+/* 打赏页 */
+.donate{display:flex;gap:22px;flex-wrap:wrap;justify-content:center;margin:6px 0 4px}
+.qr{margin:0;background:var(--glass-strong);border:1px solid var(--glass-bd);border-radius:var(--r-card);
+  padding:14px;box-shadow:var(--sh-1), var(--gloss);text-align:center}
+.qr img{display:block;width:260px;max-width:60vw;height:auto;border-radius:10px}
+.qr figcaption{margin-top:10px;font-size:13px;font-weight:600;color:var(--ink)}
+.donate-note{text-align:center;font-size:14px;color:var(--ink);margin:18px 0 0}
+
+/* 更新弹窗（自更新专用）：带自己的进度条和停止按钮 */
+.upd{position:fixed;inset:0;display:grid;place-items:center;background:rgba(10,14,20,.34);z-index:70}
+.upd.hidden{display:none}
+.upd-card{width:min(460px,86vw);background:var(--glass-strong);border:1px solid var(--glass-bd);
+  border-radius:16px;padding:18px;box-shadow:var(--sh-2), var(--gloss)}
+.upd-title{font-weight:700;margin-bottom:12px}
+.upd-bar{height:10px;border-radius:999px;background:rgba(120,134,156,.22);overflow:hidden}
+.upd-fill{height:100%;width:0;background:linear-gradient(90deg,#76b900,#a6e04a);transition:width .18s var(--ease)}
+.upd-msg{margin-top:10px;font-size:12.5px;color:var(--muted);min-height:18px}
+.upd-foot{display:flex;justify-content:flex-end;margin-top:14px}
+
+/* DLSS5 页的醒目警示（用户要求做成显眼大字） */
+.warnbig{margin:6px 0 14px;padding:12px 16px;border-radius:12px;font-size:15px;font-weight:700;line-height:1.5;
+  color:#8a1c1c;background:rgba(198,40,40,.10);border:1px solid rgba(198,40,40,.32)}
+@media (prefers-color-scheme: dark){
+  .warnbig{color:#ffb4b4;background:rgba(198,40,40,.18);border-color:rgba(255,120,120,.38)}
+}
+
+/* 封面右下角的垃圾桶（DLSS5 卡片墙用）：**一直可见**。
+   原来是半透明、只有悬停才亮，用户反馈"不够明显" —— 现在红底白图标 + 阴影，
+   在深色封面上也一眼能看见；悬停再放大一圈。 */
+.trash{position:absolute;right:8px;bottom:8px;z-index:3;width:30px;height:30px;padding:0;cursor:pointer;
+  border-radius:9px;border:1px solid rgba(255,175,175,.75);background:rgba(198,40,40,.94);color:#fff;
+  font-size:16px;line-height:1;display:grid;place-items:center;
+  box-shadow:0 2px 10px rgba(0,0,0,.55);transition:background .15s, transform .15s, border-color .15s}
+.trash:hover{background:#e53935;border-color:#fff;transform:scale(1.12)}
+
+/* 说明用的小问号：靠近时在旁边弹一块提示（比原生 title 快、样式也跟界面一套）。
+   提示块右对齐到问号，宽度固定，长句自动换行。 */
+/* 包装层：让问号能绝对定位到按钮的**左上角**（用户要求） */
+.pickwrap{position:relative;display:inline-flex;align-items:center}
+/* 位置：贴着按钮的**左上角**，落在按钮圆角那个缺口里。
+   历史：-7px 压住按钮面 -> -13px 还压一点点 -> -22px 离得太远（用户："偏离了"）
+        -> -15px/-15px：**上面那半截被裁掉了**。
+   为什么会被裁：这一行在滚动容器 .content 里（overflow:auto），它的上边缘就在行上方
+   十几像素处；top 取负值等于把圆点顶到容器外面，超出部分直接被裁（实测问号 rect 的
+   top=76，而 .content 的 top=83）。
+   所以：**只往左、不往上**（top:0 保持整圆在容器内）。
+   left:-24px：圆点 18px，右边缘落在按钮左边**外** 6px —— 视觉上还贴着按钮左上角，
+   但和按钮之间有一点呼吸感（用户觉得 -19px 还是太贴，让再往左挪一点）。
+   水平方向与按钮零重叠，按钮的边框、圆角和点击区域都不受影响。
+   左边留得出空间：容器左边缘离这里约 480px。 */
+.pickwrap .qmark{position:absolute;left:-24px;top:0}
+
+.qmark{display:inline-grid;place-items:center;width:18px;height:18px;border-radius:50%;
+  border:1px solid var(--glass-line);background:var(--glass-strong);color:var(--muted);
+  font-size:12px;font-weight:700;cursor:help;position:relative;flex:0 0 auto;
+  transition:color .15s,border-color .15s}
+.qmark:hover{color:var(--ink);border-color:var(--accent)}
+.qmark::after{content:attr(data-tip);position:absolute;top:calc(100% + 8px);right:0;z-index:6;
+  width:330px;padding:10px 12px;border-radius:10px;border:1px solid var(--glass-line);
+  background:var(--surface);color:var(--ink);font-size:12px;font-weight:400;line-height:1.7;
+  box-shadow:var(--sh-2);opacity:0;visibility:hidden;white-space:normal;text-align:left;
+  transition:opacity .15s var(--ease)}
+.qmark:hover::after{opacity:1;visibility:visible}
+
+.pathcap{font-size:12px;color:var(--muted);margin:10px 0 3px}
+/* 滚动到底部时最后一张卡要留出余量。
+   为什么不用容器的 padding-bottom：多数浏览器里滚动容器的 padding-bottom 不计入可滚区域，
+   实测最后一张卡会被切掉一点（用户反馈）。用最后一个子元素的 margin 一定算进去。 */
+#page-lib .side > :last-child,
+#page-lib .content > :last-child{margin-bottom:6px}
+/* 底部留白用 ::after 占位块而不是 padding：滚动容器的 padding-bottom 不算进可滚区域，
+   而 flex 容器里的 ::after 是一个真实的 flex item，一定会算进去（用户反馈卡片贴底）。 */
+#page-lib .side::after,
+#page-lib .content::after{content:'';display:block;flex:0 0 auto;height:34px}
+/* 其它页面（DLSS5 / 设置 / 打赏）靠 .page 自己滚，同样在末尾补一块占位：
+   滚动容器的 padding-bottom 不计入可滚区域，所以最后一行卡片会贴着底边被切掉（用户反馈 DLSS5 页）。 */
+.page::after{content:'';display:block;height:28px}
+/* DLSS5 页是"最后一行卡片墙"，28px 太紧（用户反馈"底部留的空间不够、过于紧凑"）——
+   单独给它一块更厚的占位。 */
+#page-dlss5::after{height:88px}
+
+.pathrow{display:grid;grid-template-columns:96px 1fr auto;gap:10px;align-items:center;margin:6px 0}
+.pathrow > span{color:var(--muted);font-size:12.5px}
+.pathrow code{font-family:Consolas,"Courier New",monospace;font-size:12px;color:var(--muted);word-break:break-all}
+.log{margin:8px 0 0;padding:10px 12px;border-radius:12px;background:rgba(120,134,156,.14);
+  font:12px/1.55 Consolas,"Courier New",monospace;color:var(--ink);
+  max-height:340px;overflow:auto;white-space:pre-wrap;word-break:break-all}
+.tips-edit{width:100%;min-height:200px;font:12.5px/1.65 Consolas,"Courier New","Microsoft YaHei",monospace;white-space:pre;resize:vertical}
+.tips{font-family:"Microsoft YaHei UI","Microsoft YaHei",system-ui,sans-serif;font-size:12.5px;line-height:1.8}
+.steps{margin:0;padding-left:20px;display:grid;gap:10px;font-size:13px;color:var(--muted)}
+.steps li b{color:var(--ink);font-weight:700}
+
+/* ---------------------------------------------------------------- 游戏库列表 */
+/* 游戏库这一页：**左右两列各自滚动**。
+   以前整页（含左栏）是一个滚动容器（.page 上的 overflow-y:auto），所以滚左边会把
+   右边的游戏列表也带着滚 —— 用户反馈的就是这个。现在左栏、右栏各是一个滚动区，
+   滚动互不影响；.page 自己不再滚。只作用于 #page-lib：另外三个页面没有 .layout，
+   它们仍然靠 .page 滚动。 */
+#page-lib{overflow:hidden;padding-bottom:0}
+#page-lib .layout{height:100%;align-items:stretch}
+#page-lib .side{overflow-y:auto;padding-right:6px}
+#page-lib .content{overflow-y:auto;padding-right:6px;height:100%}
+
+.content{min-width:0}
+.listhead{display:flex;align-items:flex-end;justify-content:space-between;gap:12px;margin-bottom:14px}
+.lh-text{min-width:0}
+.listhead h1{margin:0;font-size:20px}
+.listhead .sub{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin-top:2px}
+.lh-actions{display:flex;gap:8px;flex:0 0 auto;flex-wrap:wrap;justify-content:flex-end}
+.liblist{display:grid;gap:12px}
+.gcard{border-radius:var(--r-card);padding:13px 14px;display:grid;gap:10px;
+  transition:transform .2s var(--ease), box-shadow .2s var(--ease), background .2s var(--ease)}
+.gcard:hover{transform:translateY(-3px);box-shadow:var(--sh-2), var(--gloss);background:var(--glass-strong)}
+.gtop{display:flex;align-items:center;gap:12px;min-width:0}
+.thumb{width:52px;height:70px;border-radius:10px;flex:0 0 auto;box-shadow:var(--sh-1);object-fit:cover;background:linear-gradient(160deg,#38455a,#232c39)}
+.thumb.ph2{display:grid;place-items:center;color:rgba(255,255,255,.35);font-weight:800;font-size:20px}
+/* 游戏库列表用 exe 图标（方形），别按封面那样裁切 */
+.thumb.icon{object-fit:contain;background:rgba(120,134,156,.12);padding:5px;box-shadow:none;border:1px solid var(--glass-line)}
+.ginfo{min-width:0;display:grid;gap:6px}
+.gname{font-weight:700;font-size:15px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.badges{display:flex;flex-wrap:wrap;gap:6px}
+.badge{font-size:11.5px;padding:2px 9px;border-radius:999px;border:1px solid var(--glass-line);color:var(--muted);white-space:nowrap;background:rgba(255,255,255,.35)}
+@media (prefers-color-scheme: dark){.badge{background:rgba(255,255,255,.05)}}
+.badge.ok{color:var(--ok);border-color:rgba(27,127,59,.35)}
+.badge.warn{color:var(--warn);border-color:rgba(178,106,0,.35)}
+.badge.err{color:var(--err);border-color:rgba(198,40,40,.4)}
+.badge.acc{color:#3d6100;background:rgba(118,185,0,.18);border-color:rgba(118,185,0,.32)}
+.badge.dim{opacity:.75}
+.gpath{font-family:Consolas,"Courier New",monospace;font-size:12px;color:var(--muted);word-break:break-all}
+.gactions{display:flex;gap:8px;flex-wrap:wrap}
+.gactions .spacer{flex:1}
+.empty{background:var(--glass-strong);border:1px dashed var(--line);border-radius:var(--r-card);padding:22px;color:var(--muted);font-size:13px;text-align:center}
+@keyframes cardIn{from{opacity:0;transform:translateY(14px) scale(.985)}to{opacity:1;transform:none}}
+
+/* ---------------------------------------------------------------- DLSS5 卡片墙 */
+.section h2{font-size:13px;color:var(--muted);margin:18px 0 10px;display:flex;gap:8px;align-items:center}
+.wall{display:grid;grid-template-columns:repeat(auto-fill,minmax(168px,1fr));gap:14px}
+.tile{
+  position:relative;aspect-ratio:.72;border-radius:var(--r-card);overflow:hidden;cursor:pointer;
+  background:linear-gradient(160deg,#38455a,#232c39);box-shadow:var(--sh-1);
+  transition:transform .26s var(--ease), box-shadow .26s var(--ease);
+  animation:cardIn .42s var(--ease) both;animation-delay:calc(var(--i,0) * 45ms);
+}
+.tile:hover{transform:translateY(-6px) scale(1.02);box-shadow:var(--sh-2)}
+.tile:active{transform:translateY(-2px) scale(.995)}
+.tile::after{content:"";position:absolute;inset:0;border-radius:var(--r-card);border:1px solid var(--glass-line);pointer-events:none}
+.tile img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;transition:transform .4s var(--ease)}
+/* 回退到 exe 图标时：**整数倍放大 + 绝对居中**。
+   实测所有游戏的图标都是 32×32：96px = 整 3 倍，配上 pixelated 边缘是硬的、不会发虚；
+   而"居中"必须自己算 —— 之前想用内边距（上 36 / 下 62）把图标往上挪开底部文字，
+   再和 object-fit 一叠加就跑偏了（用户反馈"并不居中"）。
+   现在固定 96×96、left/top 50% + translate 居中，与内边距无关。 */
+.tile img.icon{inset:auto;left:50%;top:50%;width:96px;height:96px;padding:0;
+  transform:translate(-50%,-50%);object-fit:contain;image-rendering:pixelated;
+  background:none;filter:drop-shadow(0 3px 10px rgba(0,0,0,.45))}
+/* 悬停放大也要围绕同一个圆心（否则会飞出去） */
+.tile:hover img.icon{transform:translate(-50%,-50%) scale(1.08)}
+.tile:hover img{transform:scale(1.06)}
+.tile .ph{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;font-size:40px;font-weight:800;color:rgba(255,255,255,.20)}
+.tile .meta{position:absolute;left:0;right:0;bottom:0;padding:30px 11px 10px;color:#fff;background:linear-gradient(to top,rgba(8,12,18,.94),rgba(8,12,18,.5) 55%,transparent)}
+.tile .name{font-weight:700;font-size:13.5px;line-height:1.25;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.tile .tag{margin-top:4px;font-size:11.5px;color:#bacbdf}
+.tile .tag.ok{color:#a8e063;font-weight:700}
+.tile .ribbon{position:absolute;top:8px;left:8px;font-size:11px;padding:2px 8px;border-radius:999px;background:rgba(0,0,0,.5);color:#fff}
+.tile .ribbon.acc{background:rgba(118,185,0,.85);color:#101700;font-weight:700}
+
+/* ---------------------------------------------------------------- 页面内弹层（玻璃卡片） */
+#layers{position:fixed;inset:0;z-index:120;pointer-events:none}
+#layers > *{pointer-events:auto}
+.ov{position:fixed;inset:0;display:grid;place-items:center;animation:fade .2s var(--ease)}
+/* 被压在下层的弹层：模糊 + 变淡 + 不接收点击（只让最上面一层清晰可读） */
+.ov-behind{filter:blur(7px) saturate(.92);opacity:.72;pointer-events:none;
+  transition:filter .18s var(--ease), opacity .18s var(--ease)}
+/* 弹层本体：从「点下去的地方」长出来（transform-origin 由 JS 按点击坐标设）。
+   比居中缩放更有因果感 —— 你点了那个按钮，东西就从那儿出来。 */
+.dialog{animation:dialogIn .17s var(--ease)}
+@keyframes dialogIn{from{opacity:0;transform:scale(.93)}to{opacity:1;transform:none}}
+/* 弹层打开时：把**页面内容**正向模糊掉（不用 backdrop-filter）。
+   为什么这样更顺：filter 是"模糊自己的渲染结果"，合成器一趟画完；backdrop-filter 要回读
+   合成后的窗口，实测开销翻倍、帧数掉到个位数，看起来就是拖沓。
+   注意 #layers 不在这些元素里 —— 弹层永远是清晰的。 */
+/* 注意：**进度条不在这个名单里**。它在 #layers 里、且叠在弹层之上，永远保持清晰 ——
+   否则部署时用户只看到一条被糊掉的进度（用户反馈）。 */
+.topbar, .page{
+  transition:filter var(--ov-blur-out) var(--ov-ease-out);
+}
+body.ov-open .topbar,
+body.ov-open .page{
+  filter:blur(var(--ov-r));
+  /* 进场曲线用 ease-out（起步快、收尾缓）。之前用 ease-in-out 的"慢启动"会被读成
+     "点了没反应"—— 用户两次反馈慢，就是这个原因；但时长必须短（120ms），
+     否则快的起步又会变成"啪"一下（第一版的错就在这：ease-out + 340ms）。 */
+  transition:filter var(--ov-blur-in) var(--ov-ease-out);
+}
+/* 弹层背景：只负责**变暗**（进场快、出场更快）。
+   整屏失焦由 body.ov-open 的页面 filter 负责 —— 这里再用 backdrop-filter 就是糊两遍，
+   而且它每帧要回读合成后的窗口，实测会把过渡压成几个台阶。 */
+.ov-backdrop{
+  position:absolute;inset:0;background:rgba(10,14,20,0);
+  transition:background-color var(--ov-dim-out) var(--ease);
+}
+.ov.in .ov-backdrop{
+  background:rgba(10,14,20,.34);
+  transition:background-color var(--ov-dim) var(--ease);
+}
+.dialog{
+  position:relative;width:min(580px,92vw);max-height:86vh;overflow:auto;
+  background:var(--glass-strong);border-radius:20px;padding:0 0 14px;
+  animation:spring .32s cubic-bezier(.16,1.1,.3,1.05);
+}
+.dialog.narrow{width:min(470px,92vw)}
+/* 确认框：**关键信息必须一眼看清**。原来它和普通弹层一样是半透明玻璃 + 灰色小字，
+   后面模糊层里那些高亮内容透过来，字就读不清了（用户反馈）。
+   现在：背景做实（不透明 surface）+ 正文用正常墨色 + 关键三项做成醒目的摘要行。 */
+.dialog.confirm{background:var(--surface);box-shadow:0 20px 56px rgba(8,12,18,.30)}
+.dialog.confirm .note{color:var(--ink)}
+.dialog.confirm .summary{display:grid;gap:7px;padding:11px 13px;border-radius:12px;
+  background:color-mix(in srgb, var(--accent) 12%, transparent);
+  border:1px solid color-mix(in srgb, var(--accent) 40%, transparent)}
+/* 有摘要的确认框加宽：值（比如「Win+R 输入 osk 回车，用屏幕键盘点」）要能排在一行里 */
+.dialog.confirm.has-rows{width:min(640px,94vw)}
+.dialog.confirm .sum-row{display:grid;grid-template-columns:82px 1fr;gap:10px;align-items:baseline}
+/* 标了 nowrap 的行：值不许折行（长到放不下就整行省略号，不换行） */
+.dialog.confirm .sum-row.nowrap{grid-template-columns:auto 1fr}
+.dialog.confirm .sum-row.nowrap .sum-v{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.dialog.confirm .sum-k{font-size:12.5px;font-weight:700;color:var(--muted)}
+.dialog.confirm .sum-v{font-size:13.5px;font-weight:700;color:var(--ink);word-break:break-all}
+/* 「已被移除的游戏」：里面放的是和游戏库一样的 .gcard 卡片，所以要宽一些
+   （.dialog 本身已经是 max-height:86vh + overflow:auto，卡片多了在框内滚动） */
+.dialog.removed-dialog{width:min(940px,94vw)}
+@keyframes fade{from{opacity:0}to{opacity:1}}
+@keyframes spring{from{opacity:0;transform:translateY(16px) scale(.96)}to{opacity:1;transform:none}}
+.dialog-head{display:flex;align-items:center;gap:12px;padding:14px 16px;border-bottom:1px solid var(--glass-line);font-weight:700}
+.dialog-head .dt{flex:1;min-width:0;word-break:break-all}
+.dialog-head .thumb{width:42px;height:56px}
+.x{border:0;background:transparent;font-size:20px;line-height:1;cursor:pointer;color:var(--muted);transition:transform .2s var(--ease), color .2s}
+.x:hover{color:var(--ink);transform:rotate(90deg)}
+.dialog-body{padding:14px 16px;display:grid;gap:9px}
+/* align-items:center 而不是 start：start 会让「图形 API / 渲染后端」这类带控件的行
+   标签比控件高 6~7px（实测：部署目标 +5.5、图形 API +7.0、渲染后端 +6.5），看着就是不齐；
+   纯文字那几行本来就是齐的（差 0.5px）。居中对单行、多行值都成立。 */
+.kv{display:grid;grid-template-columns:90px 1fr;gap:10px;align-items:center}
+.kv > span{color:var(--muted);font-size:12.5px}
+/* 值会**折行**的行（安装目录 / 部署目标的路径）：标签贴第一行，而不是整块垂直居中 ——
+   路径两行时标签会飘到两行中间，右边第一行就对不上了（用户反馈"左侧与右侧位置不符"）。
+   标签和路径给同一个 line-height，第一行的基线才真的落在一条线上。 */
+.kv > span, .kv code{line-height:1.5}
+.kv.kvtop{align-items:start}
+.kv code{color:var(--ink);word-break:break-all;font-size:12.5px;font-family:Consolas,"Courier New",monospace}
+.kv b{font-weight:600;font-size:13px}
+/* 「部署目标」那一行：路径 + 【手动选择】并排。路径必须能省略 ——
+   游戏的 exe 路径很长，不省略会把右边的按钮挤出对话框（用户要求这一行是 exe 文件 + 手动选择）。
+   注意这段要写在 .kv code 之后：两个选择器优先级相同，靠源码顺序决胜。 */
+.exerow{display:flex;gap:8px;align-items:center;min-width:0}
+.exerow code{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.exerow .btn{flex:0 0 auto}
+.dialog-body .note{white-space:pre-wrap;font-size:13px;color:var(--muted);margin:0}
+.dialog-foot{display:flex;gap:8px;align-items:center;padding:6px 16px 0;flex-wrap:wrap}
+.risk{margin:12px 16px 0;color:var(--muted);font-size:12px;white-space:pre-wrap}
+.risk.strong{color:var(--warn)}
+/* 「已有」「缺少」「备用」做成小标签。两个要点：
+   1) **统一宽度**，这样每一行标签都落在同一列（父级是 space-between，少一个子元素就会跑位）；
+   2) **深色字 + 浅色底**：之前用亮绿/亮红字配浅底，在白卡片上根本看不清（用户反馈）。 */
+.mod span.yes, .mod span.no, .mod span.alt{
+  text-align:center;
+  font-size:11px;font-weight:700;padding:2px 8px;border-radius:999px;letter-spacing:.3px;
+}
+.mod span.yes{color:#0d6b2f;background:rgba(27,127,59,.13);border:1px solid rgba(27,127,59,.30)}
+.mod span.no{color:#a01b1b;background:rgba(198,40,40,.13);border:1px solid rgba(198,40,40,.32)}
+.mod span.alt{color:#5a6678;background:rgba(120,134,156,.14);border:1px solid rgba(120,134,156,.28)}
+.mod span.size{min-width:66px;text-align:right;color:var(--muted);font-size:11.5px}
+
+/* 推荐入口这一块要**靠左**：它继承的 .kv2 是 space-between（用来做"左标签右值"），
+   在建议块里值会被推到最右边，看着很散（用户反馈）。 */
+.advice{margin-top:2px}
+/* 布局：**和上面的 .kv 行用同一套列**（90px 标签列 + 10px 间距），值左对齐。
+   这样「推荐入口」右边的 DLL 名字起点与上面「安装目录/图形 API…」的值列**完全在一条竖线上**
+   （实测上面的值列 x=436）；值本身左对齐，不做居中。
+   历史：space-between（值推到最右）-> flex-start（值贴左但与上面不对齐）->
+   grid 96px + 值居中（用户："不要居中"）-> 现在 grid 90px + 左对齐。 */
+.advice .kv2{display:grid;grid-template-columns:90px 1fr;gap:10px;align-items:baseline}
+.advice .kv2 > b{text-align:left}
+
+/* 右下角提示（替代 alert）—— 玻璃卡片，颜色跟界面一套，不再是深色小方块 */
+.toasts{position:fixed;right:18px;bottom:52px;display:flex;flex-direction:column;gap:10px;align-items:flex-end;max-width:min(560px,92vw)}
+.toast{
+  /* 深色玻璃（和底部进度条一套）。上一次只把色条换成圆点，材质没变，用户看着"没区别"；
+     白底页面上一块深色才拉得出对比，同时深浅两种主题下都成立。 */
+  position:relative;max-width:min(520px,80vw);padding:11px 16px 11px 38px;border-radius:14px;
+  background:rgba(16,24,40,.92);border:1px solid rgba(255,255,255,.16);
+  box-shadow:0 12px 34px rgba(8,12,20,.38), inset 0 1px 0 rgba(255,255,255,.10);
+  color:#f2f5f9;font-size:13px;line-height:1.55;
+  white-space:pre-wrap;cursor:pointer;animation:toastIn .22s var(--ease);
+}
+.toast::before{content:'';position:absolute;left:15px;top:17px;width:9px;height:9px;border-radius:50%;background:var(--info);box-shadow:0 0 0 3px rgba(255,255,255,.10)}
+.toast.ok::before{background:var(--ok)}
+.toast.err::before{background:var(--err)}
+.toast.info::before{background:var(--info)}
+@keyframes toastIn{from{opacity:0;transform:translateX(24px) scale(.97)}to{opacity:1;transform:none}}
+
+/* ---------------------------------------------------------------- 进度条 */
+/* 进度条：fixed 在窗口底部，但**挂在 #layers 里、z-index 比弹层高** ——
+   这样弹层（含它的变暗/模糊）永远压不住它。 */
+.progressbar{position:fixed;left:0;right:0;bottom:0;height:34px;background:rgba(16,24,40,.92);
+  border-top:1px solid rgba(255,255,255,.16);
+  color:#fff;display:flex;align-items:center;gap:12px;padding:0 14px;font-size:12.5px;z-index:2}
+/* 弹层在进度条下面（同一个 #layers 里的相对层级） */
+#layers .ov{z-index:1}
+.progressbar.hidden{display:none}
+#bar-fill{position:absolute;left:0;top:0;bottom:0;width:0;background:linear-gradient(90deg,#76b900,#a6e04a);transition:width .18s linear}
+#bar-text{position:relative;z-index:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+
+/* 错误横幅：前端脚本出问题时必须看得见（否则就是白屏 + 猜） */
+#errbar{position:fixed;left:0;right:0;top:0;z-index:999;background:#c62828;color:#fff;padding:8px 12px;
+  font:12px/1.5 Consolas,monospace;white-space:pre-wrap;max-height:40vh;overflow:auto}
+
+@media (max-width:1080px){
+  /* 窄屏两列变一列：那时"各自滚动"没意义，还原成整页滚动 */
+  .layout{grid-template-columns:1fr}
+  .side{position:static}
+  #page-lib{overflow-y:auto}
+  #page-lib .layout{height:auto}
+  #page-lib .side, #page-lib .content{overflow:visible;height:auto}
+  .setgrid{grid-template-columns:1fr}
+}
+/* 软件渲染下满屏模糊是有代价的：系统开了「减少动态效果」就全部关掉 */
+@media (prefers-reduced-motion: reduce){*{animation:none !important;transition:none !important}}
+/* ---------------------------------------------------------------- 真·毛玻璃（GPU 模式）
+   主进程在 GPU 渲染时给 body 加 .glass；软件渲染不加。
+   加了这个类之后：面板/卡片/顶栏/侧栏卡片都用真模糊，透光感来自背后的极光渐变。
+   顺带把面色调淡一点 —— 真模糊需要背景透出来，太实就白模糊了。 */
+/* 真玻璃的落点：只有「有内容从它下面经过」的面才需要 backdrop-filter。
+   我们的布局里这种地方只有弹层/对话框（还有它们的背景遮罩）与 toast —— 它们盖在列表上，
+   模糊是**看得见**的；而它们是偶发状态：滚动列表时根本没有弹层，所以滚动期间零开销。
+
+   面板 / 侧栏卡片 / 列表卡片 / 顶栏故意**不模糊**：
+     1) 它们背后只有那层 background-attachment:fixed 的平滑极光，没有内容重叠 ——
+        「模糊一层平滑渐变」≈ 原样，视觉上几乎没有差别；
+     2) 任何带 backdrop-filter 的图层都会让合成器每帧多跑一趟，实测开销明显
+        （同机同口径 6.5 秒滚动：面板级模糊 71.8% 单核 / 全量 84.6% / 不模糊 43.4%，见 dev-only 的 A/B）。
+   它们的「玻璃感」来自透光度 + 发丝边 + 内高光，这三样都是免费的。 */
+/* 弹层本体不自己做模糊：它永远盖在已被 body.ov-open 模糊过的页面上，
+   再来一层 backdrop-filter 只会又贵又糊两遍。 */
+/* 透光度：真玻璃观感的主要来源，零代价 */
+body.glass .topbar{background:rgba(255,255,255,.50)}
+body.glass .panel{background:rgba(255,255,255,.46)}
+body.glass .gcard,
+body.glass .tile{background:rgba(255,255,255,.44)}
+body.glass .tabs{background:rgba(255,255,255,.44)}
+@media (prefers-color-scheme: dark){
+  body.glass .topbar{background:rgba(23,29,38,.50)}
+  body.glass .panel{background:rgba(23,29,38,.48)}
+  body.glass .gcard,
+  body.glass .tile{background:rgba(23,29,38,.46)}
+  body.glass .tabs{background:rgba(23,29,38,.46)}
+}
+
+/* 系统里开了「减少动态效果」就全部退化成不加位移的淡入 —— 前庭敏感的用户不该被动画折磨。 */
+@media (prefers-reduced-motion: reduce){
+  *, *::before, *::after{
+    animation-duration:.01ms !important;
+    animation-iteration-count:1 !important;
+    transition-duration:.01ms !important;
+    scroll-behavior:auto !important;
+  }
+}

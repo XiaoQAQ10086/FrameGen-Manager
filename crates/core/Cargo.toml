@@ -1,0 +1,58 @@
+[package]
+name = "framegen-core"
+version = "1.0.0"
+edition = "2021"
+
+[dependencies]
+# 注意：core 是**无 UI 依赖**的业务库，不要在这里加 egui/eframe/rfd/image。
+# 以前这里留着它们（B1 搬迁时整段复制过来的），结果是 Tauri 版也要白白编译一遍
+# egui/eframe；现在已确认 core 里对它们的引用全是注释，可以直接删掉。
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# 关键：不要用默认 TLS。reqwest 默认的 default-tls -> rustls -> aws-lc-rs -> aws-lc-sys，
+# 那个 crate 需要 CMake + NASM 才能编译。native-tls 在 Windows 上走 schannel，零 C 依赖。
+reqwest = { version = "0.13", default-features = false, features = [
+    "blocking",
+    "native-tls",
+    "system-proxy",
+] }
+sha2 = "0.11"
+# sha1 只用来算 git blob 哈希（和 GitHub contents API 返回的 sha 直接比对）
+sha1 = "0.11"
+# 解压 DLSS 运行库的 zip。flate2 本来就在依赖树里（png -> image -> arboard/eframe 拉的），
+# 所以加为直接依赖不会新增任何下载，也不增加体积。
+flate2 = "1"
+directories = "6"
+anyhow = "1"
+winreg = "0.56"
+walkdir = "2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    # 取游戏图标：Shell 拿 HICON，GDI 转成 RGBA 像素
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_Graphics_Gdi",
+    # 手动导入要严格校验签名：WinVerifyTrust 验内容有没有被改，
+    # CryptQueryObject 取出「真正签名的那张证书」再比指纹
+    "Win32_Security_Cryptography",
+    "Win32_Security_WinTrust",
+    # 字体文件用只读内存映射加载（见 main.rs 的 map_font_readonly）：
+    # windows-sys 把 CreateFileW / CreateFileMappingW 挂在 Win32_Security 下，
+    # 映射本身在 Win32_System_Memory。都只是 extern 声明，不会让 exe 变大。
+    "Win32_Security",
+    "Win32_System_Memory",
+    # 判断「拿锁的那个进程还在不在」：OpenProcess + GetExitCodeProcess（清陈旧锁用）
+    "Win32_System_Threading",
+] }
+
+# 反作弊模块（模块 3）需要读注册表服务项 / PE 导入表时再加，不要现在加
+# windows = { version = "0.62", features = ["Win32_System_Registry", "Win32_Security_WinTrust"] }
+
+# 注：这里**不再定义 [profile.*]** —— 非工作区根包里的 profile 会被 cargo 忽略（还会警告），
+# 而且那几个值是给退役的 egui 版调体积/流畅度用的（opt-level="z"、panic="abort"、
+# dev 下把依赖拉到 O3），对现在的 core 没意义。发布产物的编译参数由各自的工作区决定：
+#   · sidecar（apps/sidecar，自带 [workspace]）有它自己的 [profile.release]
+#   · 界面是 Electron，与 Rust profile 无关

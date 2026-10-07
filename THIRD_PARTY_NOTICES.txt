@@ -40,7 +40,55 @@ Zlib / Unlicense 这类宽松许可，与本项目的 MIT 许可兼容，无需�
     要求随附本说明，故在此列出。
   · 各组件的完整许可原文见 https://crates.io 对应页面，或 Cargo.lock。
 
+关于内置的第三方文件（来源说明）
+--------------------------------
+0.9.19 起安装包内直接带了下面这些文件，首次启动时复制到资产目录 —— 装完即可部署，不必先联网下载。
+
+本项目的作者不是这些文件的版权持有者，也不对它们的授权状态作任何声明或保证；这里只如实写明
+每个文件的来源、版本与签名信息，方便你自己判断。它们都可以被替换或删除：内置副本只在
+「资产目录里缺少该文件」时复制一次，之后你放什么就是什么。
+
 关于 NVIDIA 文件
 ----------------
-本程序不分发、也不打包 NVIDIA 的任何文件。nvngx_dlssg.dll / nvngx_dlss.dll
-由用户在本程序内主动触发下载，版权归 NVIDIA Corporation 所有。
+nvngx_dlssg.dll / nvngx_dlss.dll / nvngx_dlssnr.dll 的版权归 NVIDIA Corporation 所有，
+三个文件都带 NVIDIA 的 Authenticode 签名（下面是在本机读到的结果）：
+
+  nvngx_dlssg.dll   310.9.1.0   签名者 CN=NVIDIA Corporation（校验通过）
+  nvngx_dlss.dll    310.9.1.0   签名者 CN=NVIDIA Corporation（校验通过）
+  nvngx_dlssnr.dll  310.8.0.0   签名者 CN=NVIDIA Corporation（本机校验结果为 HashMismatch：
+                                文件内容与签名记录的哈希不符 —— 它来自 DLSS5 资源包，
+                                可能被重新打包过）
+
+前两个经 GitHub 仓库 RankFTW/rhi-repo 的 release（tag: dlssg-310.9.1 / dlss-310.9.1）取得；
+第三个随下面的 DLSS5 资源包一起提供。它们的使用与再分发受 NVIDIA DLSS SDK 许可约束。
+
+=== 安装包内置的资产文件 ===
+
+bundled-assets/ —— 帧生成，复制到 <资产目录>\
+
+  dlssg_sm86.ini                    上游项目 dlssg_for_sm86（GitHub: sdli1995/dlssg_for_sm86，
+                                    main 分支根目录）的帧生成配置
+  dxgi.dll / d3d12.dll / dbghelp.dll / dinput8.dll / version.dll / winmm.dll
+                                    同一上游仓库的 6 个代理入口 DLL（每个约 28.6 MB），
+                                    Authenticode 签名主体为 "DLSSG for SM86"（作者自签名证书）
+  nvngx_dlssg.dll                   NVIDIA DLSS 帧生成运行库 310.9.1（见上）
+  nvngx_dlss.dll                    NVIDIA DLSS 超分运行库 310.9.1（见上）
+
+bundled-dlss5/ —— DLSS5，复制到 <资产目录>\DLSS5\
+
+  ReShade_Setup_6.8.0_Addon.exe     ReShade 6.8.0 官方安装器（Addon 版），来源：ReShade 官网
+                                    https://reshade.me 的下载页（文件属性 ProductName=ReShade、
+                                    Company=crosire，签名者 CN=ReShade <info@reshade.me>，自签名证书）
+  renodx-dlss5-v8.5-model.addon64   RenoDX 项目（GitHub: clshortfuse/renodx）的 DLSS5 插件 v8.5；
+                                    *.addon64 是 ReShade 的插件后缀，ReShade 会加载与自身同目录的它
+  nvngx_dlssnr.dll                  与插件配套的神经网络模型（约 158 MB）
+
+后两个来自 RenoDX 的 DLSS5 资源包：本项目此前是在界面里给一个「获取资源包」按钮打开作者的
+分发页，现在改为把同一份资源随安装包内置，省去用户自己找包这一步。
+
+上游项目与本项目的许可
+----------------------
+· 上游 dlssg_for_sm86 —— GitHub: sdli1995/dlssg_for_sm86
+· RenoDX —— GitHub: clshortfuse/renodx
+· ReShade —— https://reshade.me（官方安装器内附有许可文件）
+· 本程序以 MIT 许可发布，见 LICENSE。

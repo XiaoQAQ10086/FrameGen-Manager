@@ -37,14 +37,17 @@ jobs:
       - name: clippy (warnings are errors)
         run: cargo clippy --all-targets -- -D warnings
 
-      - name: build
-        run: cargo build
+      - name: tests（core 的无界面自测：sourcetest / selftest / deploytest）
+        run: cargo test
 
-      - name: self test
-        run: .\target\debug\framegen-manager.exe --selftest
+      # The shipped UI is the Electron app in apps/electron (plain HTML/CSS/JS, no
+      # build step) plus the Rust sidecar in apps/sidecar. The sidecar has its own
+      # workspace, so it gets its own check - otherwise a change to crates/core
+      # could break it without CI noticing. The retired Tauri app (apps/desktop)
+      # has been deleted.
+      - name: clippy + build the sidecar
+        working-directory: apps/sidecar
+        run: |
+          cargo clippy --all-targets -- -D warnings
+          cargo build --release
 
-      - name: source selection test
-        run: .\target\debug\framegen-manager.exe --sourcetest
-
-      - name: deploy test
-        run: .\target\debug\framegen-manager.exe --deploytest

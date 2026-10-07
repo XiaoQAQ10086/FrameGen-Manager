@@ -2,56 +2,73 @@
 
 面向改代码的人。用户只需要看 [README](README.md)。
 
+> **1.0.0 起界面/架构变了**：退役的 egui 版与 Tauri 版、Inno 安装器、以及根包
+> （含 `build.rs` 编图标、`src/main.rs` 的界面与自测）都已删除。本文档里如果还有
+> 描述 egui/Tauri 实现细节、旧命令行自测、旧图标流程的段落，一律只作**历史参考** ——
+> 那些代码已经不在树里了。
+
 ## 技术栈与硬约束
 
-Rust + egui/eframe。**不许用** Electron / Tauri / WebView。
-目标：安装包 < 10 MB、启动 < 1 s、关闭即退出（不驻留、不轮询、不自动全盘扫描）。
+三层，各自独立：
 
-## 构建
+| 层 | 在哪 | 说明 |
+|---|---|---|
+| 界面 | `apps/electron/` | Electron 外壳 + 纯 HTML/CSS/JS（`ui/`），**没有前端构建步骤** |
+| 命令层 | `apps/sidecar/` | Rust sidecar（自带 `[workspace]`）：一行一条 JSON 走 stdio，只搬运参数与返回值 |
+| 业务核心 | `crates/core/` | **无 UI 依赖**，界面与 sidecar 共用；`cargo test` / `cargo clippy` 都在这里跑 |
 
-    cargo run --release        # 直接跑
-    cargo build --release      # 产物 target\release\framegen-manager.exe
+调用链：`ui/*.js → window.__TAURI__（preload 桥）→ main.js → stdio → framegen-sidecar.exe → crates/core`
 
-### 依赖上的四个坑（都已在 Cargo.toml / .cargo 里规避）
+目标：装完即用（资产随包内置）、关闭即退出（不驻留、不轮询、不自动全盘扫描）。
+体积与启动开销现在由 Electron 决定，`< 10 MB` 那条老指标已随 egui 版作废。
 
-1. **eframe 默认渲染后端是 wgpu**，会拉进 wgpu-core / naga / ash，体积巨大。
-   必须 default-features = false，只开 glow + default_fonts。
-2. **reqwest 默认 TLS 会拉 aws-lc-sys**，那个 crate 需要 CMake + NASM 才能编译。
-   改用 native-tls（Windows 走 schannel），零 C 依赖。
-3. **flate2 用来解压运行库的 zip**。它本来就在依赖树里（png -> image -> eframe），
-   所以加为直接依赖是零新增下载、零体积增加。
-4. **.cargo/config.toml 开了 +crt-static**，去掉对 vcruntime140.dll 的依赖，
-   用户不装 VC++ 运行库也能直接跑。实测依赖从 24 个降到 17 个系统 DLL。
+## 构建 / 测试 / 打包
 
-## 自测命令
+    # 1) 业务核心：测试 + 静态检查（工作区根只有 crates/core）
+    cargo test
+    cargo clippy --all-targets -- -D warnings
 
-自测按结果返回退出码：**全过 = 0，有失败 = 1**。CI 和打包脚本就靠它判定，别再靠数输出里的字符串。
-`--selftest` / `--sourcetest` / `--deploytest` 不依赖外网，每次推送都由 GitHub Actions 跑；
-`--downloadtest` / `--canceltest` 要连 GitHub，改下载链路时手工跑。
+    # 2) 命令层（自带 workspace，单独编译）
+    cargo build --release --manifest-path apps\sidecar\Cargo.toml
 
-    cargo run -- --selftest        # 扫描游戏库 + 反作弊 + 更新检查 + 入口推荐 + 显卡
-    cargo run -- --deploytest      # 部署 / 备份 / 还原 / 冲突 / 已装过本项目 端到端断言
-    cargo run -- --canceltest      # 取消下载 + 残留清理
-    cargo run -- --downloadtest    # HEAD 取 ETag -> 下载 581B 的 ini -> 校验指纹（0 次 API）
-    cargo run -- --speedtest       # 走生产路径（镜像优先 + 签名校验）实测下载速度
-    cargo run -- --selfupdate      # 软件自身版本检查 + 版本号比较的边界用例
-    cargo run -- --sourcetest      # 选源排序 + 慢源必须下完（本地起慢服务器，不依赖外网）
-    cargo run -- --speedall        # 实测每个候选源的速度，打印出下载时的尝试顺序
-    cargo run -- --backuptest      # 实测备用源，并验证镜像也会透传 ETag
-    cargo run -- --dlssrun         # 下载 DLSS 运行库：直链 -> 下载 -> 解压 -> 删包 -> 验签
-    cargo run -- --ziptest <zip> <输出>   # 单独测 zip 解压
-    cargo run -- --idtest <文件>          # 看一个文件的签名身份
-    cargo run -- --icontest <exe>         # 提取图标并打印尺寸/透明度统计
-    cargo run -- --pedump <exe>           # 打印 PE 导入表
-    cargo run -- --gpuinfo                # 只读：显卡注册表实例 + 驱动版本 + 备份状态
+    # 3) 界面：Electron，无构建步骤；开发期直接跑
+    #    （打包脚本里能看到它怎么被 electron-builder 调起来的）
+    <node.exe> apps\electron\node_modules\electron\dist\electron.exe apps\electron
 
-另有三个只给程序内部用的模式（主程序用 ShellExecuteW("runas") 拉起的提权子进程）：
+    # 4) 出安装包（版本校验 → sidecar 冒烟 → electron-builder NSIS → SHA256）
+    powershell -ExecutionPolicy Bypass -File packaging\build-release.ps1 [-Node <node.exe>]
 
-    --gpuspoof-apply <型号> <结果文件>
-    --gpuspoof-restore driver|backup <结果文件>
+版本号只有一个真源：`crates/core/Cargo.toml`（core 的 `SELF_VERSION` 取自它）；
+打包脚本会校验它与 `apps/electron/package.json` 一致，对不上就拒绝出包。
 
-它们把 JSON 结果写进结果文件后立刻退出，不创建窗口。手工调用等于自己给自己提权，
-一般用不上；`--gpuinfo` 已经能看全部状态。
+### 依赖上的坑（都已在 manifests / .cargo 里规避）
+
+1. **reqwest 默认 TLS 会拉 aws-lc-sys**（要 CMake + NASM）→ 用 native-tls（Windows 走 schannel）。
+2. **`.cargo/config.toml` 开了 +crt-static**，去掉 vcruntime140.dll 依赖。
+3. **electron-builder 的二进制走国内镜像**（`ELECTRON_MIRROR` / `ELECTRON_BUILDER_BINARIES_MIRROR`，见打包脚本）。
+4. **apps/sidecar 是它自己的 workspace**：不改根清单，也不与根共享 target/。
+
+## 自测
+
+测试住在 **`crates/core/tests/selftest.rs`**（1.0.0 从退役的 egui 版 `main.rs` 搬过来）：
+
+    cargo test                     # 三个测试：sourcetest / selftest / deploytest
+    cargo test -- --nocapture      # 看每条 [PASS]/[FAIL] 明细
+
+- 三个测试各自把 `FGM_DATA_DIR` 指到系统临时目录下的独立子目录，**不碰用户真实数据目录**。
+- `selftest` 覆盖：Steam 定位、游戏扫描、反作弊判定、上游更新检查、显卡路由、INI 档位改写、
+  图形 API/引擎识别、路径与版本号工具、导入的版本对照等。
+- `deploytest` 覆盖部署/备份/还原/入口冲突/已装过本项目 的端到端行为（用临时目录构造数据）。
+- 搬迁时删掉了 3 个耦合退役界面的小节（图标 / 手动导入校验 / 旧缓存兼容）与联网类自测
+  （download / cancel / speed）—— 前者测的是 egui 版的资产行状态机，后者本来就不在 CI 里跑。
+- CI（`.github/workflows/ci.yml`）跑：`cargo clippy --all-targets -- -D warnings`、`cargo test`、
+  以及 sidecar 的 clippy + release 构建。
+
+另有几个**只给开发排查**的 sidecar 命令行开关（不进界面）：
+
+    framegen-sidecar.exe --dlss5test <目录> [api] [--restore]   # DLSS5 部署/还原链路
+    framegen-sidecar.exe --gpuspoof-apply <型号> <结果文件>      # 提权子进程入口
+    framegen-sidecar.exe --gpuspoof-restore driver|backup <结果文件>
 
 ## 调试开关（环境变量）
 
@@ -74,8 +91,12 @@ Rust + egui/eframe。**不许用** Electron / Tauri / WebView。
 
     powershell -ExecutionPolicy Bypass -File packaging\build-release.ps1
 
-会自动从 Cargo.toml 读版本号，产出 dist\FrameGen-Manager-v<版本>.zip 和 SHA256SUMS.txt。
+会自动从 Cargo.toml 读版本号，产出 **dist\FrameGen-Manager-v<版本>-setup.exe** 和 SHA256SUMS.txt。
 装了 Inno Setup 6 的话还会顺带出安装包。
+
+**只发安装版**（用户要求）：以前还会组装一份便携 zip（electron-builder 的 win-unpacked 打包），
+现在这一步已经从脚本里去掉 —— 便携版没有 installed.txt 标记、数据落在程序目录，
+"绿色版"那条路不再发布。运行时仍然保留"没有标记就当便携"的兜底（开发期直接跑 electron 时靠它）。
 
 打包前先跑一遍 release 自测（**不过就不出包**），出包后再查安装包体积（**≥ 10 MB 直接报错**）。
 这样「exe 静默没图标」「安装包悄悄变胖」都流不出去。
@@ -90,7 +111,11 @@ Rust + egui/eframe。**不许用** Electron / Tauri / WebView。
 **注意**：packaging 下的 .ps1 和 .iss 必须保持 **UTF-8 BOM**，
 否则 PowerShell 5.1 和 Inno Setup 会按 ANSI 解码，中文变乱码并报语法错。
 
-## 实测指标（release，本机 RTX 3070）
+## 实测指标（历史：egui 版实测数据）
+
+> ⚠ 下面这张表与字体那一段是 **egui 版**的数据（安装包 4.69 MB、exe 7.16 MB 之类），
+> 1.0.0 起界面换成 Electron + sidecar，这些数字都不再适用，保留只为对照「当年为什么那么做」。
+> 现在的体积/内存该测 `FrameGen Manager.exe` + `framegen-sidecar.exe` 两个进程。
 
 | 指标 | 目标 | 实测 |
 |---|---|---|
@@ -758,6 +783,9 @@ Streamline 工作，**游戏没有它就装了也不会生效** —— 界面会
 
 assets / backups / 配置文件 / **下载记录**（`assets\update_state.json`）都优先放在
 **exe 同级**（便携，解压即用，拷走就带走全部状态），该目录不可写时才回退 %APPDATA%。
+
+> 注：这条"便携布局"只剩运行时兜底 —— 安装版靠 exe 同级的 installed.txt 标记走 %APPDATA%，
+> 发布也不再提供便携 zip（见上面的「打包」一节）。
 可写性判断走 `util::is_writable()` —— 真去写一个探针文件，而不是只看只读属性，
 因为 ACL 挡住的写操作从只读属性上看不出来。
 
@@ -774,16 +802,24 @@ assets / backups / 配置文件 / **下载记录**（`assets\update_state.json`�
 
 ## 目录结构
 
-    src/
-      main.rs        UI + 后台线程 + 命令行自测入口
-      deploy.rs      部署 / 备份 / 还原（多文件 + manifest）
-      scan.rs        Steam/Epic 扫描 + 最小 VDF 解析 + PE 解析 + 入口推荐 + 显卡路由识别
+    crates/core/src/
+      lib.rs         对外导出
+      deploy.rs      部署 / 备份 / 还原 / 手动安装清理（manifest + 多文件 + DirLock）
+      dlss5.rs       DLSS5：探测 / 自动部署 / 彻底卸载 / 模型路由（走官方 ReShade 安装器）
+      scan.rs        Steam/Epic/WeGame/本地扫描 + 最小 VDF 解析 + PE 解析 + 入口推荐 + 显卡路由
       gpu.rs         驱动版本检测 + 显卡注册表实例枚举 + 名称伪装 / 备份 / 还原 + 提权
       anticheat.rs   反作弊检测（注册表服务 + 游戏目录特征）
-      update.rs      上游更新检查 + 下载 + zip 解压 + INI 改写
-      icon.rs        从 EXE 提取图标
-      theme.rs       浅色主题 + 卡片 / 徽章 / 按钮组件
-      util.rs        哈希 / 原子替换 / 便携配置与备份目录（含老版本一次性搬迁）
+      update.rs      上游更新检查 + 下载 + zip 解压 + INI 改写 + Steam 封面抓取
+      icon.rs        从 EXE 提取图标（RGBA，交给界面画）
+      util.rs        哈希 / 原子替换 / 配置与备份目录（含老版本一次性搬迁、陈旧锁接管）
+    crates/core/tests/selftest.rs   无界面自测（cargo test）
+
+    apps/sidecar/src/main.rs        命令层：命令表 → core，一行一条 JSON 走 stdio
+    apps/electron/main.js           窗口 / IPC / 自更新 / 内置资产铺设 / EcoQoS
+    apps/electron/preload.js        window.__TAURI__ 桥
+    apps/electron/ui/               界面（HTML/CSS/JS，无构建步骤）
+    apps/electron/bundled-*/        随包内置的资产（帧生成 9 个 + DLSS5 三件套）
+    packaging/build-release.ps1     出包：版本校验 → sidecar 冒烟 → electron-builder → SHA256
 
 ## 图标
 
@@ -794,11 +830,9 @@ assets / backups / 配置文件 / **下载记录**（`assets\update_state.json`�
   图片 / 图标 crate**。脚本顺带把每一档**用 Win32 LoadImage 读回来**验证并出一张预览图。
   （注意：System.Drawing 自己的 `Icon(path,w,h)` 读不了 PNG 压缩帧、会读出噪点 —— 那是
   .NET 的老问题，Shell / LoadImage / PrivateExtractIcons 都正常，别被它误导。）
-* `build.rs` —— 调 Windows SDK 自带的 `rc.exe` 把 app.ico 编成 .res，再用
-  `cargo:rustc-link-arg` 交给链接器。**没有 build-dependency**；找不到 rc.exe 或 app.ico
-  时只警告、不中断构建（换台没装 SDK 的机器照样能编，只是 exe 没图标）。
-  坑：`.rc` 里 `\` 是转义字符，路径里的反斜杠必须写成两个，否则 rc 报 RC2135 file not found。
-* 窗口 / 任务栏图标不是另找一张图：`icon::app_icon()` 用 `PrivateExtractIconsW` 从
-  **本 exe 的图标资源**取 256 档，复用 `icon.rs` 里已有的 HICON → RGBA。
-  `--selftest` 里有断言（尺寸 + 像素不是全透明）。
-* 安装包：`packaging/installer.iss` 的 `SetupIconFile=app.ico` 用的是同一个文件。
+* `app.ico` 现在**只给安装包与 Electron 用**：`apps/electron/package.json` 的
+  `build.win.icon` 指向它，electron-builder 自己会把图标写进 exe 与快捷方式 ——
+  不再需要 `build.rs` + `rc.exe`（那段随退役的 egui 根包一起删掉了）。
+* 界面里的图标（游戏卡片、DLSS5 卡片墙）不是这张：`icon::icon_of(exe)` 从**游戏自己的 exe**
+  里抠 HICON → RGBA，由 sidecar 的 `game_icons` 命令发给界面（回退顺序：封面 → exe 图标 → 首字母）。
+* README 里用的图标与截图放在 `docs/`（`docs/icon.png` 是 app-icon.png 缩到 256 的版本）。

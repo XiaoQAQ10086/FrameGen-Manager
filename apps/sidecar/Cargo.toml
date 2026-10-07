@@ -1,0 +1,33 @@
+[package]
+name = "framegen-sidecar"
+# 版本的唯一作用是 exe 属性里好看；界面标题用的是 core 的 SELF_VERSION。
+# 还是跟着主程序走，免得用户按「属性里的版本」对不上。
+version = "1.0.0"
+edition = "2021"
+
+# 这一行让本 package 成为**它自己的 workspace 根**。
+# 上级 dlssg-manager/Cargo.toml 是另一个 workspace（members 只有 crates/core）。
+# 不写这一行，cargo 会认为 apps/sidecar「以为自己属于那个 workspace」并要求去改根清单；
+# 写了之后这里自成一体：自己的 Cargo.lock、自己的 target/，互不干扰。
+[workspace]
+
+[[bin]]
+name = "framegen-sidecar"
+path = "src/main.rs"
+
+[dependencies]
+# 业务逻辑全在 core：这里一行都不重写，只搬运参数和返回值
+framegen-core = { path = "../../crates/core" }
+serde_json = "1"
+# 选资产目录 / 手动加游戏 / 导入压缩包要弹系统对话框。
+# rfd 在独立进程里照样能弹（它自己初始化 COM，不依赖 Tauri 的窗口）。
+rfd = "0.17"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+# 故意**不写** panic = "abort"（core 的清单里有这个）：
+# sidecar 要用 catch_unwind 兜住单条命令的 panic，回一条错误行后继续服务 ——
+# 一条命令的 bug 不该把整个后台进程带走（Electron 那边还挂着一堆调用）。

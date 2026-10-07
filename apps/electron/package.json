@@ -1,0 +1,85 @@
+{
+  "name": "framegen-manager",
+  "productName": "FrameGen Manager",
+  "version": "1.0.0",
+  "description": "为 dlssg_for_sm86 部署 DLSS 帧生成",
+  "license": "MIT",
+  "author": "FrameGen Manager",
+  "main": "main.js",
+  "private": true,
+  "scripts": {
+    "start": "electron .",
+    "dist": "electron-builder --win nsis --x64"
+  },
+  "devDependencies": {
+    "electron": "^33.2.0",
+    "electron-builder": "^25.1.8"
+  },
+  "build": {
+    "appId": "com.framegen.manager",
+    "productName": "FrameGen Manager",
+    "copyright": "FrameGen Manager",
+    "directories": {
+      "output": "../../dist-electron",
+      "buildResources": "build"
+    },
+    "files": [
+      "main.js",
+      "preload.js",
+      "ui/**/*",
+      "package.json"
+    ],
+    "extraFiles": [
+      {
+        "from": "../../apps/sidecar/target/release/framegen-sidecar.exe",
+        "to": "framegen-sidecar.exe"
+      },
+      {
+        "from": "bundled-assets",
+        "to": "bundled-assets"
+      },
+      {
+        "from": "../../README.md",
+        "to": "README.md"
+      },
+      {
+        "from": "../../THIRD_PARTY_NOTICES.txt",
+        "to": "THIRD_PARTY_NOTICES.txt"
+      },
+      {
+        "from": "../../LICENSE",
+        "to": "LICENSE"
+      },
+      {
+        "from": "bundled-dlss5",
+        "to": "bundled-dlss5"
+      }
+    ],
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "icon": "build/icon.ico"
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "FrameGen Manager",
+      "artifactName": "FrameGen-Manager-v${version}-setup.${ext}",
+      "include": "build/installer.nsh",
+      "installerLanguages": [
+        "zh_CN"
+      ],
+      "deleteAppDataOnUninstall": false,
+      "runAfterFinish": true
+    }
+  }
+}

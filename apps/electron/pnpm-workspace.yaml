@@ -1,0 +1,9 @@
+allowBuilds:
+  electron: set this to true or false
+# pnpm 10 起，包管理配置从 package.json 的 "pnpm" 字段搬到了这里。
+# electron 的 postinstall 要去 GitHub 下载平台二进制（约 100 MB），pnpm 默认拦脚本，
+# 不在这里放行的话 node_modules/electron/dist 是空的，跑不起来。
+onlyBuiltDependencies:
+  - electron
+  - electron-builder
+  - esbuild
