@@ -1,7 +1,7 @@
 {
   "name": "framegen-manager",
   "productName": "FrameGen Manager",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "为 dlssg_for_sm86 部署 DLSS 帧生成",
   "license": "MIT",
   "author": "FrameGen Manager",

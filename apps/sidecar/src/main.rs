@@ -435,7 +435,43 @@ fn game_row(c: &framegen_core::scan::CachedRow, manual: bool) -> Value {
 
 /// 真实游戏库：scanned + manual 合并，去掉用户移除过的，算好部署目标与状态。
 fn list_games() -> Result<Value, String> {
-    let cache = framegen_core::scan::load_library();
+    let mut cache = framegen_core::scan::load_library();
+    /* 判定结果会跟着库缓存走，而检测只在「添加 / 扫描」时算一次。
+       于是有个坑：**检测逻辑本身升级了，老缓存还是旧结论** —— 用户装上新版打开程序，
+       看到的仍是一年前的判定（实测：「霍格沃茨之遗」自带 DLSS 帧生成，却被旧逻辑判成
+       「未检出」，装了修好的版本也还是错的）。
+
+       这里做一次**廉价自愈**：只对「缓存说不自带 DLSS」的行重算。真没有的游戏，重算
+       也就是再看一遍导入表 + 几个固定目录（每行几毫秒）；被旧逻辑漏掉的，打开程序就对了。
+       缓存里已经是 true 的行不重算，所以正常启动不会多花时间。 */
+    let mut healed = false;
+    for row in cache.scanned.iter_mut().chain(cache.manual.iter_mut()) {
+        if row.streamline {
+            continue;
+        }
+        let Some(exe) = row.render_exe.clone() else { continue };
+        if !exe.is_file() {
+            continue;
+        }
+        let rep = framegen_core::scan::detect_tech_report(&exe);
+        if rep.streamline {
+            row.streamline = true;
+            row.api = rep.api;
+            row.engine = rep.engine;
+            row.tech_scanned = true;
+            healed = true;
+            framegen_core::log::line(&format!(
+                "重新检测到自带 DLSS 帧生成：{}（{}）",
+                row.entry.name,
+                exe.display()
+            ));
+        }
+    }
+    if healed {
+        if let Err(e) = framegen_core::scan::save_library(&cache) {
+            framegen_core::log::line(&format!("自愈后写回游戏库失败：{e}"));
+        }
+    }
     let ignored = cache.ignored.clone();
     let is_ignored = |d: &Path| {
         let k = framegen_core::scan::path_key(d);

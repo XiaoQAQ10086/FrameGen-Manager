@@ -1772,6 +1772,42 @@
   }
 
   // ---------------------------------------------------------------- 扫描 / 下载 / 导入
+
+  /* 启动时自动扫描一次游戏库（用户要求）。
+     为什么要：装完新游戏、或卸掉游戏之后，用户不该还得记得点一下「扫描游戏库」。
+     安静策略：进度条照常走；**结果没变化就不弹任何提示**，只有真的新增/移除才说一句 ——
+     否则每次开机都糊一个 toast，反而烦人。
+     代价：扫描本身只读 launcher manifest + 几个目录，本机 7 个游戏实测 0.0 秒。 */
+  function autoScanLibrary() {
+    var before = (GAMES || []).map(function (g) { return g.dir; });
+    showBar('正在扫描游戏库…', 0.05);
+    return invoke('scan_library').then(function (r) {
+      showBar('扫描完成，共 ' + r.count + ' 个游戏', 1);
+      hideBarLater(2000);
+      // 新扫出来的游戏要补封面：refreshLibrary 里的 ensureCovers 只跑一次，
+      // 不重置这个开关的话这次启动就永远是 exe 图标了。
+      COVERS_TRIED = false;
+      return refreshLibrary().then(function () {
+        var after = (GAMES || []).map(function (g) { return g.dir; });
+        var beforeSet = {}, afterSet = {};
+        before.forEach(function (d) { beforeSet[d] = 1; });
+        after.forEach(function (d) { afterSet[d] = 1; });
+        var added = after.filter(function (d) { return !beforeSet[d]; }).length;
+        var removed = before.filter(function (d) { return !afterSet[d]; }).length;
+        if (!added && !removed) return;   // 没变化 = 不打扰
+        var bits = [];
+        if (added) bits.push('新增 ' + added + ' 个');
+        if (removed) bits.push('移除 ' + removed + ' 个');
+        toast('启动时已更新游戏库：' + bits.join('、'), 'ok', 7000);
+      });
+    }).catch(function (e) {
+      // 进度条只在还停在"扫描"那句话时才收，免得把别人的进度条关掉
+      var bt = $('bar-text');
+      if (bt && /^正在扫描游戏库/.test(bt.textContent || '')) hideBarLater(600);
+      toast('启动时扫描游戏库失败：' + errText(e), 'err', 12000);
+    });
+  }
+
   function scanLibrary() {
     busy($('btn-scan'), '扫描中…', function () {
       showBar('正在扫描游戏库…', 0.05);
@@ -1952,7 +1988,12 @@ if ($('sel-proxy')) {
     loadConfig().then(function () { return refreshAssets(); }).catch(function () { });
     loadDlss5Meta().catch(function () { });
     loadSpoof().catch(function () { });
-    loadCovers().then(function () { return refreshLibrary(); }).catch(function () { });
+    loadCovers()
+      .then(function () { return refreshLibrary(); })
+      // 列表先画出来，再做启动扫描（扫完自动刷新 + 有变化才提示）——
+      // 这样用户一进来就有东西看，而不是对着空列表等扫描。
+      .then(function () { return autoScanLibrary(); })
+      .catch(function () { });
   }
 
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot);

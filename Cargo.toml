@@ -18,4 +18,4 @@ members = ["crates/core"]
 # 所以这一行必须与 crates/core/Cargo.toml 的版本保持一致 —— 打包脚本会校验，
 # 不一致就拒绝出包。
 [workspace.package]
-version = "1.0.0"
+version = "1.0.1"

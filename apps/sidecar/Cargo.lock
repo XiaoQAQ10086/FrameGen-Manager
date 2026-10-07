@@ -266,7 +266,7 @@ dependencies = [
 
 [[package]]
 name = "framegen-core"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "anyhow",
  "directories",
@@ -283,7 +283,7 @@ dependencies = [
 
 [[package]]
 name = "framegen-sidecar"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "framegen-core",
  "rfd",

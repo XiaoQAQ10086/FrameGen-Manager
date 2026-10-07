@@ -1867,9 +1867,11 @@ pub fn engine_from_facts(f: &LayoutFacts) -> GameEngine {
 fn find_streamline_marker(exe: &Path) -> Option<String> {
     let dir = exe.parent()?;
     let mut cur = Some(dir);
-    for _ in 0..3 {
+    // 向上 5 层：渲染 exe 通常在 <游戏根>\<项目名>\Binaries\Win64\，要走到 <游戏根>
+    // 才看得见引擎目录 —— 以前只走 3 层，正好差一层（实测「霍格沃茨之遗」就卡在这里）。
+    for _ in 0..5 {
         let Some(d) = cur else { break };
-        let candidates = [
+        let mut candidates = vec![
             d.to_path_buf(),
             d.join("Binaries").join("Win64"),
             d.join("Engine")
@@ -1881,7 +1883,44 @@ fn find_streamline_marker(exe: &Path) -> Option<String> {
                 .join("Binaries")
                 .join("ThirdParty")
                 .join("NVIDIA"),
+            // UE 插件布局（霍格沃茨之遗、以及不少 UE4/5 游戏就是这一套）：
+            //   <根>\Engine\Plugins\Runtime\Nvidia\DLSS\Binaries\ThirdParty\Win64
+            //   <根>\Engine\Plugins\Runtime\Nvidia\Streamline\Binaries\ThirdParty\Win64
+            // Windows 文件系统不区分大小写，所以 Nvidia/NVIDIA 写哪个都行。
+            d.join("Engine")
+                .join("Plugins")
+                .join("Runtime")
+                .join("Nvidia")
+                .join("DLSS")
+                .join("Binaries")
+                .join("ThirdParty")
+                .join("Win64"),
+            d.join("Engine")
+                .join("Plugins")
+                .join("Runtime")
+                .join("Nvidia")
+                .join("Streamline")
+                .join("Binaries")
+                .join("ThirdParty")
+                .join("Win64"),
         ];
+        // 插件目录名各家不同（Nvidia / NVIDIA / DLSS / Streamline / 自建名），
+        // 所以再扫一层 Engine\Plugins\Runtime\*\Binaries\ThirdParty\Win64 兜底。
+        // 只列一层目录，条目很少，代价可忽略。
+        let runtime = d.join("Engine").join("Plugins").join("Runtime");
+        if let Ok(rd) = std::fs::read_dir(&runtime) {
+            for e in rd.flatten().take(40) {
+                if e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                    candidates.push(
+                        e.path()
+                            .join("Binaries")
+                            .join("ThirdParty")
+                            .join("Win64"),
+                    );
+                    candidates.push(e.path());
+                }
+            }
+        }
         for probe in candidates {
             let Ok(rd) = std::fs::read_dir(&probe) else {
                 continue;
