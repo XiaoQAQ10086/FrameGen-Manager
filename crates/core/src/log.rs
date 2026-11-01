@@ -151,7 +151,9 @@ pub fn event(v: &serde_json::Value) {
             .map(|d| d.as_secs())
             .unwrap_or(0)),
     );
-    let Ok(text) = serde_json::to_string(&serde_json::Value::Object(obj)) else { return };
+    let Ok(text) = serde_json::to_string(&serde_json::Value::Object(obj)) else {
+        return;
+    };
     if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(&p) {
         let _ = writeln!(f, "{}", util::redact(&text));
         let _ = f.flush();
@@ -161,7 +163,9 @@ pub fn event(v: &serde_json::Value) {
 /// 超过 max 就把 cur 改名成 prev（旧的 prev 删掉）；返回是否滚过。
 /// 抽出来是为了能用临时目录测，不依赖 init 的全局句柄。
 fn rotate_if_too_big(cur: &Path, prev: &Path, max: u64) -> bool {
-    let too_big = std::fs::metadata(cur).map(|m| m.len() > max).unwrap_or(false);
+    let too_big = std::fs::metadata(cur)
+        .map(|m| m.len() > max)
+        .unwrap_or(false);
     if !too_big {
         return false;
     }
@@ -171,7 +175,6 @@ fn rotate_if_too_big(cur: &Path, prev: &Path, max: u64) -> bool {
     }
     true
 }
-
 
 /// 一段操作的开始标记
 pub fn section(title: &str) {

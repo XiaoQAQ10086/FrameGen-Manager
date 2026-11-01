@@ -138,7 +138,10 @@ mod tests {
                 "前缀应是 2~5 个字符（大写字母开头、可含数字）：{code}"
             );
             // 前缀约定：大写字母开头，后面可以带数字（D5-011 这种）
-            assert!(bytes[0].is_ascii_uppercase(), "前缀不是大写字母开头：{code}");
+            assert!(
+                bytes[0].is_ascii_uppercase(),
+                "前缀不是大写字母开头：{code}"
+            );
             assert!(
                 bytes[..dash]
                     .iter()
@@ -147,7 +150,10 @@ mod tests {
             );
             let tail = &code[dash + 1..];
             assert_eq!(tail.len(), 3, "编号尾部应是 3 位数字：{code}");
-            assert!(tail.bytes().all(|b| b.is_ascii_digit()), "编号尾部不是数字：{code}");
+            assert!(
+                tail.bytes().all(|b| b.is_ascii_digit()),
+                "编号尾部不是数字：{code}"
+            );
             assert!(!seen.contains(&code), "编号重复：{code}");
             seen.push(code);
         }
@@ -171,7 +177,10 @@ mod tests {
     /// 真实文案的归类：几条最常出现在用户截图里的。
     #[test]
     fn real_messages_classify() {
-        assert_eq!(classify("version.dll 正被占用，请先完全退出游戏。"), "FILE-002");
+        assert_eq!(
+            classify("version.dll 正被占用，请先完全退出游戏。"),
+            "FILE-002"
+        );
         assert_eq!(classify("没有权限写入 D:\\Game"), "ACL-003");
         assert_eq!(
             classify("内置资产校验不通过（6 项）：\n· version.dll（缺失）"),
@@ -183,7 +192,10 @@ mod tests {
         );
         assert_eq!(classify("unknown command: deploy_state"), "IPC-009");
         assert_eq!(classify("缺少参数 version"), "REQ-017");
-        assert_eq!(classify("备份 version.dll 自身已损坏，中止（目录一个字都没动）"), "BAK-012");
+        assert_eq!(
+            classify("备份 version.dll 自身已损坏，中止（目录一个字都没动）"),
+            "BAK-012"
+        );
         assert_eq!(classify("今天天气不错"), FALLBACK);
     }
 }

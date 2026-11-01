@@ -153,6 +153,8 @@ function showClearedDialog(report, kinds) {
 // 按**程序版本**只做一次（`assetsLegacyPrompted`），否则每次启动都扫一遍、删一遍。
 function checkAssetsLegacy() {
   if (!CFG) return Promise.resolve();
+  // 停更退场版本已经统一清过部署，别再弹旧资产提示。
+  if (CFG.retired) return Promise.resolve();
   var ver = CFG.version ? CFG.version : '';
   if (ver.length > 0 && CFG.assetsLegacyPrompted === ver) return Promise.resolve();
   var uniq = function (arr) {

@@ -112,9 +112,13 @@ pub enum DeployState {
         installing: bool,
     },
     /// 目录里有本项目的文件，但不是本工具部署的（用户之前手动装的）
-    ManuallyInstalled { files: Vec<String> },
+    ManuallyInstalled {
+        files: Vec<String>,
+    },
     /// 目录里有代理 DLL，但不是本项目的 —— 可能是别的 Mod
-    Occupied { files: Vec<String> },
+    Occupied {
+        files: Vec<String>,
+    },
     /// Smooth Motion 的解锁组件占着 version.dll（和帧生成同一个文件名，必须分开认）
     SmDeployed,
 }
@@ -152,11 +156,12 @@ impl DeployState {
             DeployState::SmDeployed => "已被 Smooth Motion 占用".to_owned(),
         }
     }
-
 }
 
 fn manifest_path(dir: &Path) -> Result<PathBuf> {
-    Ok(util::backups_dir()?.join(util::dir_key(dir)).join("manifest.json"))
+    Ok(util::backups_dir()?
+        .join(util::dir_key(dir))
+        .join("manifest.json"))
 }
 
 /// manifest 的状态。**「文件在但读不出来」必须和「压根没有这份文件」分开**：
@@ -203,12 +208,36 @@ pub fn load_manifest(dir: &Path) -> Option<BackupManifest> {
 /// 单测 `proxy_table_matches_bundled_assets` 会拿 `bundled-assets/` 里的真实文件核对，
 /// 换资产时忘了改这里会直接测挂。
 const PROXY_ASSET_SHA256: &[(&str, u64, &str)] = &[
-    ("version.dll", 815_240, "275ffa781b2d244ad269d1d65d4e5b68a12a3f89ff2baaec58d100eb5a1ff411"),
-    ("d3d12.dll", 815_744, "e188a992d1ff1ef1ebb51bfc544ac132536d717f2fa2ec77642f9d506cdea58e"),
-    ("dbghelp.dll", 832_648, "82c04383044657bcb4bb45b7061d8fb27a753bc222b37f6712c5affb20848f5f"),
-    ("dinput8.dll", 814_216, "8181129b3754bbea4a91bcc61f50a7e28f6fb939b880e2d38eb7a5b4ffbcc8ad"),
-    ("dxgi.dll", 815_752, "96e05da6572f6e4808b7f7402ccc9c584fc2257d7e5ea2478fc725663bdc27b4"),
-    ("winmm.dll", 825_984, "1a584a9b0333e0c3be4ab32e00901c545ca16a620a56784a67cacf003c041739"),
+    (
+        "version.dll",
+        815_240,
+        "275ffa781b2d244ad269d1d65d4e5b68a12a3f89ff2baaec58d100eb5a1ff411",
+    ),
+    (
+        "d3d12.dll",
+        815_744,
+        "e188a992d1ff1ef1ebb51bfc544ac132536d717f2fa2ec77642f9d506cdea58e",
+    ),
+    (
+        "dbghelp.dll",
+        832_648,
+        "82c04383044657bcb4bb45b7061d8fb27a753bc222b37f6712c5affb20848f5f",
+    ),
+    (
+        "dinput8.dll",
+        814_216,
+        "8181129b3754bbea4a91bcc61f50a7e28f6fb939b880e2d38eb7a5b4ffbcc8ad",
+    ),
+    (
+        "dxgi.dll",
+        815_752,
+        "96e05da6572f6e4808b7f7402ccc9c584fc2257d7e5ea2478fc725663bdc27b4",
+    ),
+    (
+        "winmm.dll",
+        825_984,
+        "1a584a9b0333e0c3be4ab32e00901c545ca16a620a56784a67cacf003c041739",
+    ),
 ];
 
 /// 已知的 ReShade（Addon 版）模块指纹：dxgi/d3d11/… 只是换了文件名，内容一致。
@@ -239,12 +268,15 @@ fn is_reshade_module(p: &std::path::Path) -> bool {
     }
     if RESHADE_KNOWN.iter().any(|(s, _)| *s == meta.len()) {
         return crate::util::sha256_file(p)
-            .map(|h| RESHADE_KNOWN.iter().any(|(_, sha)| h.eq_ignore_ascii_case(sha)))
+            .map(|h| {
+                RESHADE_KNOWN
+                    .iter()
+                    .any(|(_, sha)| h.eq_ignore_ascii_case(sha))
+            })
             .unwrap_or(false);
     }
     false
 }
-
 
 /// 这个文件是不是我们内置的代理。
 ///
@@ -391,9 +423,9 @@ pub fn deploy(
         bail!("游戏目录不存在: {}", target_dir.display());
     }
     /* 写不进去就别开始，而且把话说清楚。
-       实测：目录没写权限时以前会一路走到写文件才失败，报的是
-       「写入临时文件 …\.version.dll.tmp」—— 用户完全看不懂。原神默认装在
-       C:\Program Files，普通权限就是写不进去，这是最常见的踩坑。 */
+    实测：目录没写权限时以前会一路走到写文件才失败，报的是
+    「写入临时文件 …\.version.dll.tmp」—— 用户完全看不懂。原神默认装在
+    C:\Program Files，普通权限就是写不进去，这是最常见的踩坑。 */
     if !crate::util::is_writable(target_dir) {
         bail!(
             "这个目录现在写不进去（{}）。\n\n最常见的原因：游戏装在 C:\\Program Files 这类需要管理员权限的地方。\n解决办法：右键本程序 →「以管理员身份运行」再部署；或者先把游戏完全退出。",
@@ -441,8 +473,8 @@ pub fn deploy(
             continue;
         }
         /* **先判占用，再判签名**。游戏还在运行时文件常被独占，签名也读不出来 ——
-           于是会误报成「签名者：无签名 → 不是本项目的文件，请换个代理入口」，
-           用户照着去换入口，真实原因却是"游戏没退干净"（还要退启动器和反作弊进程）。 */
+        于是会误报成「签名者：无签名 → 不是本项目的文件，请换个代理入口」，
+        用户照着去换入口，真实原因却是"游戏没退干净"（还要退启动器和反作弊进程）。 */
         match crate::util::lock_state(&dst) {
             crate::util::LockState::InUse => bail!(
                 "{} 正被占用 —— 游戏（或它的启动器、反作弊进程）还在运行。请完全退出游戏后再部署。",
@@ -464,8 +496,8 @@ pub fn deploy(
                 continue;
             }
             /* Smooth Motion 的解锁组件也叫 version.dll，但它是社区打包的、没有我们的签名，
-               按签名判会被当成「别人的文件」直接拒掉 —— 而它其实是本工具放进去的。
-               按内容哈希认出来，交给下面那段单独处置。 */
+            按签名判会被当成「别人的文件」直接拒掉 —— 而它其实是本工具放进去的。
+            按内容哈希认出来，交给下面那段单独处置。 */
             if crate::sm::is_our_asset_file(&dst) {
                 sm_asset_here.push(f.dest_name.clone());
                 continue;
@@ -485,8 +517,8 @@ pub fn deploy(
 
     let mut notes: Vec<String> = Vec::new();
     /* Smooth Motion 留下（或正在用）的解锁组件：两个都用 version.dll。
-       覆盖动作照做 —— 用户可以选择忽略冲突提示继续部署 —— 但要把话说清楚：
-       这次覆盖了什么、Smooth Motion 会变成什么样。 */
+    覆盖动作照做 —— 用户可以选择忽略冲突提示继续部署 —— 但要把话说清楚：
+    这次覆盖了什么、Smooth Motion 会变成什么样。 */
     if !sm_asset_here.is_empty() {
         notes.push(SM_CONFLICT_NOTE.to_owned());
         notes.push(format!(
@@ -497,7 +529,10 @@ pub fn deploy(
     // 认出来"本来就是我们自己的文件"（所以不备份、只覆盖）的条目
     let mut ours_overwritten: Vec<String> = Vec::new();
     if !overwrite_own.is_empty() {
-        notes.push(format!("已覆盖本项目的旧文件：{}", overwrite_own.join("、")));
+        notes.push(format!(
+            "已覆盖本项目的旧文件：{}",
+            overwrite_own.join("、")
+        ));
     }
     if !overwrite_other.is_empty() {
         notes.push(format!(
@@ -546,8 +581,7 @@ pub fn deploy(
     // 只算哈希，真正的内容在第 6 步按文件复制。
     let mut payload: Vec<(String, PathBuf, String)> = Vec::new();
     for f in files {
-        let sha = util::sha256_file(&f.src)
-            .with_context(|| format!("读取 {}", f.src.display()))?;
+        let sha = util::sha256_file(&f.src).with_context(|| format!("读取 {}", f.src.display()))?;
         payload.push((f.dest_name.clone(), f.src.clone(), sha));
     }
 
@@ -565,7 +599,12 @@ pub fn deploy(
     // 把真正的原件覆盖掉 —— 之后「还原」只能还原出我们自己部署的版本。
     let prev: BTreeMap<String, BackupEntry> = existing_manifest
         .as_ref()
-        .map(|m| m.files.iter().map(|e| (e.rel_path.clone(), e.clone())).collect())
+        .map(|m| {
+            m.files
+                .iter()
+                .map(|e| (e.rel_path.clone(), e.clone()))
+                .collect()
+        })
         .unwrap_or_default();
 
     let mut entries = Vec::new();
@@ -592,9 +631,9 @@ pub fn deploy(
         let dst = target_dir.join(name);
         let present = dst.is_file();
         /* 这个位置的东西如果是**我们自己放进去的**（老版本铺的、或用户手动装的），
-           就不能记成"游戏原件" —— 见 is_our_artifact 的说明。
-           注意：有部署记录的那条路在上面已经沿用旧备份了，走到这里说明**没有记录**
-           （手动装的目录、或记录被清过），正是最容易误判成游戏原件的情况。 */
+        就不能记成"游戏原件" —— 见 is_our_artifact 的说明。
+        注意：有部署记录的那条路在上面已经沿用旧备份了，走到这里说明**没有记录**
+        （手动装的目录、或记录被清过），正是最容易误判成游戏原件的情况。 */
         let ours_here = present
             && std::fs::read(&dst)
                 .map(|b| is_our_artifact(&dst, name, &b))
@@ -623,7 +662,7 @@ pub fn deploy(
     }
 
     /* 这里才轮到说这句话：ours_overwritten 是上面那个循环填的。
-       放早了会说空话（曾经就是这样，提示根本没出现过）。 */
+    放早了会说空话（曾经就是这样，提示根本没出现过）。 */
     if !ours_overwritten.is_empty() {
         notes.push(format!(
             "已是本项目文件，已直接覆盖、没有当成游戏原件备份：{}",
@@ -689,7 +728,8 @@ pub fn deploy(
                     .with_context(|| format!("创建目录 {}", parent.display()))?;
             }
         }
-        let tmp = util::long_path(&target_dir.join(format!(".{}.tmp", name.replace(['\\', '/'], "_"))));
+        let tmp =
+            util::long_path(&target_dir.join(format!(".{}.tmp", name.replace(['\\', '/'], "_"))));
         // 报错里用**目标文件名**，不要把 .xxx.tmp 这种内部细节甩给用户
         let step = std::fs::copy(util::long_path(src), &tmp)
             .with_context(|| format!("写入 {}", name))
@@ -770,10 +810,10 @@ pub fn deploy(
                         removed_legacy.push(e.rel_path.clone());
                     } else {
                         /* 删不掉（游戏正开着、文件被占用）：**记录必须传下去** ——
-                           下面 failed_remove 的说明写着"本次记录已保留，下次点「还原」仍可处理"，
-                           记录一丢那句话就是假的，那个旧运行库再也没人清得掉。
-                           restore 只在"文件仍是 deployed_sha256 那份"时才删（deploy.rs 第 2 步），
-                           所以传下去是安全的。 */
+                        下面 failed_remove 的说明写着"本次记录已保留，下次点「还原」仍可处理"，
+                        记录一丢那句话就是假的，那个旧运行库再也没人清得掉。
+                        restore 只在"文件仍是 deployed_sha256 那份"时才删（deploy.rs 第 2 步），
+                        所以传下去是安全的。 */
                         failed_remove.push(e.rel_path.clone());
                         carried.push(e.clone());
                     }
@@ -1037,10 +1077,10 @@ fn restore_with(manifest: &BackupManifest) -> Result<RestoreOutcome> {
         }
         let src = files_dir.join(r.backup_name);
         /* 那份"游戏原件"本身如果是本项目放的文件（按签名或 0.3.x 指纹认），就**不写回**：
-           写回去等于把我们自己的 mod 文件当成游戏原件塞进游戏目录，而且从此被当成
-           游戏文件、本工具再也清不掉 —— 实测复现过的恶性 bug（手动装过 0.3.x 的目录，
-           老版本会把我们自己的代理备份成"游戏原件"）。这份备份留在备份目录里不动，
-           用户想核对还能找到。 */
+        写回去等于把我们自己的 mod 文件当成游戏原件塞进游戏目录，而且从此被当成
+        游戏文件、本工具再也清不掉 —— 实测复现过的恶性 bug（手动装过 0.3.x 的目录，
+        老版本会把我们自己的代理备份成"游戏原件"）。这份备份留在备份目录里不动，
+        用户想核对还能找到。 */
         if is_our_artifact(&src, &rel, &bytes) {
             healed.push(rel);
             continue;
@@ -1072,8 +1112,8 @@ fn restore_with(manifest: &BackupManifest) -> Result<RestoreOutcome> {
             }
         };
         /* 上一次「部分还原」已经把原件放回去了（重试时就会看到）：这一条不用再动，
-           更不能当成「内容被别人改过」去跳过 —— 那会让部署记录永远删不掉。
-           直接拿备份里的原件字节比，比哈希更准（老记录可能没有 original_sha256）。 */
+        更不能当成「内容被别人改过」去跳过 —— 那会让部署记录永远删不掉。
+        直接拿备份里的原件字节比，比哈希更准（老记录可能没有 original_sha256）。 */
         let already_original = plan
             .get(&e.rel_path)
             .map(|(_, existed_before, original)| *existed_before && original == &bytes)
@@ -1081,11 +1121,11 @@ fn restore_with(manifest: &BackupManifest) -> Result<RestoreOutcome> {
         if already_original {
             continue;
         }
-        let same_as_deployed = !e.deployed_sha256.is_empty()
-            && util::sha256_hex(&bytes) == e.deployed_sha256;
+        let same_as_deployed =
+            !e.deployed_sha256.is_empty() && util::sha256_hex(&bytes) == e.deployed_sha256;
         /* 内容不是这次部署的那份时还有第二种可能：**位置被本工具放的别的东西顶掉了**
-           （最典型的是 Smooth Motion 的解锁组件，它也占 version.dll）。那同样是我们放的，
-           要一并收走 —— 留着会让游戏继续加载到 Smooth Motion 的组件，而用户以为还原干净了。 */
+        （最典型的是 Smooth Motion 的解锁组件，它也占 version.dll）。那同样是我们放的，
+        要一并收走 —— 留着会让游戏继续加载到 Smooth Motion 的组件，而用户以为还原干净了。 */
         let still_ours = same_as_deployed || is_our_artifact(&p, &e.rel_path, &bytes);
         if still_ours {
             // 有原件的那几条由回滚写回原件（等于覆盖掉它），这里只登记「这次新建的」
@@ -1121,10 +1161,10 @@ fn restore_with(manifest: &BackupManifest) -> Result<RestoreOutcome> {
     }
 
     /* 4) 以下情况都要保留备份目录并如实说明，别把「原件还在」这一点弄丢：
-          · 有文件被用户改过（skipped）：不能删，否则原件跟着没了
-          · 记下的"游戏原件"其实是我们自己的文件（healed）：那份备份也不能删 ——
-            用户可能想核对它到底是不是游戏自带的
-          · 还有本工具的文件没删掉（leftover）：记录留着才能再点一次「还原」收尾 */
+    · 有文件被用户改过（skipped）：不能删，否则原件跟着没了
+    · 记下的"游戏原件"其实是我们自己的文件（healed）：那份备份也不能删 ——
+      用户可能想核对它到底是不是游戏自带的
+    · 还有本工具的文件没删掉（leftover）：记录留着才能再点一次「还原」收尾 */
     let keep_backups =
         !skipped.is_empty() || !healed.is_empty() || !unreadable.is_empty() || !leftover.is_empty();
     let mut msg = if keep_backups {
@@ -1258,7 +1298,11 @@ pub fn manual_files(dir: &Path) -> Vec<String> {
     // 没有备份就删除会直接破坏游戏的 DLSS 帧生成（Cyberpunk 2077 实测）。
     // 有部署记录时由 restore 按备份处理；没有记录时一律不动。
     let p = dir.join(INI_NAME);
-    if p.is_file() && std::fs::read(&p).map(|b| is_known_ours(INI_NAME, &b)).unwrap_or(false) {
+    if p.is_file()
+        && std::fs::read(&p)
+            .map(|b| is_known_ours(INI_NAME, &b))
+            .unwrap_or(false)
+    {
         out.push(INI_NAME.to_owned());
     }
     // 插件运行时建的目录（日志 / bundle 缓存）。同上：只有确实有本项目的代理入口时
@@ -1277,10 +1321,7 @@ pub fn manual_files(dir: &Path) -> Vec<String> {
 pub fn cleanup_manual(dir: &Path) -> Result<String> {
     let files = manual_files(dir);
     if files.is_empty() {
-        bail!(
-            "这个目录里没有找到本项目的帧生成文件（{}）",
-            dir.display()
-        );
+        bail!("这个目录里没有找到本项目的帧生成文件（{}）", dir.display());
     }
     // 和其它写操作共用同一把锁：避免和另一个实例的部署/还原撞在一起
     let _lock = DirLock::acquire(&util::backups_dir()?.join(util::dir_key(dir)))?;
@@ -1306,7 +1347,10 @@ pub fn cleanup_manual(dir: &Path) -> Result<String> {
         .iter()
         .filter(|n| {
             let p = dir.join(*n);
-            p.is_file() && std::fs::read(&p).map(|b| !is_known_ours(n, &b)).unwrap_or(false)
+            p.is_file()
+                && std::fs::read(&p)
+                    .map(|b| !is_known_ours(n, &b))
+                    .unwrap_or(false)
         })
         .map(|n| (*n).to_owned())
         .collect();
@@ -1384,8 +1428,8 @@ pub fn prepare_deploy(
     let mut notes = Vec::new();
 
     /* 部署前先把内置资产按分发表核一遍（0.4.0 起资产是一整个目录，缺一个文件
-       在游戏里的表现都是"没生效"）。核不过就拒绝部署并列出是哪个文件 ——
-       用户看到的是"资产不完整，请重装"，而不是去游戏里反复试。 */
+    在游戏里的表现都是"没生效"）。核不过就拒绝部署并列出是哪个文件 ——
+    用户看到的是"资产不完整，请重装"，而不是去游戏里反复试。 */
     let bad_assets = verify_asset_inventory(&crate::update::asset_path(proxy)?);
     if !bad_assets.is_empty() {
         anyhow::bail!(
@@ -1397,20 +1441,22 @@ pub fn prepare_deploy(
 
     let dll = crate::update::asset_path(proxy)?;
     if !dll.is_file() {
-        anyhow::bail!("资产缺失（{proxy}）—— 资产随安装包内置，请检查安装是否完整（或重新安装本程序）");
+        anyhow::bail!(
+            "资产缺失（{proxy}）—— 资产随安装包内置，请检查安装是否完整（或重新安装本程序）"
+        );
     }
     files.push(DeployFile::new(proxy, dll));
 
     /* 0.4.0 起运行库不再铺在游戏根目录（搬进 dlssg_sm86\runtime\），所以：
-         * 老用户（0.3.x 我们铺过根目录运行库）—— 那两份**是我们放的**，不能当"游戏自带的"
-           留着：新版会在 dlssg_sm86\runtime\ 里带自己的运行库，根目录再留一份旧的
-           可能被游戏优先加载，表现就是"升级上来了还是旧行为"。这里直接不把它们放进
-           本次负载，交给部署第 8 步的清单比对删掉（记录里 existed_before=false，可以安全删）。
-         * 从没用过本工具、但游戏目录自带运行库的目录 —— 照旧不动（那是游戏自己的东西）。 */
+    * 老用户（0.3.x 我们铺过根目录运行库）—— 那两份**是我们放的**，不能当"游戏自带的"
+      留着：新版会在 dlssg_sm86\runtime\ 里带自己的运行库，根目录再留一份旧的
+      可能被游戏优先加载，表现就是"升级上来了还是旧行为"。这里直接不把它们放进
+      本次负载，交给部署第 8 步的清单比对删掉（记录里 existed_before=false，可以安全删）。
+    * 从没用过本工具、但游戏目录自带运行库的目录 —— 照旧不动（那是游戏自己的东西）。 */
     /* 0.3.x 时代运行库内嵌在代理里，这里按"已有的不动、缺的才补"把两份 DLSS 运行库
-       铺到游戏目录。**0.4.0 起这条规则失效了**：运行库搬进了 dlssg_sm86\runtime\，
-       再往游戏根目录铺一份 66 MB 的旧库，既浪费又有被优先加载的风险。
-       所以 0.4.0 布局下这一整套直接跳过；根目录残留的旧库由下面那段负责清掉。 */
+    铺到游戏目录。**0.4.0 起这条规则失效了**：运行库搬进了 dlssg_sm86\runtime\，
+    再往游戏根目录铺一份 66 MB 的旧库，既浪费又有被优先加载的风险。
+    所以 0.4.0 布局下这一整套直接跳过；根目录残留的旧库由下面那段负责清掉。 */
     let (have, need) = if RUNTIME_IS_SEPARATE_DIR {
         (Vec::new(), Vec::new())
     } else {
@@ -1420,11 +1466,7 @@ pub fn prepare_deploy(
         let prev = load_manifest(dir);
         let we_put_it = |n: &str| {
             prev.as_ref()
-                .map(|m| {
-                    m.files
-                        .iter()
-                        .any(|e| e.rel_path == n && !e.existed_before)
-                })
+                .map(|m| m.files.iter().any(|e| e.rel_path == n && !e.existed_before))
                 .unwrap_or(false)
         };
         // 这两个列表此时恒为空（上面已短路），保留这段只为让"如果哪天又需要往根目录
@@ -1437,7 +1479,9 @@ pub fn prepare_deploy(
     for name in &need {
         let p = crate::update::asset_path(name).unwrap_or_default();
         if !p.is_file() {
-            anyhow::bail!("缺少运行库 {name} —— 资产随安装包内置，请检查安装是否完整（或重新安装本程序）");
+            anyhow::bail!(
+                "缺少运行库 {name} —— 资产随安装包内置，请检查安装是否完整（或重新安装本程序）"
+            );
         }
         files.push(DeployFile::new(name, p));
     }
@@ -1463,19 +1507,25 @@ pub fn prepare_deploy(
     files.push(DeployFile::new(INI_NAME, ini_path));
 
     /* 0.4.0 起运行库/后端/内核搬进了 dlssg_sm86\ 目录：只放代理 DLL 什么都不会发生，
-       所以整个目录都要铺进游戏目录，并**逐个文件进清单**（「还原」才收得干净）。
-       代理旁边那个 30 MB 的时代结束了：现在的代理不到 1 MB。 */
+    所以整个目录都要铺进游戏目录，并**逐个文件进清单**（「还原」才收得干净）。
+    代理旁边那个 30 MB 的时代结束了：现在的代理不到 1 MB。 */
     let runtime_src = crate::update::asset_path(RUNTIME_DIR)?;
     if runtime_src.is_dir() {
         let mut count = 0usize;
-        for entry in walkdir::WalkDir::new(&runtime_src).into_iter().filter_map(|e| e.ok()) {
+        for entry in walkdir::WalkDir::new(&runtime_src)
+            .into_iter()
+            .filter_map(|e| e.ok())
+        {
             if !entry.file_type().is_file() {
                 continue;
             }
             let rel = entry
                 .path()
                 .strip_prefix(&runtime_src)
-                .map(|r| r.to_string_lossy().replace('/', std::path::MAIN_SEPARATOR_STR))
+                .map(|r| {
+                    r.to_string_lossy()
+                        .replace('/', std::path::MAIN_SEPARATOR_STR)
+                })
                 .unwrap_or_default();
             if rel.is_empty() {
                 continue;
@@ -1495,7 +1545,9 @@ pub fn prepare_deploy(
                 );
             }
         }
-        notes.push(format!("已铺入 {RUNTIME_DIR}\\ 运行库目录（{count} 个文件）"));
+        notes.push(format!(
+            "已铺入 {RUNTIME_DIR}\\ 运行库目录（{count} 个文件）"
+        ));
     }
 
     Ok(PreparedDeploy { files, notes })
@@ -1579,14 +1631,20 @@ pub fn asset_inventory_gaps(root: &Path) -> Vec<String> {
 pub fn runtime_dir_files(root: &Path) -> Vec<(String, u64)> {
     let dir = root.join(RUNTIME_DIR);
     let mut out = Vec::new();
-    for entry in walkdir::WalkDir::new(&dir).into_iter().filter_map(|e| e.ok()) {
+    for entry in walkdir::WalkDir::new(&dir)
+        .into_iter()
+        .filter_map(|e| e.ok())
+    {
         if !entry.file_type().is_file() {
             continue;
         }
         let rel = entry
             .path()
             .strip_prefix(&dir)
-            .map(|r| r.to_string_lossy().replace('/', std::path::MAIN_SEPARATOR_STR))
+            .map(|r| {
+                r.to_string_lossy()
+                    .replace('/', std::path::MAIN_SEPARATOR_STR)
+            })
             .unwrap_or_default();
         let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
         if !rel.is_empty() {
@@ -1617,7 +1675,11 @@ pub fn verify_asset_inventory(runtime_src: &Path) -> Vec<String> {
         }
         match crate::util::sha256_file(&p) {
             Ok(h) if h.eq_ignore_ascii_case(sha) => {}
-            Ok(h) => bad.push(format!("{rel}（哈希 {} ≠ {}）", &h[..8.min(h.len())], &sha[..8])),
+            Ok(h) => bad.push(format!(
+                "{rel}（哈希 {} ≠ {}）",
+                &h[..8.min(h.len())],
+                &sha[..8]
+            )),
             Err(e) => bad.push(format!("{rel}（读不出来：{e}）")),
         }
     }
@@ -1641,7 +1703,9 @@ pub fn is_protected_game_lib(name: &str) -> bool {
         return false;
     }
     let short = norm.rsplit('\\').next().unwrap_or(&norm);
-    PROTECTED_GAME_LIBS.iter().any(|n| short.eq_ignore_ascii_case(n))
+    PROTECTED_GAME_LIBS
+        .iter()
+        .any(|n| short.eq_ignore_ascii_case(n))
 }
 
 /// 0.3.x 那一套（我们 1.0.x 版本发布时内置的资产）的精确内容指纹：(文件名, 字节数, sha256)。
@@ -1768,10 +1832,7 @@ impl AssetFamily {
 ///
 /// 之前用文件大小（11_875_464）猜，上游哪天大小相同就会误判；哈希是唯一的。
 fn modern_family(dir: &Path) -> AssetFamily {
-    let k = dir
-        .join(RUNTIME_DIR)
-        .join("kernels")
-        .join("fg_kernels.dll");
+    let k = dir.join(RUNTIME_DIR).join("kernels").join("fg_kernels.dll");
     let Ok(cur) = crate::util::sha256_file_cached(&k) else {
         return AssetFamily::V040;
     };
@@ -1830,10 +1891,7 @@ pub fn deployed_assets(dir: &Path) -> Option<DeployedAssets> {
 
     let has_runtime_dir = dir.join(RUNTIME_DIR).is_dir();
     let from_manifest = manifest.as_ref().and_then(|m| {
-        if m.files
-            .iter()
-            .any(|e| e.rel_path.starts_with(RUNTIME_DIR))
-        {
+        if m.files.iter().any(|e| e.rel_path.starts_with(RUNTIME_DIR)) {
             Some(modern_family(dir))
         } else if !m.files.is_empty() {
             Some(AssetFamily::Legacy03x)
@@ -1862,7 +1920,9 @@ pub fn deployed_assets(dir: &Path) -> Option<DeployedAssets> {
 
     // 运行库版本：先看新版位置，再看游戏根目录
     let runtime_version = [
-        dir.join(RUNTIME_DIR).join("runtime").join("nvngx_dlssg.dll"),
+        dir.join(RUNTIME_DIR)
+            .join("runtime")
+            .join("nvngx_dlssg.dll"),
         dir.join("nvngx_dlssg.dll"),
     ]
     .iter()
@@ -1967,8 +2027,8 @@ pub fn is_our_artifact(path: &Path, name: &str, bytes: &[u8]) -> bool {
         return true;
     }
     /* dlssg_sm86\ 里的运行库、后端、内核是 NVIDIA 签名的，签名判定认不出"这是我们放的"；
-       但内容就是内置资产里那一份。**重复部署时不能把它们当游戏原件备份** ——
-       否则「还原」会把我们上次部署的旧运行库写回游戏目录（和 0.3.x 时代那个坑同源）。 */
+    但内容就是内置资产里那一份。**重复部署时不能把它们当游戏原件备份** ——
+    否则「还原」会把我们上次部署的旧运行库写回游戏目录（和 0.3.x 时代那个坑同源）。 */
     if is_our_runtime_file(name, bytes) {
         return true;
     }
@@ -2137,7 +2197,10 @@ mod proxy_inventory_tests {
 
         assert!(legacy_leftover_candidates(&d).is_empty());
         let (deleted, failed) = clean_legacy_leftovers(&d);
-        assert!(deleted.is_empty(), "protected lib must not be deleted: {deleted:?}");
+        assert!(
+            deleted.is_empty(),
+            "protected lib must not be deleted: {deleted:?}"
+        );
         assert!(failed.is_empty());
         assert!(f.is_file());
 

@@ -152,7 +152,10 @@ pub fn load_originals(files_dir: &Path, refs: &[BackupRef<'_>]) -> Result<Backup
         let bytes = std::fs::read(&src).with_context(|| format!("读取备份 {}", src.display()))?;
         if let Some(orig) = r.original_sha256 {
             if util::sha256_hex(&bytes) != *orig {
-                bail!("备份 {} 自身已损坏，中止（目录一个字都没动）", r.backup_name);
+                bail!(
+                    "备份 {} 自身已损坏，中止（目录一个字都没动）",
+                    r.backup_name
+                );
             }
         }
         plan.push(r.rel, true, bytes);
@@ -297,7 +300,9 @@ fn remove_file_with_retry(p: &Path) -> std::io::Result<()> {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
             Err(e) => {
                 // 退避表用完 = 这就是最后一次尝试：把系统的错误原样带回去
-                let Some(wait_ms) = waits.next() else { return Err(e) };
+                let Some(wait_ms) = waits.next() else {
+                    return Err(e);
+                };
                 // 只读属性也会让 remove_file 失败。这个文件本来就是我们部署进去的，
                 // 去掉只读再删没有副作用。
                 if let Ok(meta) = std::fs::metadata(p) {

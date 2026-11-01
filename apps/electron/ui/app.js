@@ -193,6 +193,92 @@ if (opts.scrollBody) body.push(h('div', { class: 'ov-scroll', text: opts.scrollB
     ov = openOverlay(box, function () { if (!done) { done = true; resolve(single); } });
   });
 }
+// ---- 1.7.0 停更退场 ----
+// 更新到这一版后：自动清掉所有游戏里的部署（帧生成 / Smooth Motion / DLSS5），
+// 然后只弹一次公告，把用户引到新项目。清理失败不谎报成功，列出来让用户重试。
+var RETIRE_TEXT = '已清除所有部署文件！本项目已停止更新维护，请转移至新项目FrameGen Manager Next完成部署！后续不再对该项目进行维护与更新！';
+var RETIRE_LINKS = [
+  { label: '打开新项目Github仓库', url: 'https://github.com/XiaoQAQ10086/FrameGen-Manager-Next' },
+  { label: 'Github下载', url: 'https://github.com/XiaoQAQ10086/FrameGen-Manager-Next/releases' },
+  { label: '去网盘下载', url: 'https://pan.quark.cn/s/adea7ed4f2b2' }
+];
+var RETIRE_RUNNING = false;
+function retireOpenUrl(url) {
+  invoke('open_url', { url: url }).then(function (r) {
+    if (!r || !r.ok) toast(t('打开链接失败'), 'err');
+  }).catch(function (e) {
+    toast(t('打开链接失败') + '：' + ((e && e.message) || e), 'err');
+  });
+}
+function showRetireNotice(extra) {
+  var body = [h('p', { class: 'note retire-text', text: t(RETIRE_TEXT) })];
+  if (extra) body.push(h('p', { class: 'note retire-extra', text: extra }));
+  var acts = h('div', { class: 'retire-actions' }, RETIRE_LINKS.map(function (x, i) {
+    return h('button', {
+      class: 'btn' + (i === 0 ? ' primary' : ''), type: 'button', text: t(x.label),
+      on: { click: function () { retireOpenUrl(x.url); } }
+    });
+  }));
+  var box = h('div', { class: 'dialog narrow confirm retire-notice' }, [
+    h('div', { class: 'dialog-head' }, [h('div', { class: 'dt', text: t('停止更新维护') })]),
+    h('div', { class: 'dialog-body' }, body),
+    acts
+  ]);
+  openOverlay(box);
+  if (CFG && !CFG.retireAnnounced) {
+    CFG.retireAnnounced = true;
+    invoke('retire_announce_seen').catch(function () { });
+  }
+}
+function retireFailedText(res) {
+  var out = [];
+  var failed = (res && res.failed) || [];
+  var warnings = (res && res.warnings) || [];
+  if (failed.length) out.push(t('以下部署未能完全清除：') + '\n' + failed.join('\n'));
+  if (warnings.length) out.push(t('以下配置未能写回：') + '\n' + warnings.join('\n'));
+  if (!out.length) out.push(t('清理没有完成，请稍后重试。'));
+  out.push(t('请先关闭正在运行的游戏，再点「重试」。'));
+  return out.join('\n\n');
+}
+function askRetireRetry(res) {
+  return uiConfirm({
+    title: t('自动清理未完成'),
+    body: retireFailedText(res),
+    ok: t('重试'),
+    cancel: t('稍后')
+  });
+}
+function runRetireCleanup() {
+  if (RETIRE_RUNNING) return Promise.resolve();
+  RETIRE_RUNNING = true;
+  showBar(t('正在清除所有部署文件…'), 0.12, 'retire');
+  return invoke('retire_cleanup').then(function (res) {
+    RETIRE_RUNNING = false;
+    hideBarLater(400);
+    if (res && res.ok) {
+      var warn = (res.warnings || []).join('\n');
+      return loadConfig().then(function () {
+        showRetireNotice(warn ? t('注意：') + '\n' + warn : '');
+      });
+    }
+    return askRetireRetry(res).then(function (go) { if (go) return runRetireCleanup(); });
+  }).catch(function (e) {
+    RETIRE_RUNNING = false;
+    hideBarLater(400);
+    return askRetireRetry({ failed: [String((e && e.message) || e)] }).then(function (go) {
+      if (go) return runRetireCleanup();
+    });
+  });
+}
+function retireOnBoot() {
+  if (!CFG) return Promise.resolve();
+  if (CFG.retired) {
+    if (!CFG.retireAnnounced) showRetireNotice('');
+    return Promise.resolve();
+  }
+  return runRetireCleanup();
+}
+
 window.alert = function (m) { toast(String(m), 'info', 9000); };
 window.confirm = function (m) { uiConfirm({ title: t('请确认'), body: String(m) }); return false; };
 var BAR_PHASE = '';
@@ -634,6 +720,9 @@ function boot() {
   refreshGpu().then(function () { warnGpuIfNeeded(); }).catch(function () { });
   loadConfig().then(function () {
     if ($('auto-scan-tgl')) $('auto-scan-tgl').checked = !!(CFG && CFG.autoScanOnStart);
+    // 退场清理必须赶在其它启动逻辑之前：先把游戏里的部署清干净，再谈资产/库。
+    return retireOnBoot();
+  }).then(function () {
     return refreshAssets();
   }).catch(function () { });
   loadDlss5Meta().catch(function () { });

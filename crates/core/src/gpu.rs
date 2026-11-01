@@ -45,10 +45,7 @@ pub const PRESETS: &[&str] = &[
 ///
 /// PRESETS 仍然保留完整六档：它同时是 apply() 的白名单 —— 老版本用户留下过的型号
 /// 还得能通过校验、能还原。
-pub const PRESETS_UI: [&str; 2] = [
-    "NVIDIA GeForce RTX 5090",
-    "NVIDIA GeForce RTX 5060",
-];
+pub const PRESETS_UI: [&str; 2] = ["NVIDIA GeForce RTX 5090", "NVIDIA GeForce RTX 5060"];
 
 /// 改显卡名的副作用。界面上必须完整展示，动手前要用户确认（egui 版是勾选，这边是确认框）。
 pub const SPOOF_WARNINGS: [&str; 8] = [
@@ -99,8 +96,7 @@ pub struct DriverInfo {
     pub source: &'static str,
 }
 
-impl DriverInfo {
-}
+impl DriverInfo {}
 
 /// 调 nvidia-smi 问驱动自己。比读注册表权威，但要起一个进程（约 35ms）。
 /// nvidia-smi 的**绝对路径**。
@@ -113,12 +109,11 @@ fn nvidia_smi_path() -> Option<std::path::PathBuf> {
     if let Ok(root) = std::env::var("SystemRoot") {
         cands.push(std::path::Path::new(&root).join("System32\nvidia-smi.exe"));
     }
-    cands.push(std::path::PathBuf::from(r"C:\Windows\System32\nvidia-smi.exe"));
+    cands.push(std::path::PathBuf::from(
+        r"C:\Windows\System32\nvidia-smi.exe",
+    ));
     if let Ok(pf) = std::env::var("ProgramFiles") {
-        cands.push(
-            std::path::Path::new(&pf)
-                .join(r"NVIDIA Corporation\NVSMI\nvidia-smi.exe"),
-        );
+        cands.push(std::path::Path::new(&pf).join(r"NVIDIA Corporation\NVSMI\nvidia-smi.exe"));
     }
     cands.into_iter().find(|p| p.is_file())
 }
@@ -458,9 +453,7 @@ pub fn has_backup_for(a: &GpuAdapter) -> bool {
 fn open_rw(key: &str) -> Result<RegKey> {
     RegKey::predef(HKEY_LOCAL_MACHINE)
         .open_subkey_with_flags(key, KEY_READ | KEY_WRITE)
-        .with_context(|| {
-            format!("打开注册表键失败（这一步需要管理员权限）: HKLM\\{key}")
-        })
+        .with_context(|| format!("打开注册表键失败（这一步需要管理员权限）: HKLM\\{key}"))
 }
 
 /// 把显卡名改成 \`new_name\`。调用方必须已经拿到用户对副作用说明的确认。
@@ -510,9 +503,7 @@ pub fn apply(a: &GpuAdapter, new_name: &str) -> Result<String> {
         bail!("写入后读回不一致（实际为「{after}」），已尝试回滚");
     }
 
-    let from = a
-        .current_name()
-        .unwrap_or_else(|| a.driver_name.clone());
+    let from = a.current_name().unwrap_or_else(|| a.driver_name.clone());
     Ok(format!(
         "已把显卡名从「{from}」改为「{new_name}」。重启后生效。"
     ))

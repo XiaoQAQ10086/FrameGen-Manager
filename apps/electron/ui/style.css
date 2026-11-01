@@ -512,6 +512,10 @@ body.ov-open .page{
 .exerow .btn{flex:0 0 auto}
 .dialog-body .note{white-space:pre-wrap;font-size:13px;color:var(--muted);margin:0}
 .dialog-foot{display:flex;gap:8px;align-items:center;padding:6px 16px 0;flex-wrap:wrap}
+/* 停更公告：正文是用户原话，三个入口竖排，避免长中文按钮在窄框里挤成两行 */
+.retire-notice .dialog-body .retire-text{white-space:pre-wrap;font-size:13.5px;line-height:1.7;color:var(--ink)}
+.retire-actions{display:flex;flex-direction:column;gap:8px;padding:12px 16px 4px}
+.retire-actions .btn{width:100%;justify-content:center}
 .risk{margin:12px 16px 0;color:var(--muted);font-size:12px;white-space:pre-wrap}
 .risk.strong{color:var(--warn)}
 /* 「已有」「缺少」「备用」做成小标签。两个要点：

@@ -123,7 +123,7 @@ pub fn load_library_from(p: &Path) -> LibraryCache {
         Ok(v) => v,
         Err(e) => {
             /* 解析失败**别当空库**：库里有人工添加的游戏、"已移除"记录，而启动时的自动扫描
-               会立刻把空库写回去 —— 那样旧数据就永久没了。先留一份 .bad 备份 + 写日志。 */
+            会立刻把空库写回去 —— 那样旧数据就永久没了。先留一份 .bad 备份 + 写日志。 */
             let bad = p.with_extension("json.bad");
             let _ = std::fs::copy(p, &bad);
             crate::log::line(&format!(
@@ -222,7 +222,10 @@ pub fn vdf_pairs(text: &str) -> Vec<(String, String)> {
 // ---------------------------------------------------------------- Steam
 
 fn reg_str(root: RegKey, sub: &str, value: &str) -> Option<String> {
-    root.open_subkey(sub).ok()?.get_value::<String, _>(value).ok()
+    root.open_subkey(sub)
+        .ok()?
+        .get_value::<String, _>(value)
+        .ok()
 }
 
 /// Steam 注册表里的路径常带正斜杠（d:/steam），会导致显示难看，
@@ -252,9 +255,13 @@ fn steam_from_uninstall() -> Vec<PathBuf> {
         "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall",
         "SOFTWARE\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall",
     ] {
-        let Ok(k) = hklm.open_subkey(root) else { continue };
+        let Ok(k) = hklm.open_subkey(root) else {
+            continue;
+        };
         for name in k.enum_keys().flatten() {
-            let Ok(gk) = k.open_subkey(&name) else { continue };
+            let Ok(gk) = k.open_subkey(&name) else {
+                continue;
+            };
             let disp = gk.get_value::<String, _>("DisplayName").unwrap_or_default();
             if !uninstall_is_steam(&disp) {
                 continue;
@@ -291,7 +298,10 @@ pub fn steam_roots() -> Vec<PathBuf> {
         cands.push((normalize_win_path(&p), "HKCU SteamPath"));
     }
     for (sub, from) in [
-        ("SOFTWARE\\WOW6432Node\\Valve\\Steam", "HKLM 32 位 InstallPath"),
+        (
+            "SOFTWARE\\WOW6432Node\\Valve\\Steam",
+            "HKLM 32 位 InstallPath",
+        ),
         ("SOFTWARE\\Valve\\Steam", "HKLM 原生 InstallPath"),
     ] {
         if let Some(p) = reg_str(RegKey::predef(HKEY_LOCAL_MACHINE), sub, "InstallPath") {
@@ -425,7 +435,8 @@ pub fn scan_steam_notes(notes: &mut Vec<String>) -> Vec<GameEntry> {
     let mut out = Vec::new();
     let roots = steam_roots();
     note(notes, format!("Steam：找到 {} 个安装目录", roots.len()));
-    let (mut manifests, mut junk, mut missing_dir, mut read_fail) = (0usize, 0usize, 0usize, 0usize);
+    let (mut manifests, mut junk, mut missing_dir, mut read_fail) =
+        (0usize, 0usize, 0usize, 0usize);
 
     for root in &roots {
         let libs = steam_libraries_notes(root, notes);
@@ -444,7 +455,10 @@ pub fn scan_steam_notes(notes: &mut Vec<String>) -> Vec<GameEntry> {
             let Ok(read) = std::fs::read_dir(&sa) else {
                 note(
                     notes,
-                    format!("  读不了库目录 {}（被占用或权限不足），里面的游戏这次会漏掉", sa.display()),
+                    format!(
+                        "  读不了库目录 {}（被占用或权限不足），里面的游戏这次会漏掉",
+                        sa.display()
+                    ),
                 );
                 continue;
             };
@@ -460,7 +474,10 @@ pub fn scan_steam_notes(notes: &mut Vec<String>) -> Vec<GameEntry> {
                         read_fail += 1;
                         note(
                             notes,
-                            format!("  读不了 {}：{err}（这个游戏这次会漏掉）", e.path().display()),
+                            format!(
+                                "  读不了 {}：{err}（这个游戏这次会漏掉）",
+                                e.path().display()
+                            ),
                         );
                         continue;
                     }
@@ -555,7 +572,10 @@ pub fn scan_epic_notes(notes: &mut Vec<String>) -> Vec<GameEntry> {
             }
         };
         let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
-            note(notes, format!("  解析不了 {}（不是合法 JSON）", p.display()));
+            note(
+                notes,
+                format!("  解析不了 {}（不是合法 JSON）", p.display()),
+            );
             continue;
         };
 
@@ -892,7 +912,10 @@ pub fn wegame_verdict(
 /// 「WeGame 游戏」列出来了。装都没装 WeGame，就不可能有 WeGame 游戏。
 pub fn wegame_installed() -> bool {
     let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
-    for root in ["SOFTWARE\\WOW6432Node\\Tencent\\WeGame", "SOFTWARE\\Tencent\\WeGame"] {
+    for root in [
+        "SOFTWARE\\WOW6432Node\\Tencent\\WeGame",
+        "SOFTWARE\\Tencent\\WeGame",
+    ] {
         if hklm.open_subkey(root).is_ok() {
             return true;
         }
@@ -936,10 +959,14 @@ pub fn scan_wegame_notes(notes: &mut Vec<String>) -> Vec<GameEntry> {
     let mut detailed = 0usize;
 
     for root in WEGAME_REG_ROOTS {
-        let Ok(k) = hklm.open_subkey(root) else { continue };
+        let Ok(k) = hklm.open_subkey(root) else {
+            continue;
+        };
         for key_name in k.enum_keys().flatten() {
             keys += 1;
-            let Ok(gk) = k.open_subkey(&key_name) else { continue };
+            let Ok(gk) = k.open_subkey(&key_name) else {
+                continue;
+            };
 
             let mut dir: Option<PathBuf> = None;
             let mut dir_value: Option<String> = None;
@@ -948,7 +975,9 @@ pub fn scan_wegame_notes(notes: &mut Vec<String>) -> Vec<GameEntry> {
             let mut display: Option<String> = None;
 
             for (vname, _) in gk.enum_values().flatten() {
-                let Ok(s) = gk.get_value::<String, _>(&vname) else { continue };
+                let Ok(s) = gk.get_value::<String, _>(&vname) else {
+                    continue;
+                };
                 let s = s.trim();
                 if s.is_empty() {
                     continue;
@@ -1018,7 +1047,9 @@ pub fn scan_wegame_notes(notes: &mut Vec<String>) -> Vec<GameEntry> {
 
     // WeGame 自己的安装目录下可能有 apps\ 结构，兜底再扫一遍
     for base in wegame_install_bases() {
-        let Ok(rd) = std::fs::read_dir(base.join("apps")) else { continue };
+        let Ok(rd) = std::fs::read_dir(base.join("apps")) else {
+            continue;
+        };
         for e in rd.flatten() {
             let p = e.path();
             if !p.is_dir() {
@@ -1316,7 +1347,10 @@ fn cert_contains(blob: &[u8], needle: &str) -> bool {
     if !ascii.is_empty() && blob.windows(ascii.len()).any(|w| w == ascii) {
         return true;
     }
-    let utf16: Vec<u8> = needle.encode_utf16().flat_map(|c| c.to_le_bytes()).collect();
+    let utf16: Vec<u8> = needle
+        .encode_utf16()
+        .flat_map(|c| c.to_le_bytes())
+        .collect();
     !utf16.is_empty() && blob.windows(utf16.len()).any(|w| w == utf16)
 }
 
@@ -1491,7 +1525,7 @@ pub fn advise_proxy(target_dir: &Path) -> ProxyAdvice {
             own_existing.push(entry);
         } else if crate::sm::is_our_asset_file(&p) {
             /* 走到这里的「本项目文件」不是我们签名的帧生成代理，而是 Smooth Motion
-               的解锁组件（固定指纹）—— 名字相同、作用完全不同。 */
+            的解锁组件（固定指纹）—— 名字相同、作用完全不同。 */
             sm_component.push(entry);
         } else {
             occupied.push(entry);
@@ -1499,18 +1533,19 @@ pub fn advise_proxy(target_dir: &Path) -> ProxyAdvice {
     }
     // 这个游戏是不是疑似开着 Smooth Motion：两个都是插帧，一起开通常更糟，
     // 部署帧生成前得提醒一句（不拦，用户可以忽略继续）。
-    let sm_likely_on = crate::sm::looks_enabled_for_dir(
-        target_dir,
-        find_render_exe(target_dir).as_deref(),
-    );
-    let is_occupied = |n: &str| {
-        occupied.iter().any(|o| o.name == n) || sm_component.iter().any(|o| o.name == n)
-    };
+    let sm_likely_on =
+        crate::sm::looks_enabled_for_dir(target_dir, find_render_exe(target_dir).as_deref());
+    let is_occupied =
+        |n: &str| occupied.iter().any(|o| o.name == n) || sm_component.iter().any(|o| o.name == n);
 
     // **推荐入口避开 SM 的解锁组件**：它可能正被用户开着，覆盖它 = SM 失效。
     // 推荐第一个其它入口，并把共存的路子写进 reason（用户定的规则）。
     if let Some(sc) = sm_component.first() {
-        if let Some(alt) = cands.iter().copied().find(|n| *n != sc.name && !is_occupied(n)) {
+        if let Some(alt) = cands
+            .iter()
+            .copied()
+            .find(|n| *n != sc.name && !is_occupied(n))
+        {
             return ProxyAdvice {
                 recommended: alt.to_owned(),
                 reason: format!(
@@ -1555,7 +1590,9 @@ pub fn advise_proxy(target_dir: &Path) -> ProxyAdvice {
     }
 
     'outer: for d in dirs {
-        let Ok(rd) = std::fs::read_dir(&d) else { continue };
+        let Ok(rd) = std::fs::read_dir(&d) else {
+            continue;
+        };
         for e in rd.flatten() {
             let p = e.path();
             let is_module = p
@@ -1829,7 +1866,12 @@ pub fn detect_tech_report(exe: &Path) -> TechReport {
     // 所以主 exe 的导入表里根本没有 d3d*.dll。这时去看引擎 DLL 自己的导入表 ——
     // 实测一个 Unity 游戏：主 exe 0.6 MB（导入表没提 API），UnityPlayer.dll 里才有。
     if api == GraphicsApi::Unknown {
-        for name in ["unityplayer.dll", "engine2.dll", "engine.dll", "crysystem.dll"] {
+        for name in [
+            "unityplayer.dll",
+            "engine2.dll",
+            "engine.dll",
+            "crysystem.dll",
+        ] {
             if !siblings.iter().any(|x| x == name) {
                 continue;
             }
@@ -1942,7 +1984,8 @@ pub fn pick_gpu_name(
     list.sort_by(|a, b| {
         let ua = i32::from(classify_gpu(&a.driver_name) == GpuRoute::Unknown);
         let ub = i32::from(classify_gpu(&b.driver_name) == GpuRoute::Unknown);
-        ua.cmp(&ub).then_with(|| b.driver_version.cmp(&a.driver_version))
+        ua.cmp(&ub)
+            .then_with(|| b.driver_version.cmp(&a.driver_version))
     });
     list.first().map(|a| a.driver_name.clone())
 }
@@ -1997,8 +2040,8 @@ pub fn classify_gpu(name: &str) -> GpuRoute {
         return GpuRoute::Unsupported;
     }
     /* 专业卡：命名和消费级撞车，必须在通用规则**之前**判，而且要分代次。
-       Quadro RTX 5000 = 图灵 TU104（和 RTX 2080 同核心、有 Tensor Core）→ 走 20 系那条路；
-       而 RTX 4000/5000/6000 Ada Generation 才是 40 系一代 → 不需要本 Mod。 */
+    Quadro RTX 5000 = 图灵 TU104（和 RTX 2080 同核心、有 Tensor Core）→ 走 20 系那条路；
+    而 RTX 4000/5000/6000 Ada Generation 才是 40 系一代 → 不需要本 Mod。 */
     if n.contains(" ADA") {
         return GpuRoute::NotNeeded;
     }
@@ -2223,26 +2266,77 @@ pub fn scan_all() -> Vec<GameEntry> {
 /// 让他把 logs 目录发过来就能直接定位，不用再靠猜。
 /// 「像游戏库」的目录名（小写）：没有启动器的游戏常被放在这些目录下面。
 const LOOSE_LIBRARY_NAMES: &[&str] = &[
-    "games", "game", "my games", "steamlibrary", "gog games", "epic games",
-    "xboxgames", "origin games", "repacks", "游戏", "单机游戏", "游戏库",
+    "games",
+    "game",
+    "my games",
+    "steamlibrary",
+    "gog games",
+    "epic games",
+    "xboxgames",
+    "origin games",
+    "repacks",
+    "游戏",
+    "单机游戏",
+    "游戏库",
 ];
 
 /// 目录名里**包含**这些词就肯定不是游戏：播放器/聊天/管家等国产客户端。
 /// 用「包含」而不是「相等」：真实目录名五花八门（`QQMusic`、`QQ音乐`、`QQ音乐2024`…），
 /// 相等匹配会漏（用户反馈：扫出了 QQ音乐）。
 const APP_DIR_MARKERS: &[&str] = &[
-    "qqmusic", "qq音乐", "cloudmusic", "netease", "kugou", "kuwo", "bilibili",
-    "wechat", "weixin", "微信", "wegame", "tim", "tencent", "thunder", "xunlei",
-    "qqlive", "qqplayer", "qqpcmgr", "dingtalk", "钉钉", "qq浏览器", "qqbrowser",
+    "qqmusic",
+    "qq音乐",
+    "cloudmusic",
+    "netease",
+    "kugou",
+    "kuwo",
+    "bilibili",
+    "wechat",
+    "weixin",
+    "微信",
+    "wegame",
+    "tim",
+    "tencent",
+    "thunder",
+    "xunlei",
+    "qqlive",
+    "qqplayer",
+    "qqpcmgr",
+    "dingtalk",
+    "钉钉",
+    "qq浏览器",
+    "qqbrowser",
 ];
 
 /// 这些子目录不是游戏本体：引擎资源、下载缓存、工作坊、存档……
 /// 少了它们，`Content` / `steamapps` 也会被当成一个「游戏」。
 const LOOSE_NOT_A_GAME: &[&str] = &[
-    "steamapps", "workshop", "downloading", "shadercache", "temp", "tmp", "backup",
-    "backups", "redist", "redistributable", "directx", "vcredist", "content", "engine",
-    "__macosx", "save", "saves", "gamesave", "gamesaves", "config", "mods", "mod",
-    "logs", "log", "cache", "common",
+    "steamapps",
+    "workshop",
+    "downloading",
+    "shadercache",
+    "temp",
+    "tmp",
+    "backup",
+    "backups",
+    "redist",
+    "redistributable",
+    "directx",
+    "vcredist",
+    "content",
+    "engine",
+    "__macosx",
+    "save",
+    "saves",
+    "gamesave",
+    "gamesaves",
+    "config",
+    "mods",
+    "mod",
+    "logs",
+    "log",
+    "cache",
+    "common",
 ];
 
 /// 各盘符下名字像游戏库的目录（D:\Game、E:\SteamLibrary、C:\My Games……）。
@@ -2271,9 +2365,24 @@ fn loose_roots() -> Vec<PathBuf> {
 /// 少了它，「有 exe 就算游戏」这条会被 `unins000.exe` 骗过去 —— 真实游戏目录里
 /// 几乎都有一个卸载器（自测就是被这个抓出来的）。
 const LOOSE_NOT_A_GAME_EXE: &[&str] = &[
-    "unins", "uninstall", "setup", "install", "vcredist", "vc_redist", "dxsetup",
-    "dxwebsetup", "oalinst", "crashpad", "crashreport", "crashhandler", "report",
-    "launcher_installer", "update", "updater", "patcher", "helper",
+    "unins",
+    "uninstall",
+    "setup",
+    "install",
+    "vcredist",
+    "vc_redist",
+    "dxsetup",
+    "dxwebsetup",
+    "oalinst",
+    "crashpad",
+    "crashreport",
+    "crashhandler",
+    "report",
+    "launcher_installer",
+    "update",
+    "updater",
+    "patcher",
+    "helper",
 ];
 
 /// 浅层检查：这个目录里（最多两层）有没有一个像游戏主程序的 exe。

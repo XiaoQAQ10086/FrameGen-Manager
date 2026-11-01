@@ -31,7 +31,6 @@ pub const REPO: &str = "sdli1995/dlssg_for_sm86";
 pub const BRANCH: &str = "main";
 pub const INI_REPO_PATH: &str = "dlssg_sm86.ini";
 
-
 const USER_AGENT: &str = "FrameGen-Manager/0.1 (+https://github.com/sdli1995/dlssg_for_sm86)";
 
 pub fn client() -> Result<reqwest::blocking::Client> {
@@ -239,7 +238,11 @@ fn same_version(a: &str, b: &str) -> bool {
 
 /// 问一个源，拿它报的版本号。失败返回 None。
 fn fetch_self_version_one(client: &reqwest::blocking::Client, url: &str) -> Option<String> {
-    let resp = client.get(url).timeout(Duration::from_secs(8)).send().ok()?;
+    let resp = client
+        .get(url)
+        .timeout(Duration::from_secs(8))
+        .send()
+        .ok()?;
     if !resp.status().is_success() {
         return None;
     }
@@ -299,7 +302,6 @@ fn etag_of(resp: &reqwest::blocking::Response) -> Option<String> {
     }
 }
 
-
 /// 从仓库文件里抠出上游版本号。
 ///
 /// 0.2.4（native）两处都写成 "Native 0.2.4"：
@@ -352,9 +354,6 @@ fn version_in_line(line: &str) -> Option<String> {
     None
 }
 
-
-
-
 /// 官方下载地址
 pub fn official_url(repo_path: &str) -> String {
     format!("https://raw.githubusercontent.com/{REPO}/{BRANCH}/{repo_path}")
@@ -382,17 +381,24 @@ pub fn friendly_error(e: &reqwest::Error) -> String {
 
 /// 临时文件名：version.dll -> version.dll.part
 fn part_path(dest: &Path) -> PathBuf {
-    let mut name = dest.file_name().map(|s| s.to_os_string()).unwrap_or_default();
+    let mut name = dest
+        .file_name()
+        .map(|s| s.to_os_string())
+        .unwrap_or_default();
     name.push(".part");
     dest.with_file_name(name)
 }
 
 /// 清理资产目录里遗留的 .part 文件（进程被强杀时会留下）
 pub fn clean_stale_partials() -> usize {
-    let Ok(dir) = util::assets_dir() else { return 0 };
-    let Ok(rd) = std::fs::read_dir(&dir) else { return 0 };
-    let cutoff = std::time::SystemTime::now()
-        .checked_sub(std::time::Duration::from_secs(7 * 24 * 3600));
+    let Ok(dir) = util::assets_dir() else {
+        return 0;
+    };
+    let Ok(rd) = std::fs::read_dir(&dir) else {
+        return 0;
+    };
+    let cutoff =
+        std::time::SystemTime::now().checked_sub(std::time::Duration::from_secs(7 * 24 * 3600));
     let mut n = 0;
     for e in rd.flatten() {
         let p = e.path();
@@ -411,7 +417,6 @@ pub fn clean_stale_partials() -> usize {
     }
     n
 }
-
 
 /// 校验通过后，把下载好的 .part 落到正式位置。
 ///
@@ -561,7 +566,11 @@ pub fn download(
     // 正在用的是哪个源（空串 = 官方源），跟着进度一起报给界面
     source: &str,
 ) -> Result<Downloaded> {
-    let Sink { dest, cancel, progress } = sink;
+    let Sink {
+        dest,
+        cancel,
+        progress,
+    } = sink;
     let tmp = part_path(dest);
     // 断点续传：上次没下完的 .part 接着下（只有服务器回 206 才算数）。
     // 换源重试、同一个源再试一次，都能从这里续上，慢速网络不用从头再来。
@@ -681,11 +690,6 @@ fn record_download_speed(source: &str, bytes: u64, secs: f64) {
     record_speed(source, (bytes as f64 / secs / 1024.0) as u64);
 }
 
-
-
-
-
-
 pub fn asset_path(name: &str) -> Result<PathBuf> {
     Ok(util::assets_dir()?.join(name))
 }
@@ -781,11 +785,16 @@ fn repair_assets_at(app: Option<&Path>, dir: &Path) -> Result<AssetRepair> {
 
 /// 把 src 里缺失/大小不对的文件补到 dst；reported 前缀只影响结果里的展示路径。
 fn copy_missing_tree(src: &Path, dst: &Path, prefix: &str, out: &mut AssetRepair) {
-    for entry in walkdir::WalkDir::new(src).into_iter().filter_map(|e| e.ok()) {
+    for entry in walkdir::WalkDir::new(src)
+        .into_iter()
+        .filter_map(|e| e.ok())
+    {
         if !entry.file_type().is_file() {
             continue;
         }
-        let Ok(rel) = entry.path().strip_prefix(src) else { continue };
+        let Ok(rel) = entry.path().strip_prefix(src) else {
+            continue;
+        };
         let rel = rel.to_string_lossy().replace('/', "\\");
         if rel.is_empty() {
             continue;
@@ -797,7 +806,10 @@ fn copy_missing_tree(src: &Path, dst: &Path, prefix: &str, out: &mut AssetRepair
         };
         let want = entry.metadata().map(|m| m.len()).unwrap_or(0);
         let target = dst.join(&rel);
-        if std::fs::metadata(&target).map(|m| m.len() == want).unwrap_or(false) {
+        if std::fs::metadata(&target)
+            .map(|m| m.len() == want)
+            .unwrap_or(false)
+        {
             out.present += 1;
             continue;
         }
@@ -843,7 +855,6 @@ fn expected_asset_files() -> Vec<String> {
     out
 }
 
-
 /// 出厂默认的「优化等级」（上游 0.4.0 的出厂 INI：Optimized=2；0.3.x 时期是 1）
 pub const DEFAULT_OPTIMIZED: u8 = 1;
 
@@ -869,12 +880,7 @@ pub const DEFAULT_MAX_FRAMES: u8 = 3;
 ///
 /// 为什么必须分段：上游 0.4.0 把 Optimized / Preset 从别的段挪进了 [DLSSG]，
 /// 而 Preset 这种键名很容易在别的段里也有，不分段就会改错地方。
-fn ini_set_key_in(
-    text: &str,
-    section: Option<&str>,
-    key: &str,
-    value: &str,
-) -> Option<String> {
+fn ini_set_key_in(text: &str, section: Option<&str>, key: &str, value: &str) -> Option<String> {
     let mut cur_section = String::new();
     let mut found = false;
     let mut out = String::with_capacity(text.len());
@@ -975,14 +981,22 @@ pub fn prepare_deploy_ini(
         bail!("缺少 {INI_REPO_PATH} —— 资产随安装包内置，请检查安装是否完整（或重新安装本程序）");
     }
     /* 空串 = 没选过（老配置），按出厂默认。
-       **注意不能"是默认值就跳过写文件"**：资产里那份 dlssg_sm86.ini 是上游 stock，
-       它的 Preset 是 Auto。默认 C 要想真的生效，就必须把 Preset=C 写进游戏目录那份 ——
-       跳过写文件等于把 stock 的 Auto 部署出去，默认值形同虚设。
-       所以只有"预设选 Auto（跟随上游）+ 两个档位也是出厂值"时，才原样用 stock 文件；
-       其余情况一律生成 deploy.ini。 */
-    let preset = if preset.is_empty() { DEFAULT_PRESET } else { preset };
+    **注意不能"是默认值就跳过写文件"**：资产里那份 dlssg_sm86.ini 是上游 stock，
+    它的 Preset 是 Auto。默认 C 要想真的生效，就必须把 Preset=C 写进游戏目录那份 ——
+    跳过写文件等于把 stock 的 Auto 部署出去，默认值形同虚设。
+    所以只有"预设选 Auto（跟随上游）+ 两个档位也是出厂值"时，才原样用 stock 文件；
+    其余情况一律生成 deploy.ini。 */
+    let preset = if preset.is_empty() {
+        DEFAULT_PRESET
+    } else {
+        preset
+    };
     let engine = if engine.is_empty() { "DLSS" } else { engine };
-    let flow = if xess_flow.is_empty() { "Middle" } else { xess_flow };
+    let flow = if xess_flow.is_empty() {
+        "Middle"
+    } else {
+        xess_flow
+    };
     // 0.4.1：Engine=XeSS 时最多 3（=4X），选 5（6X）会导致帧生成不启用（max_generated_frames_unsupported）
     let mut max_frames = max_frames;
     let mut xess_clamped = false;
@@ -1004,26 +1018,36 @@ pub fn prepare_deploy_ini(
         notes.push("XeSS 引擎最多 4X（MaxGeneratedFrames 1-3），已自动降到 4X".to_owned());
     }
     /* 段名跟着上游 0.4.0：Optimized 与 Preset 在 [DLSSG]，MaxGeneratedFrames 在
-       [FrameGeneration]。找不到段时退回"不限段"查找，这样老版 INI 也还能改。 */
+    [FrameGeneration]。找不到段时退回"不限段"查找，这样老版 INI 也还能改。 */
     let preset_value = preset.to_owned();
     /* Auto 就是上游 stock 那份 INI 里的值（[DLSSG] Preset=Auto），不是"我们的改动"。
-       用户选「跟随游戏/驱动」时不该往文件里写一行内容相同的 Preset=Auto ——
-       那样文件白改一次、说明里也多一条假改动。 */
+    用户选「跟随游戏/驱动」时不该往文件里写一行内容相同的 Preset=Auto ——
+    那样文件白改一次、说明里也多一条假改动。 */
     let mut jobs: Vec<(Option<&str>, &str, String, &str)> = vec![
-        (Some("[DLSSG]"), "Optimized", optimized.to_string(), "优化等级"),
-        (None, "MaxGeneratedFrames", max_frames.to_string(), "倍率上限"),
+        (
+            Some("[DLSSG]"),
+            "Optimized",
+            optimized.to_string(),
+            "优化等级",
+        ),
+        (
+            None,
+            "MaxGeneratedFrames",
+            max_frames.to_string(),
+            "倍率上限",
+        ),
     ];
     if preset != DEFAULT_PRESET {
         jobs.push((Some("[DLSSG]"), "Preset", preset_value, "DLSS-G 预设"));
     }
     /* 三个进阶开关：只在**与出厂值不同**时才写。deploy.ini 每次都从 stock 重新生成，
-       所以用户改回默认时这些键自然消失，不需要"清除"逻辑。
-       - [SuperResolution] Mode：超分加速（只对游戏用 DLSS Performance/Ultra 档时生效）
-       - [FrameGeneration] Engine：第二引擎 XeSS（本项目自己的运行器，只 2X）
-       - [XeSSFG] FlowResolution / UseHudless：只对 XeSS 引擎有意义 */
+    所以用户改回默认时这些键自然消失，不需要"清除"逻辑。
+    - [SuperResolution] Mode：超分加速（只对游戏用 DLSS Performance/Ultra 档时生效）
+    - [FrameGeneration] Engine：第二引擎 XeSS（本项目自己的运行器，只 2X）
+    - [XeSSFG] FlowResolution / UseHudless：只对 XeSS 引擎有意义 */
     /* 0.4.1 起 [SuperResolution] Mode 是**显式预设**（Off/M-INT8/L-INT8/M-FP16/L-FP16），
-       0.4.0 的 Mode=On 已删除。这里按配置写入；空值/非法值回落到 Off。
-       老 ini 里遗留的 Mode=On 也会被这次改写顺手迁移。 */
+    0.4.0 的 Mode=On 已删除。这里按配置写入；空值/非法值回落到 Off。
+    老 ini 里遗留的 Mode=On 也会被这次改写顺手迁移。 */
     let sr_mode = {
         let cfg = crate::util::load_config();
         let v = cfg.fg_sr_mode.trim().to_owned();
@@ -1050,11 +1074,21 @@ pub fn prepare_deploy_ini(
     if engine == "XeSS" {
         jobs.push((None, "Engine", "XeSS".to_owned(), "帧生成引擎"));
         if flow != "Middle" {
-            jobs.push((Some("[XeSSFG]"), "FlowResolution", flow.to_owned(), "光流分辨率"));
+            jobs.push((
+                Some("[XeSSFG]"),
+                "FlowResolution",
+                flow.to_owned(),
+                "光流分辨率",
+            ));
         }
         // 三态：Auto（不写，出厂）/ 1（强制）/ 0（不用）
         if !xess_hudless.eq_ignore_ascii_case("Auto") {
-            jobs.push((Some("[XeSSFG]"), "UseHudless", xess_hudless.to_owned(), "无 HUD 合成"));
+            jobs.push((
+                Some("[XeSSFG]"),
+                "UseHudless",
+                xess_hudless.to_owned(),
+                "无 HUD 合成",
+            ));
         }
     }
     for (section, key, value, what) in jobs {
@@ -1069,12 +1103,16 @@ pub fn prepare_deploy_ini(
             // 缺这一行就补上（上游改键名/挪段时最容易踩的坑）
             None => {
                 out = if section_name.is_empty() {
-                    format!("{out}{key}={value}
-")
+                    format!(
+                        "{out}{key}={value}
+"
+                    )
                 } else {
                     ini_insert_key(&out, section_name, key, &value)
                 };
-                notes.push(format!("{what} {key}={value}（这份 INI 里原本没有，已补上）"));
+                notes.push(format!(
+                    "{what} {key}={value}（这份 INI 里原本没有，已补上）"
+                ));
             }
         }
     }
@@ -1202,7 +1240,13 @@ fn now_unix() -> i64 {
 /// 记下一次测速值。prefix 空串表示官方源。
 pub fn record_speed(prefix: &str, kbps: u64) {
     let mut s = load_speeds();
-    s.entries.insert(prefix.to_owned(), SpeedSample { kbps, at: now_unix() });
+    s.entries.insert(
+        prefix.to_owned(),
+        SpeedSample {
+            kbps,
+            at: now_unix(),
+        },
+    );
     save_speeds(&s);
 }
 
@@ -1325,9 +1369,16 @@ fn download_with_mirror(
     // 这是没有官方指纹可比时唯一能挡住「换个内容塞进来」的廉价信号。
     expect_bytes: Option<u64>,
 ) -> Result<u64> {
-    let ms = if official_only { Vec::new() } else { mirrors("") };
+    let ms = if official_only {
+        Vec::new()
+    } else {
+        mirrors("")
+    };
     // 报错/日志里用来称呼这个文件（比如 nvngx_dlssg_310.9.1.zip）
-    let label = dest.file_name().and_then(|n| n.to_str()).unwrap_or("运行库");
+    let label = dest
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("运行库");
     // 依次试每个镜像，最后兜底官方源。只看能不能下完，不看速度 ——
     // 慢源就让它慢慢下，只有用户点取消或者源彻底不动才算数。
     try_sources(official, &ms, true, Some(cancel), |url, src| {
@@ -1436,7 +1487,9 @@ fn fetch_sums_official(
     .context("下载 SHA256SUMS.txt 失败（校验和必须来自官方源，不能走镜像；网络不通时请到发布页手动下载）")?;
     let sums = std::fs::read_to_string(sums_path).context("读 SHA256SUMS.txt 失败")?;
     parse_sha256sums(&sums, setup).with_context(|| {
-        format!("这次发布的 SHA256SUMS.txt 里没有 {setup}（老版本没带这个文件），只能手动下载安装包")
+        format!(
+            "这次发布的 SHA256SUMS.txt 里没有 {setup}（老版本没带这个文件），只能手动下载安装包"
+        )
     })
 }
 
@@ -1482,9 +1535,14 @@ fn fetch_sums_consensus(
         }
     }
     for (m, h) in &heard {
-        let agree = heard.iter().filter(|(_, x)| x.eq_ignore_ascii_case(h)).count();
+        let agree = heard
+            .iter()
+            .filter(|(_, x)| x.eq_ignore_ascii_case(h))
+            .count();
         if agree >= 2 {
-            crate::log::line(&format!("自更新：采用镜像一致的校验和（{m} 等 {agree} 个源）"));
+            crate::log::line(&format!(
+                "自更新：采用镜像一致的校验和（{m} 等 {agree} 个源）"
+            ));
             return Ok(h.clone());
         }
     }
@@ -1592,7 +1650,8 @@ pub fn stage_self_update(
 pub fn swap_in_place(cur: &Path, new_exe: &Path) -> Result<PathBuf> {
     let old = cur.with_extension("exe.old");
     let _ = std::fs::remove_file(&old);
-    std::fs::rename(cur, &old).with_context(|| format!("没法把当前程序改名成 {}", old.display()))?;
+    std::fs::rename(cur, &old)
+        .with_context(|| format!("没法把当前程序改名成 {}", old.display()))?;
     match std::fs::copy(new_exe, cur) {
         Ok(_) => {
             crate::util::clear_motw(cur);
@@ -1622,9 +1681,6 @@ pub fn cleanup_self_update_leftovers() -> usize {
 }
 
 // ------------------------------------------------------------------ 测速
-
-
-
 
 fn rd_u16le(d: &[u8], o: usize) -> u16 {
     u16::from_le_bytes([d[o], d[o + 1]])
@@ -1656,8 +1712,8 @@ pub struct ZipMeta {
 /// 整包读进来会让内存爆掉（这个程序的卖点之一就是轻量）。
 pub fn zip_list(zip_path: &Path) -> Result<Vec<ZipMeta>> {
     use std::io::{Read, Seek, SeekFrom};
-    let mut f = std::fs::File::open(zip_path)
-        .with_context(|| format!("打开 {}", zip_path.display()))?;
+    let mut f =
+        std::fs::File::open(zip_path).with_context(|| format!("打开 {}", zip_path.display()))?;
     let len = f.metadata()?.len() as usize;
     if len < 22 {
         bail!("zip 文件太小，不像是有效的压缩包");
@@ -1744,8 +1800,8 @@ pub fn zip_list(zip_path: &Path) -> Result<Vec<ZipMeta>> {
 /// 流式的意义同上：一百多 MB 的包不能整包读进内存。
 pub fn zip_extract_to(zip_path: &Path, meta: &ZipMeta, dest: &Path) -> Result<u64> {
     use std::io::{Read, Seek, SeekFrom, Write};
-    let mut f = std::fs::File::open(zip_path)
-        .with_context(|| format!("打开 {}", zip_path.display()))?;
+    let mut f =
+        std::fs::File::open(zip_path).with_context(|| format!("打开 {}", zip_path.display()))?;
     f.seek(SeekFrom::Start(meta.local_off as u64))?;
     let mut head = [0u8; 30];
     f.read_exact(&mut head)?;
@@ -1754,13 +1810,15 @@ pub fn zip_extract_to(zip_path: &Path, meta: &ZipMeta, dest: &Path) -> Result<u6
     }
     let l_name = rd_u16le(&head, 26) as u64;
     let l_extra = rd_u16le(&head, 28) as u64;
-    f.seek(SeekFrom::Start(meta.local_off as u64 + 30 + l_name + l_extra))?;
+    f.seek(SeekFrom::Start(
+        meta.local_off as u64 + 30 + l_name + l_extra,
+    ))?;
 
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let mut out = std::fs::File::create(dest)
-        .with_context(|| format!("创建 {}", dest.display()))?;
+    let mut out =
+        std::fs::File::create(dest).with_context(|| format!("创建 {}", dest.display()))?;
     let limited = f.take(meta.comp_size);
     // 解压炸弹：只限压缩输入是不够的（deflate 最大能膨胀上千倍）。
     // 输出一旦超过上限就当场停手并删掉半成品，别把用户磁盘写满。
@@ -1772,13 +1830,13 @@ pub fn zip_extract_to(zip_path: &Path, meta: &ZipMeta, dest: &Path) -> Result<u6
             left: MAX_EXTRACT_BYTES.min(meta.uncomp_size.max(1)),
             crc: flate2::Crc::new(),
         };
-    let n = match meta.method {
-        0 => std::io::copy(&mut { limited }, &mut capped)?,
-        8 => {
-            let mut dec = flate2::read::DeflateDecoder::new(limited);
-            std::io::copy(&mut dec, &mut capped)?
-        }
-        m => bail!("不支持的 zip 压缩方式 {m}（只支持存储和 deflate）"),
+        let n = match meta.method {
+            0 => std::io::copy(&mut { limited }, &mut capped)?,
+            8 => {
+                let mut dec = flate2::read::DeflateDecoder::new(limited);
+                std::io::copy(&mut dec, &mut capped)?
+            }
+            m => bail!("不支持的 zip 压缩方式 {m}（只支持存储和 deflate）"),
         };
         (n, capped.crc.sum())
     };
@@ -1817,7 +1875,9 @@ impl<W: std::io::Write> std::io::Write for LimitedWriter<W> {
         self.left -= buf.len() as u64;
         self.inner.write(buf)
     }
-    fn flush(&mut self) -> std::io::Result<()> { self.inner.flush() }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
 }
 
 /// 从 zip 里解出**指定名字**的 .dll 到 out_path，返回该条目名。
@@ -1849,10 +1909,6 @@ pub fn zip_extract_dll(zip_path: &Path, out_path: &Path, want: &str) -> Result<S
     Ok(meta.name.clone())
 }
 
-
-
-
-
 /// 一个待同步的资产文件（etag 为空表示没有指纹可比）。
 pub struct SyncItem {
     pub local: String,
@@ -1861,7 +1917,6 @@ pub struct SyncItem {
     pub etag: Option<String>,
     pub size: u64,
 }
-
 
 /// 给这些 appid 拉 Steam 的**竖版**封面（library_600x900，600×900 正好是卡片 .72 的比例）。
 ///
@@ -1888,7 +1943,10 @@ pub fn fetch_steam_covers(
             continue;
         }
         let dest = dir.join(format!("{app}.jpg"));
-        if std::fs::metadata(&dest).map(|m| m.len() > 1024).unwrap_or(false) {
+        if std::fs::metadata(&dest)
+            .map(|m| m.len() > 1024)
+            .unwrap_or(false)
+        {
             skipped += 1;
             continue;
         }
@@ -1908,11 +1966,7 @@ pub fn fetch_steam_covers(
 }
 
 /// 依次试几个 Steam CDN；先竖版，没有再退横版 header（会被裁，但比没有强）。
-fn fetch_one_cover(
-    client: &reqwest::blocking::Client,
-    app: &str,
-    dest: &Path,
-) -> Result<()> {
+fn fetch_one_cover(client: &reqwest::blocking::Client, app: &str, dest: &Path) -> Result<()> {
     const HOSTS: [&str; 3] = [
         "https://cdn.cloudflare.steamstatic.com",
         "https://cdn.akamai.steamstatic.com",
@@ -1957,7 +2011,6 @@ pub struct DownloadPlan {
     pub total: u64,
 }
 
-
 /// 更新日志在仓库里的路径（走 raw 取，和版本号同一套路：不占 API 配额、镜像也拿得到）。
 pub const RELEASE_NOTES_PATH: &str = "docs/release-notes.md";
 
@@ -1967,7 +2020,8 @@ pub const RELEASE_NOTES_PATH: &str = "docs/release-notes.md";
 /// **不参与「要不要更新」的判断**，所以不需要「两个镜像报同一份」那套防投毒逻辑，
 /// 官方源优先、拿不到就用第一个成功的镜像即可。
 pub fn fetch_release_notes(client: &reqwest::blocking::Client) -> Option<String> {
-    let official = format!("https://raw.githubusercontent.com/{SELF_REPO}/main/{RELEASE_NOTES_PATH}");
+    let official =
+        format!("https://raw.githubusercontent.com/{SELF_REPO}/main/{RELEASE_NOTES_PATH}");
     if let Some(t) = fetch_text_one(client, &official) {
         return Some(clip_notes(t));
     }
@@ -1980,12 +2034,20 @@ pub fn fetch_release_notes(client: &reqwest::blocking::Client) -> Option<String>
 }
 
 fn fetch_text_one(client: &reqwest::blocking::Client, url: &str) -> Option<String> {
-    let resp = client.get(url).timeout(Duration::from_secs(8)).send().ok()?;
+    let resp = client
+        .get(url)
+        .timeout(Duration::from_secs(8))
+        .send()
+        .ok()?;
     if !resp.status().is_success() {
         return None;
     }
     let t = resp.text().ok()?;
-    if t.trim().is_empty() { None } else { Some(t) }
+    if t.trim().is_empty() {
+        None
+    } else {
+        Some(t)
+    }
 }
 
 /// 只留**最新那一节**，太长再截断（界面上还要能看，不要糊满整屏）。
@@ -2036,10 +2098,8 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
-        let base = std::env::temp_dir().join(format!(
-            "fgm-asset-repair-{}-{stamp}",
-            std::process::id()
-        ));
+        let base =
+            std::env::temp_dir().join(format!("fgm-asset-repair-{}-{stamp}", std::process::id()));
         // 模拟安装目录：bundled-assets / bundled-sm / bundled-dlss5 三套
         let app = base.join("app");
         let assets = base.join("assets");
@@ -2069,16 +2129,33 @@ mod tests {
         std::fs::write(assets.join("same.txt"), b"SAME").unwrap();
 
         let r = repair_assets_at(Some(&app), &assets).unwrap();
-        assert!(r.repaired.iter().any(|x| x == "version.dll"), "{:?}", r.repaired);
-        assert!(r.repaired.iter().any(|x| x == "dlssg_sm86\\a.dll"), "{:?}", r.repaired);
         assert!(
-            r.repaired.iter().any(|x| x == "bundled-sm\\rtx30\\version.dll"),
+            r.repaired.iter().any(|x| x == "version.dll"),
+            "{:?}",
+            r.repaired
+        );
+        assert!(
+            r.repaired.iter().any(|x| x == "dlssg_sm86\\a.dll"),
+            "{:?}",
+            r.repaired
+        );
+        assert!(
+            r.repaired
+                .iter()
+                .any(|x| x == "bundled-sm\\rtx30\\version.dll"),
             "SM 组件的 version.dll 也要补：{:?}",
             r.repaired
         );
-        assert!(r.repaired.iter().any(|x| x == "DLSS5\\Uplift.fx"), "{:?}", r.repaired);
+        assert!(
+            r.repaired.iter().any(|x| x == "DLSS5\\Uplift.fx"),
+            "{:?}",
+            r.repaired
+        );
         assert_eq!(r.present, 1, "same.txt 应该按原样跳过");
-        assert_eq!(std::fs::read(assets.join("version.dll")).unwrap(), b"PROXY-OK");
+        assert_eq!(
+            std::fs::read(assets.join("version.dll")).unwrap(),
+            b"PROXY-OK"
+        );
         assert_eq!(
             std::fs::read(assets.join("dlssg_sm86").join("a.dll")).unwrap(),
             b"NEW-DLL"
@@ -2088,7 +2165,11 @@ mod tests {
             b"SM-DLL"
         );
         // 源里没有的核心代理（winmm.dll 等）必须报 missing，界面才能提示「被杀软删了」
-        assert!(r.missing.iter().any(|x| x == "winmm.dll"), "{:?}", r.missing);
+        assert!(
+            r.missing.iter().any(|x| x == "winmm.dll"),
+            "{:?}",
+            r.missing
+        );
         // SM 两份都在就不该误报
         assert!(
             !r.missing.iter().any(|x| x.contains("rtx30")),

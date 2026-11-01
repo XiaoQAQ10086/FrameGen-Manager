@@ -72,7 +72,8 @@ pub fn git_blob_sha1_file(path: &Path) -> Result<String> {
         .len();
     let mut h = Sha1::new();
     h.update(format!("blob {len}\0").as_bytes());
-    let mut f = std::fs::File::open(path).with_context(|| format!("读取文件失败: {}", path.display()))?;
+    let mut f =
+        std::fs::File::open(path).with_context(|| format!("读取文件失败: {}", path.display()))?;
     let mut buf = vec![0u8; 64 * 1024];
     loop {
         let n = f.read(&mut buf)?;
@@ -109,7 +110,9 @@ fn redact_users_segment(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut i = 0usize;
     while i < s.len() {
-        let Some(rel) = lower[i..].find(&MARK.to_ascii_lowercase()) else { break };
+        let Some(rel) = lower[i..].find(&MARK.to_ascii_lowercase()) else {
+            break;
+        };
         let name_start = i + rel + MARK.len();
         out.push_str(&s[i..name_start]);
         let rest = &s[name_start..];
@@ -142,8 +145,12 @@ static BACKUPS_ROOT: OnceLock<PathBuf> = OnceLock::new();
 
 /// 备份目录里的条目数与总字节数（设置页要显示“N 项 · X MB”）。
 pub fn backups_report() -> (usize, u64) {
-    let Ok(dir) = backups_dir() else { return (0, 0) };
-    let Ok(rd) = std::fs::read_dir(&dir) else { return (0, 0) };
+    let Ok(dir) = backups_dir() else {
+        return (0, 0);
+    };
+    let Ok(rd) = std::fs::read_dir(&dir) else {
+        return (0, 0);
+    };
     let mut count = 0usize;
     let mut bytes = 0u64;
     for e in rd.flatten() {
@@ -200,8 +207,12 @@ pub fn clean_backups() -> anyhow::Result<(usize, u64)> {
 /// 备份明细：让界面在"清理"之前能列出**将要删掉哪些东西**。
 /// 返回 (条目名, 种类, 字节数)；种类 = gpu-name / dlss5 / framegen。
 pub fn backups_entries() -> Vec<(String, String, u64, String)> {
-    let Ok(dir) = backups_dir() else { return Vec::new() };
-    let Ok(rd) = std::fs::read_dir(&dir) else { return Vec::new() };
+    let Ok(dir) = backups_dir() else {
+        return Vec::new();
+    };
+    let Ok(rd) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
     let mut out = Vec::new();
     for e in rd.flatten() {
         if !e.path().is_dir() {
@@ -299,7 +310,9 @@ fn data_root_is_normal() -> bool {
     if exe_dir().map(|d| same_path(&d, &root)).unwrap_or(false) {
         return true;
     }
-    app_data_dir().map(|d| same_path(&d, &root)).unwrap_or(false)
+    app_data_dir()
+        .map(|d| same_path(&d, &root))
+        .unwrap_or(false)
 }
 
 /// 搬迁结果只算一次：main() 一进来就调用它，界面再调用时拿到的是同一句话。
@@ -335,7 +348,9 @@ fn do_migrate_backups() -> Option<String> {
         return None;
     }
     let _ = std::fs::remove_dir_all(&old);
-    Some(format!("已把旧位置的 {old_count} 项备份搬到程序目录的 backups\\"))
+    Some(format!(
+        "已把旧位置的 {old_count} 项备份搬到程序目录的 backups\\"
+    ))
 }
 
 /// 把**更老那一代**（程序还叫 DLSSG-Manager 时用的 %APPDATA%\DLSSG-Manager\backups）
@@ -448,6 +463,17 @@ pub struct AppConfig {
     /// **统一**的「三类资产有更新」提示按哪个程序版本弹过（帧生成 / SM / DLSS5 合并成一个弹窗）。
     #[serde(default)]
     pub assets_legacy_prompt_version: String,
+    /// 1.7.0 停更退场的「清空所有部署」是否已经成功跑完。
+    ///
+    /// 失败时保持 false：下次启动会重试（否则没清掉的 version.dll 就永远留在游戏目录里）。
+    #[serde(default)]
+    pub retired: bool,
+    /// 已经尝试过退场清理但没成功：停更版不允许再往游戏里部署，直到清理通过。
+    #[serde(default)]
+    pub retire_pending: bool,
+    /// 停更公告是否已经给用户看过（只弹一次）。
+    #[serde(default)]
+    pub retire_announced: bool,
 }
 
 // 这两个是**业务默认**（2 / 3），不是 u8 的类型默认（0），所以 AppConfig 的 Default
@@ -480,10 +506,12 @@ impl Default for AppConfig {
             sm_legacy_prompt_version: String::new(),
             dlss5_legacy_prompt_version: String::new(),
             assets_legacy_prompt_version: String::new(),
+            retired: false,
+            retire_pending: false,
+            retire_announced: false,
         }
     }
 }
-
 
 pub fn exe_dir() -> Option<PathBuf> {
     std::env::current_exe()
@@ -557,15 +585,15 @@ pub fn load_config() -> AppConfig {
         return AppConfig::default();
     };
     /* 老配置（1.1.2 之前）里没有 fg_preset 这一项：serde 会按默认值给 C，界面也用 C，
-       但文件本身不体现 —— 用户打开配置文件看不到这一项，会以为没生效。
-       这里补写回去一次，让文件和界面说的是同一件事。 */
+    但文件本身不体现 —— 用户打开配置文件看不到这一项，会以为没生效。
+    这里补写回去一次，让文件和界面说的是同一件事。 */
     let mut dirty = false;
     if !text.contains("\"fg_preset\"") {
         cfg.fg_preset = default_fg_preset();
         dirty = true;
     }
     /* 出厂优化等级从 1 换成 2：把"当年那个旧出厂值"迁过来（只迁一次，见字段说明）。
-       只动 1：用户自己选的 0（不加速）或 3（全部有损）是明确的偏好，不能改。 */
+    只动 1：用户自己选的 0（不加速）或 3（全部有损）是明确的偏好，不能改。 */
     if !cfg.optimized_migrated_to_2 {
         if cfg.fg_optimized == 1 {
             crate::log::line(
@@ -659,8 +687,7 @@ pub fn assets_dir() -> Result<PathBuf> {
         }
     }
     let d = load_config().asset_dir.unwrap_or_else(default_asset_dir);
-    std::fs::create_dir_all(&d)
-        .with_context(|| format!("创建资产目录失败: {}", d.display()))?;
+    std::fs::create_dir_all(&d).with_context(|| format!("创建资产目录失败: {}", d.display()))?;
     if let Ok(mut g) = assets_cache().lock() {
         *g = Some(d.clone());
     }
@@ -710,7 +737,10 @@ pub fn atomic_replace(src: &Path, dst: &Path) -> Result<()> {
     };
 
     fn wide(p: &Path) -> Vec<u16> {
-        p.as_os_str().encode_wide().chain(std::iter::once(0)).collect()
+        p.as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect()
     }
 
     // 长路径加 verbatim 前缀，否则深目录下的游戏根本写不进去
@@ -754,7 +784,12 @@ pub fn lock_state(path: &Path) -> LockState {
     use std::fs::OpenOptions;
     use std::os::windows::fs::OpenOptionsExt;
     // dwShareMode = 0 -> 独占
-    match OpenOptions::new().read(true).write(true).share_mode(0).open(path) {
+    match OpenOptions::new()
+        .read(true)
+        .write(true)
+        .share_mode(0)
+        .open(path)
+    {
         Ok(_) => LockState::Free,
         Err(e) => match e.raw_os_error() {
             Some(32) | Some(33) => LockState::InUse, // 共享冲突 / 区域锁
@@ -806,7 +841,6 @@ pub fn now_local_hms() -> String {
     #[allow(unreachable_code)]
     now_utc().split(' ').nth(1).unwrap_or_default().to_owned()
 }
-
 
 fn civil_from_days(z: i64) -> (i64, u32, u32) {
     let z = z + 719_468;
@@ -908,7 +942,6 @@ pub fn safe_join(base: &std::path::Path, rel: &str) -> anyhow::Result<std::path:
     Ok(out)
 }
 
-
 /// 读 PE 的版本资源块，返回一块**宽松的 ASCII 文本**（仅用于特征判断，不保证完整）。
 ///
 /// 用途：识别“这个 dxgi.dll 是不是 ReShade 装进来的”——ReShade 的版本资源里带
@@ -916,9 +949,7 @@ pub fn safe_join(base: &std::path::Path, rel: &str) -> anyhow::Result<std::path:
 #[cfg(windows)]
 pub fn file_version_text(p: &std::path::Path) -> Option<String> {
     use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::Storage::FileSystem::{
-        GetFileVersionInfoSizeW, GetFileVersionInfoW,
-    };
+    use windows_sys::Win32::Storage::FileSystem::{GetFileVersionInfoSizeW, GetFileVersionInfoW};
     let wide: Vec<u16> = p
         .as_os_str()
         .encode_wide()
@@ -952,6 +983,36 @@ pub fn file_version_text(p: &std::path::Path) -> Option<String> {
         } else {
             Some(out)
         }
+    }
+}
+
+#[cfg(test)]
+mod config_compat_tests {
+    use super::AppConfig;
+
+    /// 1.7.0 之前的配置里没有 retired / retire_pending / retire_announced。
+    /// 少一个 `serde(default)` 就会让整个配置解析失败、所有设置被重置 —— 这里钉住它。
+    #[test]
+    fn old_config_without_retire_fields_still_parses() {
+        let cfg: AppConfig = serde_json::from_str(r#"{"fg_optimized":0}"#).unwrap();
+        assert_eq!(cfg.fg_optimized, 0);
+        assert!(!cfg.retired);
+        assert!(!cfg.retire_pending);
+        assert!(!cfg.retire_announced);
+    }
+
+    #[test]
+    fn retire_fields_round_trip() {
+        let cfg = AppConfig {
+            retired: true,
+            retire_pending: false,
+            retire_announced: true,
+            ..AppConfig::default()
+        };
+        let text = serde_json::to_string(&cfg).unwrap();
+        let back: AppConfig = serde_json::from_str(&text).unwrap();
+        assert!(back.retired);
+        assert!(back.retire_announced);
     }
 }
 

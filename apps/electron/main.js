@@ -9,6 +9,10 @@ const readline = require('node:readline');
 const PRODUCT = 'FrameGen Manager';
 // 网盘下载（发布页直链之外的备用下载方式，放在更新窗口与「关于」页）
 const NETDISK_URL = 'https://pan.quark.cn/s/adea7ed4f2b2';
+// 1.7.0 停更公告里的新项目入口
+const PROJECT_NEXT_URL = 'https://github.com/XiaoQAQ10086/FrameGen-Manager-Next';
+const PROJECT_NEXT_RELEASES_URL = 'https://github.com/XiaoQAQ10086/FrameGen-Manager-Next/releases';
+const RETIRE_URLS = new Set([PROJECT_NEXT_URL, PROJECT_NEXT_RELEASES_URL, NETDISK_URL]);
 
 const DEV = !app.isPackaged || process.env.FGM_DEV === '1';
 const USE_GPU = !(process.argv.includes('--fgm-no-gpu') || process.env.FGM_NO_GPU === '1');
@@ -795,6 +799,13 @@ if (!app.requestSingleInstanceLock()) {
       }
       if (cmd === 'open_netdisk') {
         return shell.openExternal(NETDISK_URL).then(function () { return { ok: true }; });
+      }
+      if (cmd === 'open_url') {
+        // 只允许停更公告里的三个地址，避免渲染进程变成任意链接跳板。
+        const url = String((args && args.url) || '');
+        if (!RETIRE_URLS.has(url)) return Promise.resolve({ ok: false, error: 'blocked' });
+        return shell.openExternal(url).then(function () { return { ok: true }; })
+          .catch(function (e) { return { ok: false, error: String((e && e.message) || e) }; });
       }
       if (cmd === 'open_hags_settings') {
         // 从主进程打开：主进程有前台窗口，设置页才会弹到应用**前面** ——

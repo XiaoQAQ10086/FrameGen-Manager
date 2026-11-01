@@ -1,4 +1,4 @@
-﻿# FrameGen Manager —— 发布打包脚本（Electron 版）
+# FrameGen Manager —— 发布打包脚本（Electron 版）
 #
 # 用法：  pwsh -ExecutionPolicy Bypass -File packaging\build-release.ps1 [-Node <node.exe>]
 #
@@ -76,6 +76,10 @@ if (-not (Test-Path $sc)) {
 $smoke = Join-Path $env:TEMP ('fgm-smoke-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
 New-Item -ItemType Directory -Force -Path $smoke | Out-Null
 $prevDataDir = $env:FGM_DATA_DIR
+$prevConsoleEnc = [Console]::OutputEncoding
+# sidecar 的 JSON 是 UTF-8；不强制控制台编码时，中文标签会被按 OEM 解码，
+# 可能把引号/逗号吞掉，ConvertFrom-Json 直接报 unexpected character。
+[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new()
 $env:FGM_DATA_DIR = $smoke
 try {
   $reqs = @('{"id":1,"cmd":"ping"}', '{"id":2,"cmd":"gpu_info"}', '{"id":3,"cmd":"get_config"}') -join [Environment]::NewLine
@@ -99,6 +103,7 @@ try {
   Write-Output ('  sidecar 自报版本与要发的一致：' + $vc)
 } finally {
   $env:FGM_DATA_DIR = $prevDataDir
+  [Console]::OutputEncoding = $prevConsoleEnc
   Remove-Item $smoke -Recurse -Force -ErrorAction SilentlyContinue
 }
 

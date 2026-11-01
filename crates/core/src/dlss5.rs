@@ -30,7 +30,7 @@ use std::time::{Duration, Instant};
 
 use crate::backup_restore::{self, BackupRef};
 use crate::deploy::DirLock;
-use crate::scan::{self, GraphicsApi, GpuRoute};
+use crate::scan::{self, GpuRoute, GraphicsApi};
 use crate::util;
 
 // ---------------------------------------------------------------- 常量
@@ -573,7 +573,12 @@ fn product_name(path: &Path) -> Option<String> {
     }
     let mut buf = vec![0u8; size as usize];
     let ok = unsafe {
-        GetFileVersionInfoW(wide.as_ptr(), 0, size, buf.as_mut_ptr() as *mut core::ffi::c_void)
+        GetFileVersionInfoW(
+            wide.as_ptr(),
+            0,
+            size,
+            buf.as_mut_ptr() as *mut core::ffi::c_void,
+        )
     };
     if ok == 0 {
         return None;
@@ -589,7 +594,11 @@ fn product_name(path: &Path) -> Option<String> {
         if ok == 0 || p.is_null() || len == 0 {
             return None;
         }
-        let n = if is_text { len as usize * 2 } else { len as usize };
+        let n = if is_text {
+            len as usize * 2
+        } else {
+            len as usize
+        };
         Some(unsafe { std::slice::from_raw_parts(p as *const u8, n) }.to_vec())
     };
     // 语言/代码页：先问 \VarFileInfo\Translation，问不到就按常见的中英文试一遍
@@ -672,7 +681,11 @@ fn describe_occupant(path: &Path) -> String {
 /// 解这一份**只为了事后核对**：装进去的到底是不是它该装的那份。
 fn extract_reshade_dll(setup: &Path, is64: bool, out: &Path) -> Result<()> {
     let bytes = std::fs::read(setup).with_context(|| format!("读取 {}", setup.display()))?;
-    let want = if is64 { "ReShade64.dll" } else { "ReShade32.dll" };
+    let want = if is64 {
+        "ReShade64.dll"
+    } else {
+        "ReShade32.dll"
+    };
     let tmp_zip = std::env::temp_dir().join(format!(
         "fgm-reshade-embed-{}-{}.zip",
         std::process::id(),
@@ -712,7 +725,12 @@ fn extract_reshade_dll(setup: &Path, is64: bool, out: &Path) -> Result<()> {
 
 /// 跑一次安装器。state = None（首次安装）/ Some("update") / Some("uninstall")。
 /// 返回 (退出码, stdout+stderr, 是否超时)。
-fn run_setup(setup: &Path, exe: &Path, api: &str, state: Option<&str>) -> Result<(i32, String, bool)> {
+fn run_setup(
+    setup: &Path,
+    exe: &Path,
+    api: &str,
+    state: Option<&str>,
+) -> Result<(i32, String, bool)> {
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
@@ -728,7 +746,9 @@ fn run_setup(setup: &Path, exe: &Path, api: &str, state: Option<&str>) -> Result
     cmd.stderr(std::process::Stdio::piped());
     cmd.creation_flags(CREATE_NO_WINDOW);
 
-    let mut child = cmd.spawn().with_context(|| format!("启动 {}", setup.display()))?;
+    let mut child = cmd
+        .spawn()
+        .with_context(|| format!("启动 {}", setup.display()))?;
     let deadline = Instant::now() + SETUP_TIMEOUT;
     let mut timed_out = false;
     loop {
@@ -802,7 +822,9 @@ pub fn prepare(dir: &Path, exe: Option<&Path>, api_sel: GraphicsApi) -> Result<P
     let setup = find_setup().with_context(|| {
         format!(
             "资产目录里没有 ReShade 安装器（{}）—— 重新安装本程序会自动补齐内置资产",
-            asset_dir().map(|p| p.display().to_string()).unwrap_or_default()
+            asset_dir()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default()
         )
     })?;
     let addon = find_addon().context("资产目录里没有 DLSS5 插件（renodx-dlss5-*.addon64）")?;
@@ -897,8 +919,8 @@ pub fn deploy(
         bail!("暂不支持渲染后端「{backend}」，目前只有 {BACKEND_RESHADE}");
     }
     /* 先确认目录写得进去，再去跑官方 ReShade 安装器。
-       实测（用户日志）：目录不可写时 ReShade 安装器只会吐一句乱码的
-       「Failed to install dxgi.dll: 对路径…的访问被拒绝」，用户完全不知道要提权 / 加白名单。 */
+    实测（用户日志）：目录不可写时 ReShade 安装器只会吐一句乱码的
+    「Failed to install dxgi.dll: 对路径…的访问被拒绝」，用户完全不知道要提权 / 加白名单。 */
     if !crate::util::is_writable(target_dir) {
         bail!(
             "这个目录现在写不进去（{}）。\n\n最常见的原因：游戏装在需要管理员权限的位置，或者杀毒软件拦截了 DLL 写入。\n解决办法：右键本程序 →「以管理员身份运行」再部署；把游戏目录加入杀毒软件白名单；并先完全退出游戏。",
@@ -950,16 +972,25 @@ pub fn deploy(
     want_files.push((RE_LOG.to_owned(), "ReShade 日志".to_owned()));
     // 安装器还会顺手建一个空的预设文件（实测 0 字节）。**也要记上** ——
     // 不然「还原」删掉 ReShade 之后，它还会孤零零留在游戏目录里。
-    want_files.push((RE_PRESET.to_owned(), "ReShade 预设（安装器建的占位文件）".to_owned()));
+    want_files.push((
+        RE_PRESET.to_owned(),
+        "ReShade 预设（安装器建的占位文件）".to_owned(),
+    ));
     let addon_name = addon
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .context("插件文件名读不出来")?;
     want_files.push((addon_name.clone(), "DLSS5 插件".to_owned()));
     want_files.push((ADDON32_NAME.to_owned(), "DLSS5 插件（32 位）".to_owned()));
-    want_files.push((HELPER_NAME.to_owned(), "DLSS5 辅助进程（32 位/DX9）".to_owned()));
+    want_files.push((
+        HELPER_NAME.to_owned(),
+        "DLSS5 辅助进程（32 位/DX9）".to_owned(),
+    ));
     // 模型按 GITC 的要求放子目录（放 exe 旁边会被 NVIDIA DLSS 抢先加载）
-    want_files.push((format!("{GITC_MODEL_DIR}\\{MODEL_NAME}"), "神经网络模型".to_owned()));
+    want_files.push((
+        format!("{GITC_MODEL_DIR}\\{MODEL_NAME}"),
+        "神经网络模型".to_owned(),
+    ));
     for fx in FX_NAMES {
         // 必须放进**子目录**：ReShade 默认 EffectSearchPaths 是 `reshade-shaders\Shaders\**\**`，
         // 只认子目录里的 fx —— 直接放 Shaders 根下会解析失败、首页提示"没有效果文件"（实测踩过）。
@@ -1004,7 +1035,10 @@ pub fn deploy(
     }
 
     // 1) 备份 + 先落 manifest（后面任何失败都能按它回滚）
-    let prev: Vec<Entry> = existing.as_ref().map(|m| m.files.clone()).unwrap_or_default();
+    let prev: Vec<Entry> = existing
+        .as_ref()
+        .map(|m| m.files.clone())
+        .unwrap_or_default();
     let mut entries: Vec<Entry> = Vec::new();
     for (name, role) in &want_files {
         // 上次部署过、备份还在 -> 沿用**第一次**的备份，别拿我们自己的文件当原件
@@ -1099,11 +1133,19 @@ pub fn deploy(
         .as_ref()
         .map(|m| dir.join(m).is_file())
         .unwrap_or(false);
-    let mut run = run_setup(&setup, &exe, plan.arg, if update_mode { Some("update") } else { None })?;
+    let mut run = run_setup(
+        &setup,
+        &exe,
+        plan.arg,
+        if update_mode { Some("update") } else { None },
+    )?;
     // 已经装过 ReShade（同 API）时，非 update 模式会被安装器自己挡下来，它明说了
     // 「已存在，请先卸载」；这时用官方给的 --state update 再来一次。
     if run.0 != 0 && looks_like_existing_reshade(&run.1) {
-        on("目录里已有 ReShade，按「更新」方式再装一次…".to_owned(), 0.4);
+        on(
+            "目录里已有 ReShade，按「更新」方式再装一次…".to_owned(),
+            0.4,
+        );
         run = run_setup(&setup, &exe, plan.arg, Some("update"))?;
     }
     if run.2 {
@@ -1151,10 +1193,11 @@ pub fn deploy(
             format!("{}|{}|{}", setup.display(), m.len(), mt)
         })
         .unwrap_or_default();
-    let mut cached: std::collections::HashMap<String, String> = std::fs::read_to_string(&cache_path)
-        .ok()
-        .and_then(|t| serde_json::from_str(&t).ok())
-        .unwrap_or_default();
+    let mut cached: std::collections::HashMap<String, String> =
+        std::fs::read_to_string(&cache_path)
+            .ok()
+            .and_then(|t| serde_json::from_str(&t).ok())
+            .unwrap_or_default();
     let expect_sha = if !setup_key.is_empty() {
         if let Some(h) = cached.get(&setup_key) {
             Some(h.clone())
@@ -1208,7 +1251,8 @@ pub fn deploy(
         }
         (Some(_), None) => {
             // 解不出来只影响「核对」这一步，不影响安装本身：如实说明，不当成失败
-            verify_note = "（没能从安装器里解出内嵌的 ReShade 做哈希核对，已跳过这一步）".to_owned();
+            verify_note =
+                "（没能从安装器里解出内嵌的 ReShade 做哈希核对，已跳过这一步）".to_owned();
         }
     }
     if let Some(why) = verify_problem {
@@ -1240,7 +1284,8 @@ pub fn deploy(
                     if p.is_dir() {
                         stack.push(p);
                     } else if let Ok(rel) = p.strip_prefix(&fx_root) {
-                        effect_copies.push((p.clone(), format!("{SHADERS_DIR}\\{}", rel.display())));
+                        effect_copies
+                            .push((p.clone(), format!("{SHADERS_DIR}\\{}", rel.display())));
                     }
                 }
             }
@@ -1248,9 +1293,21 @@ pub fn deploy(
     }
     let copies: Vec<(PathBuf, String, &str)> = vec![
         (addon.clone(), addon_name.clone(), "DLSS5 插件"),
-        (extra_asset.join(ADDON32_NAME), ADDON32_NAME.to_owned(), "DLSS5 插件（32 位）"),
-        (extra_asset.join(HELPER_NAME), HELPER_NAME.to_owned(), "DLSS5 辅助进程"),
-        (model.clone(), format!("{GITC_MODEL_DIR}\\{MODEL_NAME}"), "神经网络模型"),
+        (
+            extra_asset.join(ADDON32_NAME),
+            ADDON32_NAME.to_owned(),
+            "DLSS5 插件（32 位）",
+        ),
+        (
+            extra_asset.join(HELPER_NAME),
+            HELPER_NAME.to_owned(),
+            "DLSS5 辅助进程",
+        ),
+        (
+            model.clone(),
+            format!("{GITC_MODEL_DIR}\\{MODEL_NAME}"),
+            "神经网络模型",
+        ),
         (
             extra_asset.join(FX_NAMES[0]),
             format!("{SHADERS_DIR}\\Shaders\\{GITC_MODEL_DIR}\\{}", FX_NAMES[0]),
@@ -1385,7 +1442,9 @@ pub fn deploy(
         if !p.is_file() {
             continue;
         }
-        let Ok(cur) = util::sha256_file(&p) else { continue };
+        let Ok(cur) = util::sha256_file(&p) else {
+            continue;
+        };
         let still_ours = prev
             .iter()
             .find(|e| &e.rel_path == name)
@@ -1442,7 +1501,9 @@ pub fn deploy(
             .map(|p| p.display().to_string())
             .unwrap_or_default()
     ));
-    notes.push("首次进游戏请确认 ReShade 的插件列表里能看到 DLSS5；模型只对 20/30 系有效。".to_owned());
+    notes.push(
+        "首次进游戏请确认 ReShade 的插件列表里能看到 DLSS5；模型只对 20/30 系有效。".to_owned(),
+    );
     notes.push(
         "内置效果包已一并装好：首次进游戏 ReShade 会编译这些 shader（可能几十秒），属于正常现象。"
             .to_owned(),
@@ -1476,15 +1537,18 @@ fn friendly_setup_error(out: &str, dir: &Path, plan: &ApiPlan) -> String {
 }
 
 fn looks_like_existing_reshade(out: &str) -> bool {
-    out.to_ascii_lowercase().contains("existing reshade installation")
+    out.to_ascii_lowercase()
+        .contains("existing reshade installation")
 }
 
 /// Vulkan 全局层的本体路径。
 fn vulkan_module_path(is64: bool) -> PathBuf {
     let base = std::env::var("ProgramData").unwrap_or_else(|_| "C:\\ProgramData".to_owned());
-    PathBuf::from(base)
-        .join(COMMON_DIR)
-        .join(if is64 { "ReShade64.dll" } else { "ReShade32.dll" })
+    PathBuf::from(base).join(COMMON_DIR).join(if is64 {
+        "ReShade64.dll"
+    } else {
+        "ReShade32.dll"
+    })
 }
 
 // ---------------------------------------------------------------- 还原
@@ -1626,7 +1690,11 @@ fn first_addon_in(dir: &Path) -> Option<String> {
         } else {
             (u32::MAX, 0, 0)
         };
-        if best.as_ref().map(|(a, b, c, _)| v > (*a, *b, *c)).unwrap_or(true) {
+        if best
+            .as_ref()
+            .map(|(a, b, c, _)| v > (*a, *b, *c))
+            .unwrap_or(true)
+        {
             best = Some((v.0, v.1, v.2, name));
         }
     }
@@ -1701,7 +1769,7 @@ impl Found {
             parts.push(RE_PRESET.to_owned());
         }
         if self.shaders_dir {
-            parts.push(format!("{SHADERS_DIR}\\_（整个目录）", ));
+            parts.push(format!("{SHADERS_DIR}\\_（整个目录）",));
         }
         if let Some(a) = &self.addon {
             parts.push(format!("DLSS5 插件 {a}"));
@@ -1715,7 +1783,11 @@ impl Found {
         if parts.is_empty() {
             return "未检测到".to_owned();
         }
-        let who = if self.ours { "本工具部署的" } else { "非本工具安装的" };
+        let who = if self.ours {
+            "本工具部署的"
+        } else {
+            "非本工具安装的"
+        };
         format!("{who}：{}", parts.join("、"))
     }
 }
@@ -1765,14 +1837,13 @@ pub fn detect(dir: &Path) -> Found {
         reshade_ini: dir.join(RE_INI).is_file(),
         reshade_log: dir.join(RE_LOG).is_file(),
         preset: dir.join(RE_PRESET).is_file(),
-        shaders_dir: dir
-            .join(SHADERS_DIR)
-            .is_dir()
+        shaders_dir: dir.join(SHADERS_DIR).is_dir()
             && std::fs::read_dir(dir.join(SHADERS_DIR))
                 .map(|mut rd| rd.any(|e| e.map(|e| e.path().is_file()).unwrap_or(false)))
                 .unwrap_or(false),
         addon: first_addon_in(dir),
-        model: dir.join(MODEL_NAME).is_file() || dir.join(GITC_MODEL_DIR).join(MODEL_NAME).is_file(),
+        model: dir.join(MODEL_NAME).is_file()
+            || dir.join(GITC_MODEL_DIR).join(MODEL_NAME).is_file(),
         leftovers: addon_leftover_names(dir),
         legacy,
     }
@@ -1789,7 +1860,11 @@ fn clean_d3d12_agility(dir: &Path) -> Option<String> {
     if !d.is_dir() {
         return None;
     }
-    let mut items: Vec<PathBuf> = std::fs::read_dir(&d).ok()?.flatten().map(|e| e.path()).collect();
+    let mut items: Vec<PathBuf> = std::fs::read_dir(&d)
+        .ok()?
+        .flatten()
+        .map(|e| e.path())
+        .collect();
     if items.len() != 1 {
         return None;
     }
@@ -1797,7 +1872,9 @@ fn clean_d3d12_agility(dir: &Path) -> Option<String> {
     if f.file_name()?.to_string_lossy().to_ascii_lowercase() != "d3d12core.dll" {
         return None;
     }
-    let txt = util::file_version_text(&f).unwrap_or_default().to_ascii_lowercase();
+    let txt = util::file_version_text(&f)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
     if !txt.contains("microsoft") {
         return None;
     }
@@ -1835,7 +1912,11 @@ fn clean_extras(dir: &Path) -> Vec<String> {
         }
     }
     let gd = dir.join(GITC_MODEL_DIR);
-    if gd.is_dir() && std::fs::read_dir(&gd).map(|mut r| r.next().is_none()).unwrap_or(false) {
+    if gd.is_dir()
+        && std::fs::read_dir(&gd)
+            .map(|mut r| r.next().is_none())
+            .unwrap_or(false)
+    {
         let _ = std::fs::remove_dir(&gd);
     }
     done
@@ -1845,7 +1926,11 @@ fn clean_extras(dir: &Path) -> Vec<String> {
 /// 我们再补掉插件、模型、插件运行时残渣。
 ///
 /// 全部是永久删除（remove_file / remove_dir_all，不进回收站）—— 所以**调用方必须先拿到用户二次确认**。
-pub fn uninstall(dir: &Path, exe: Option<&Path>, on: &mut dyn FnMut(String, f32)) -> Result<String> {
+pub fn uninstall(
+    dir: &Path,
+    exe: Option<&Path>,
+    on: &mut dyn FnMut(String, f32),
+) -> Result<String> {
     if !dir.is_dir() {
         bail!("目录不存在：{}", dir.display());
     }
@@ -1899,7 +1984,11 @@ pub fn uninstall(dir: &Path, exe: Option<&Path>, on: &mut dyn FnMut(String, f32)
                 Ok((code, out, timed)) => notes.push(format!(
                     "官方卸载器没成功（退出码 {code}{}）：{}；改用直接删除",
                     if timed { "，超时" } else { "" },
-                    if out.trim().is_empty() { "无输出" } else { out.trim() }
+                    if out.trim().is_empty() {
+                        "无输出"
+                    } else {
+                        out.trim()
+                    }
                 )),
                 Err(e) => notes.push(format!("官方卸载器跑不起来：{e}；改用直接删除")),
             }
@@ -1954,7 +2043,10 @@ pub fn uninstall(dir: &Path, exe: Option<&Path>, on: &mut dyn FnMut(String, f32)
     } else {
         notes.push("复查通过：这个目录里已经没有 ReShade / DLSS5 的任何文件".to_owned());
     }
-    notes.push("以上都是直接删除（未进回收站），不可恢复；需要的话重新点「部署 DLSS5」即可装回来".to_owned());
+    notes.push(
+        "以上都是直接删除（未进回收站），不可恢复；需要的话重新点「部署 DLSS5」即可装回来"
+            .to_owned(),
+    );
 
     let mut msg = format!(
         "已彻底卸载 {} 项：{}",
@@ -1975,7 +2067,10 @@ pub fn restore(dir: &Path) -> Result<String> {
     let m = match state_of(dir) {
         State::Deployed(m) => *m,
         State::NotDeployed => {
-            bail!("没有找到本工具对该目录的 DLSS5 部署记录（{}）", dir.display())
+            bail!(
+                "没有找到本工具对该目录的 DLSS5 部署记录（{}）",
+                dir.display()
+            )
         }
         State::Broken(e) => bail!("这个目录的 DLSS5 记录读不出来（{e}），不敢按它还原"),
     };
@@ -2038,11 +2133,13 @@ pub fn restore(dir: &Path) -> Result<String> {
 
 /// 部署的 DLSS5 资产是否旧于当前内置（比关键文件的指纹；效果包不参与，避免每次哈希 108 个文件）。
 pub fn is_outdated(game_dir: &Path) -> bool {
-    let Some(m) = load_manifest(game_dir) else { return false };
+    let Some(m) = load_manifest(game_dir) else {
+        return false;
+    };
     let Ok(dir) = asset_dir() else { return false };
     /* 24 位插件（gitc-uplift.addon64）的**文件名带版本段**，不能拿前缀 "gitc-uplift" 去拼路径：
-       1.6.0 就是这么写的（`dir.join("gitc-uplift")` 根本不存在），于是 addon64 换了版本也认不出来 ——
-       只改 addon64 的那次更新会完全漏报。这里直接问 find_addon() 要真实路径。 */
+    1.6.0 就是这么写的（`dir.join("gitc-uplift")` 根本不存在），于是 addon64 换了版本也认不出来 ——
+    只改 addon64 的那次更新会完全漏报。这里直接问 find_addon() 要真实路径。 */
     let addon = find_addon();
     for e in &m.files {
         let rel = e.rel_path.replace('/', "\\");
@@ -2066,7 +2163,9 @@ pub fn is_outdated(game_dir: &Path) -> bool {
         if !dst.is_file() {
             continue;
         }
-        let (Ok(sm1), Ok(sm2)) = (std::fs::metadata(&src), std::fs::metadata(&dst)) else { continue };
+        let (Ok(sm1), Ok(sm2)) = (std::fs::metadata(&src), std::fs::metadata(&dst)) else {
+            continue;
+        };
         if sm1.len() != sm2.len() {
             return true;
         }

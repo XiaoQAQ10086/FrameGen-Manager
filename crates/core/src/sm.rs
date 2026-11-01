@@ -54,7 +54,11 @@ pub fn gate_for(driver_raw: Option<&str>, is_sm86: bool, is_sm75: bool, gpu_name
         allowed = false;
         reason = format!(
             "当前显卡「{}」不是 20/30 系 —— 这个解锁只对 20/30 系有效。",
-            if gpu_name.is_empty() { "未知" } else { gpu_name }
+            if gpu_name.is_empty() {
+                "未知"
+            } else {
+                gpu_name
+            }
         );
     } else if version.is_none() {
         allowed = false;
@@ -134,9 +138,11 @@ pub fn nvpresent_all() -> Vec<NvPresent> {
                 bytes,
                 sha256,
                 recognized: hit.is_some(),
-                note: hit.map(|(d, _, _, n)| format!("对应驱动 {d}：{n}")).unwrap_or_else(|| {
-                    "这个构建不在本工具的已识别清单里（上游可能尚未适配该驱动）".to_owned()
-                }),
+                note: hit
+                    .map(|(d, _, _, n)| format!("对应驱动 {d}：{n}"))
+                    .unwrap_or_else(|| {
+                        "这个构建不在本工具的已识别清单里（上游可能尚未适配该驱动）".to_owned()
+                    }),
             });
         }
     }
@@ -164,22 +170,54 @@ pub const SM_SETTING_ID: u32 = 0xB0D3_84C0;
 pub fn base_sm_state() -> SettingState {
     let sess = match nv::Session::open() {
         Ok(s) => s,
-        Err(e) => return SettingState { state: "读取失败", value: None, detail: e },
+        Err(e) => {
+            return SettingState {
+                state: "读取失败",
+                value: None,
+                detail: e,
+            }
+        }
     };
     let prof = match sess.base() {
         Ok(p) => p,
-        Err(e) => return SettingState { state: "读取失败", value: None, detail: e },
+        Err(e) => {
+            return SettingState {
+                state: "读取失败",
+                value: None,
+                detail: e,
+            }
+        }
     };
     state_from_read(sess.read(prof, SM_SETTING_ID))
 }
 
 fn state_from_read(r: Result<u32, String>) -> SettingState {
     match r {
-        Ok(1) => SettingState { state: "已开启", value: Some(1), detail: String::new() },
-        Ok(0) => SettingState { state: "已关闭", value: Some(0), detail: String::new() },
-        Ok(v) => SettingState { state: "未设置", value: Some(v), detail: String::new() },
-        Err(e) if e.starts_with("rc=-160") => SettingState { state: "未设置", value: None, detail: e },
-        Err(e) => SettingState { state: "读取失败", value: None, detail: e },
+        Ok(1) => SettingState {
+            state: "已开启",
+            value: Some(1),
+            detail: String::new(),
+        },
+        Ok(0) => SettingState {
+            state: "已关闭",
+            value: Some(0),
+            detail: String::new(),
+        },
+        Ok(v) => SettingState {
+            state: "未设置",
+            value: Some(v),
+            detail: String::new(),
+        },
+        Err(e) if e.starts_with("rc=-160") => SettingState {
+            state: "未设置",
+            value: None,
+            detail: e,
+        },
+        Err(e) => SettingState {
+            state: "读取失败",
+            value: None,
+            detail: e,
+        },
     }
 }
 
@@ -208,21 +246,33 @@ pub fn exe_sm_state(exe: &std::path::Path) -> ExeProfileState {
     let mut out = ExeProfileState {
         found: false,
         matched: Vec::new(),
-        state: SettingState { state: "未设置", value: None, detail: String::new() },
+        state: SettingState {
+            state: "未设置",
+            value: None,
+            detail: String::new(),
+        },
         detail: String::new(),
         profile_count: 0,
         sample_apps: Vec::new(),
         diag: Vec::new(),
     };
     if want.is_empty() {
-        out.state = SettingState { state: "读取失败", value: None, detail: "没有给 EXE 路径".to_owned() };
+        out.state = SettingState {
+            state: "读取失败",
+            value: None,
+            detail: "没有给 EXE 路径".to_owned(),
+        };
         out.detail = "没有给 EXE 路径".to_owned();
         return out;
     }
     let sess = match nv::Session::open() {
         Ok(s) => s,
         Err(e) => {
-            out.state = SettingState { state: "读取失败", value: None, detail: e.clone() };
+            out.state = SettingState {
+                state: "读取失败",
+                value: None,
+                detail: e.clone(),
+            };
             out.detail = e;
             return out;
         }
@@ -252,7 +302,10 @@ pub fn exe_sm_state(exe: &std::path::Path) -> ExeProfileState {
     }
     if !out.found {
         out.detail = "驱动里没有挂这个 EXE 的 profile（还没为它建过驱动配置）".to_owned();
-        out.diag.push(format!("scanned={} profiles, exe={}", out.profile_count, want));
+        out.diag.push(format!(
+            "scanned={} profiles, exe={}",
+            out.profile_count, want
+        ));
     }
     out
 }
@@ -314,7 +367,10 @@ mod nv {
 
         fn value(&self) -> u32 {
             u32::from_le_bytes([
-                self.current[0], self.current[1], self.current[2], self.current[3],
+                self.current[0],
+                self.current[1],
+                self.current[2],
+                self.current[3],
             ])
         }
     }
@@ -324,7 +380,6 @@ mod nv {
     fn wide(s: &str) -> Vec<u16> {
         s.encode_utf16().chain(std::iter::once(0)).collect()
     }
-
 
     // ---- 按 EXE 定位 profile（只读）----
 
@@ -350,7 +405,8 @@ mod nv {
                 if lib.is_null() {
                     return Err("加载 nvapi64.dll 失败（没装 NVIDIA 驱动？）".to_owned());
                 }
-                let Some(p) = GetProcAddress(lib, c"nvapi_QueryInterface".as_ptr() as *const u8) else {
+                let Some(p) = GetProcAddress(lib, c"nvapi_QueryInterface".as_ptr() as *const u8)
+                else {
                     return Err("nvapi64.dll 里没有 nvapi_QueryInterface".to_owned());
                 };
                 let query: FnQuery = std::mem::transmute(p);
@@ -455,7 +511,13 @@ mod nv {
                     *mut u32,
                     *mut c_void,
                 ) -> i32 = std::mem::transmute(raw);
-                let rc = f(self.sess, prof, 0, &mut count, buf.as_mut_ptr() as *mut c_void);
+                let rc = f(
+                    self.sess,
+                    prof,
+                    0,
+                    &mut count,
+                    buf.as_mut_ptr() as *mut c_void,
+                );
                 if rc != 0 {
                     crate::log::line(&format!("[sm] EnumApplications rc={rc} count={count}"));
                     return Vec::new();
@@ -488,7 +550,6 @@ mod nv {
             out
         }
 
-
         /// 问驱动：这个 exe 属于哪个 profile？找不到返回 Ok(None)。
         ///
         /// 为什么必须用它：真实游戏几乎都已经属于某个 NVIDIA 预置 profile，
@@ -518,7 +579,12 @@ mod nv {
                 let mut app = vec![0u8; 20492];
                 app[0..4].copy_from_slice(&(20492u32 | (4u32 << 16)).to_le_bytes());
                 let mut prof: *mut c_void = std::ptr::null_mut();
-                let rc = f(self.sess, w.as_ptr(), &mut prof, app.as_mut_ptr() as *mut c_void);
+                let rc = f(
+                    self.sess,
+                    w.as_ptr(),
+                    &mut prof,
+                    app.as_mut_ptr() as *mut c_void,
+                );
                 if rc == 0 && !prof.is_null() {
                     Ok(Some(prof))
                 } else {
@@ -659,7 +725,9 @@ mod nv {
                 }
                 let rc = f(self.sess, prof, buf.as_mut_ptr() as *mut c_void);
                 if rc != 0 {
-                    return Err(format!("DRS_CreateApplication rc={rc}（-167 = 该 exe 已被别的配置占用）"));
+                    return Err(format!(
+                        "DRS_CreateApplication rc={rc}（-167 = 该 exe 已被别的配置占用）"
+                    ));
                 }
                 Ok(())
             }
@@ -741,7 +809,6 @@ mod nv {
         }
     }
 }
-
 
 // ---------------------------------------------------------------- 写入路径（游戏自己的 profile）
 
@@ -1115,7 +1182,9 @@ pub fn set_game_sm(
     sess.save()?;
 
     // 复核必须换一个**全新的会话**：同一个会话里读回来的可能只是内存里那份。
-    let readback = nv::Session::open().ok().and_then(|s| s.read(prof, SM_SETTING_ID).ok());
+    let readback = nv::Session::open()
+        .ok()
+        .and_then(|s| s.read(prof, SM_SETTING_ID).ok());
     let ok = readback == Some(value);
     crate::log::line(&format!(
         "[sm] set_game_sm game={game} on={on} profile={profile_name} rc={rc_set} readback={readback:?}"
@@ -1130,9 +1199,7 @@ pub fn set_game_sm(
                 if on { "开启" } else { "关闭" }
             )
         } else {
-            format!(
-                "写入后复核不符：期望 {value}，实际读到 {readback:?}（配置「{profile_name}」）"
-            )
+            format!("写入后复核不符：期望 {value}，实际读到 {readback:?}（配置「{profile_name}」）")
         },
     })
 }
@@ -1246,7 +1313,11 @@ pub fn restore_game_sm(
 /// 和 restore_game_sm 的区别：restore 是"把我们的改动收回去"（旧值是开就回开），
 /// 这个是"关掉"。界面按钮上写的是「关闭 Smooth Motion」，那它就必须真的关掉 ——
 /// 无论之前有没有我们的记录、旧值是几。关掉后这次操作不再是"待还原"，记录一并清掉。
-pub fn turn_off_game_sm(game: &str, game_dir: &std::path::Path, exe: &std::path::Path) -> Result<String, String> {
+pub fn turn_off_game_sm(
+    game: &str,
+    game_dir: &std::path::Path,
+    exe: &std::path::Path,
+) -> Result<String, String> {
     let before;
     let profile_name;
     {
@@ -1374,9 +1445,9 @@ pub fn test_record_read(game_dir: &std::path::Path) -> Option<TestRecord> {
 }
 
 /* 这里原来有两个函数：`orphan_profiles()`（找出「我们建过但没挂应用」的驱动 profile）
-   和它专用的 `recorded_profile_names()`。egui 版退役后它们**没有任何调用点**
-   （sidecar 里也没有对应命令），已随本轮代码结构审计删除（见 docs/CHANGELOG.md）；
-   要恢复从 git 历史里取。 */
+和它专用的 `recorded_profile_names()`。egui 版退役后它们**没有任何调用点**
+（sidecar 里也没有对应命令），已随本轮代码结构审计删除（见 docs/CHANGELOG.md）；
+要恢复从 git 历史里取。 */
 
 // ---------------------------------------------------------------- 内置解锁组件的部署 / 还原
 
@@ -1492,7 +1563,9 @@ pub fn component_files(c: SmComponent) -> Vec<(&'static str, &'static str, &'sta
 }
 
 fn asset_record_path(game_dir: &std::path::Path) -> Result<std::path::PathBuf, String> {
-    let dir = crate::util::backups_dir().map_err(|e| format!("{e:#}"))?.join("sm-assets");
+    let dir = crate::util::backups_dir()
+        .map_err(|e| format!("{e:#}"))?
+        .join("sm-assets");
     std::fs::create_dir_all(&dir).map_err(|e| format!("建目录 {} 失败：{e}", dir.display()))?;
     let key: String = game_dir
         .display()
@@ -1551,7 +1624,11 @@ fn file_version_pair(p: &std::path::Path) -> Option<(u16, u16)> {
     use windows_sys::Win32::Storage::FileSystem::{
         GetFileVersionInfoSizeW, GetFileVersionInfoW, VerQueryValueW,
     };
-    let wide: Vec<u16> = p.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+    let wide: Vec<u16> = p
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
     unsafe {
         let mut dummy = 0u32;
         let size = GetFileVersionInfoSizeW(wide.as_ptr(), &mut dummy);
@@ -1591,7 +1668,11 @@ fn vcruntime_warning(game_dir: &std::path::Path) -> Option<String> {
     };
     if ver.is_none() {
         ver = std::env::var_os("SystemRoot")
-            .map(|r| std::path::PathBuf::from(r).join("System32").join("msvcp140.dll"))
+            .map(|r| {
+                std::path::PathBuf::from(r)
+                    .join("System32")
+                    .join("msvcp140.dll")
+            })
             .as_deref()
             .and_then(file_version_pair);
     }
@@ -1629,8 +1710,8 @@ pub fn asset_deploy(game_dir: &std::path::Path) -> Result<String, String> {
     std::fs::create_dir_all(&bdir).map_err(|e| format!("{e}"))?;
 
     /* 1) 先做完全部**只读**的准备工作：源文件在不在、目标能不能写、原件长什么样。
-       这一步一个字节都不写进游戏目录 —— 任何一项不过就直接返回，用户看到的是「什么都没动」
-       （以前是边备份边铺，中途失败还得靠回滚把前面几个文件拼回去）。 */
+    这一步一个字节都不写进游戏目录 —— 任何一项不过就直接返回，用户看到的是「什么都没动」
+    （以前是边备份边铺，中途失败还得靠回滚把前面几个文件拼回去）。 */
     let mut done: Vec<AssetFileRecord> = Vec::new();
     let mut items: Vec<crate::backup_restore::WriteItem> = Vec::new();
     let mut plan = crate::backup_restore::BackupPlan::new();
@@ -1666,8 +1747,8 @@ pub fn asset_deploy(game_dir: &std::path::Path) -> Result<String, String> {
         let mut backup: Option<String> = None;
         if dst.is_file() && is_our_asset_file(&dst) {
             /* 目录里已经是**我们自己的组件**（老版本部署的）：绝不能拿它去覆盖备份——
-               否则"关闭"时会把这个旧组件当成原件又还原回来（用户实测踩过：关了组件还在）。
-               备份里要保留的是**更早的原件**；原件备份不存在就当没有原件（关闭时直接删）。 */
+            否则"关闭"时会把这个旧组件当成原件又还原回来（用户实测踩过：关了组件还在）。
+            备份里要保留的是**更早的原件**；原件备份不存在就当没有原件（关闭时直接删）。 */
             if bp.is_file() {
                 let bytes = std::fs::read(&bp)
                     .map_err(|e| format!("读取备份 {} 失败：{e}", bp.display()))?;
@@ -1702,29 +1783,31 @@ pub fn asset_deploy(game_dir: &std::path::Path) -> Result<String, String> {
     }
 
     /* 2) 铺文件：原子替换 + 逐个校验，任何一步失败都按上面的快照回滚
-       （有原件的写回原件、没有的删掉），游戏目录不会停在半铺状态。 */
+    （有原件的写回原件、没有的删掉），游戏目录不会停在半铺状态。 */
     crate::backup_restore::apply(game_dir, &plan, &items).map_err(|e| format!("{e:#}"))?;
     let had_any = done.iter().any(|f| f.had_original);
     let body = AssetRecord {
-        dir: game_dir.display().to_string().replace(std::path::MAIN_SEPARATOR, "/"),
+        dir: game_dir
+            .display()
+            .to_string()
+            .replace(std::path::MAIN_SEPARATOR, "/"),
         v: 2,
         had_original: false,
         backup: None,
         sha: None,
         files: done,
     };
-    std::fs::write(&rec, serde_json::to_string(&body).map_err(|e| format!("{e}"))?)
-        .map_err(|e| format!("写部署记录失败：{e}"))?;
+    std::fs::write(
+        &rec,
+        serde_json::to_string(&body).map_err(|e| format!("{e}"))?,
+    )
+    .map_err(|e| format!("写部署记录失败：{e}"))?;
     crate::log::line(&format!("[sm] 已部署解锁组件到 {}", game_dir.display()));
     let label = match comp {
         SmComponent::Rtx30 => "RTX 30 系组件（SmoothMotion-next）",
         SmComponent::Rtx20 => "RTX 20 系运行库（加载器 + 运行库 + 清单）",
     };
-    let size = body
-        .files
-        .iter()
-        .filter_map(|f| f.sha.as_deref())
-        .count();
+    let size = body.files.iter().filter_map(|f| f.sha.as_deref()).count();
     let _ = size;
     let mut msg = format!(
         "已放入解锁组件（{}，{} 个文件）{}",
@@ -1756,7 +1839,10 @@ pub fn asset_restore_searching(
             return;
         }
         let key = d.display().to_string().to_lowercase();
-        if !cands.iter().any(|c| c.display().to_string().to_lowercase() == key) {
+        if !cands
+            .iter()
+            .any(|c| c.display().to_string().to_lowercase() == key)
+        {
             cands.push(d.to_path_buf());
         }
     };
@@ -1803,7 +1889,11 @@ pub fn asset_restore_searching(
     }
     crate::log::line(&format!(
         "[sm] 附近几个目录都没有我们的组件：{}",
-        cands.iter().map(|d| d.display().to_string()).collect::<Vec<_>>().join(" | ")
+        cands
+            .iter()
+            .map(|d| d.display().to_string())
+            .collect::<Vec<_>>()
+            .join(" | ")
     ));
     // 一个都没有：可能是别的 Mod；也可能这里从没放过，那就别报错说"取回失败"。
     Ok("这几个目录里没有本工具的解锁组件（可能已经取回过了）".to_owned())
@@ -1837,7 +1927,9 @@ fn remove_with_retry(path: &std::path::Path) -> Result<(), String> {
         path.display(),
         last,
         path.exists(),
-        std::fs::metadata(path).map(|m| m.permissions().readonly()).unwrap_or(false)
+        std::fs::metadata(path)
+            .map(|m| m.permissions().readonly())
+            .unwrap_or(false)
     ));
     Err(format!(
         "解锁组件还留在游戏目录里（{}）：{last}。\n\n请把游戏（包括它的启动器）完全退出后，再点一次「关闭 Smooth Motion」；\n如果还不行，多半是杀毒软件/同步盘正占着这个文件，可以手动删掉它，或者告诉我。",
@@ -1905,8 +1997,8 @@ pub fn asset_restore(game_dir: &std::path::Path) -> Result<String, String> {
                 let bp_path = std::path::Path::new(bp);
                 if bp_path.is_file() {
                     /* 备份本身如果是**我们的组件**（老版本部署时被误备份进去的），
-                       不能"还原"——那等于把组件又装回去（用户实测：关了组件还在）。
-                       这种情况直接删掉目标文件，让目录回到干净状态。 */
+                    不能"还原"——那等于把组件又装回去（用户实测：关了组件还在）。
+                    这种情况直接删掉目标文件，让目录回到干净状态。 */
                     if is_our_asset_file(bp_path) {
                         if p.is_file() {
                             remove_with_retry(&p)?;
@@ -1978,15 +2070,20 @@ pub fn open_session_for_probe() -> Result<nv::Session, String> {
     nv::Session::open()
 }
 
-
 /// 这个目录里部署的 SM 组件是不是**旧于**当前内置资产？
 ///
 /// 判定不看版本号，而是拿部署记录里的文件哈希和当前内置文件比 —— 20/30 系
 /// 哪一系列真变了才提示（记录缺哈希视为旧）。
 pub fn is_outdated(game_dir: &std::path::Path) -> bool {
-    let Ok(rec_path) = asset_record_path(game_dir) else { return false };
-    let Ok(text) = std::fs::read_to_string(rec_path) else { return false };
-    let Ok(rec) = serde_json::from_str::<AssetRecord>(&text) else { return false };
+    let Ok(rec_path) = asset_record_path(game_dir) else {
+        return false;
+    };
+    let Ok(text) = std::fs::read_to_string(rec_path) else {
+        return false;
+    };
+    let Ok(rec) = serde_json::from_str::<AssetRecord>(&text) else {
+        return false;
+    };
     let files = if rec.files.is_empty() {
         vec![AssetFileRecord {
             rel: SM_ASSET_FILE.to_string(),
@@ -2007,12 +2104,19 @@ pub fn is_outdated(game_dir: &std::path::Path) -> bool {
     };
     let Ok(base) = asset_base() else { return false };
     for f in &files {
-        let Some(cur) = f.sha.as_ref() else { return true };
-        let Some((_, src_rel, _)) = component_files(comp).into_iter().find(|(rel, _, _)| *rel == f.rel) else {
+        let Some(cur) = f.sha.as_ref() else {
+            return true;
+        };
+        let Some((_, src_rel, _)) = component_files(comp)
+            .into_iter()
+            .find(|(rel, _, _)| *rel == f.rel)
+        else {
             continue;
         };
         let src = base.join(src_rel.replace('/', "\\"));
-        let Ok(want) = crate::util::sha256_file(&src) else { continue };
+        let Ok(want) = crate::util::sha256_file(&src) else {
+            continue;
+        };
         if !want.eq_ignore_ascii_case(cur) {
             return true;
         }

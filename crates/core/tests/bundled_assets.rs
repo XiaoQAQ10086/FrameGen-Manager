@@ -32,7 +32,10 @@ fn names_in(dir: &Path) -> Vec<String> {
 /// 帧生成资产目录里 core 期望的文件名（顶层）：6 个代理入口 + INI。
 /// 0.4.0 起运行库/后端/内核都在 dlssg_sm86\\ 子目录里，由 ASSET_INVENTORY 管。
 fn expected_framegen_assets() -> Vec<String> {
-    let mut want: Vec<String> = scan::PROXY_PRIORITY.iter().map(|p| (*p).to_owned()).collect();
+    let mut want: Vec<String> = scan::PROXY_PRIORITY
+        .iter()
+        .map(|p| (*p).to_owned())
+        .collect();
     want.push(update::INI_REPO_PATH.to_owned());
     want.sort();
     want
@@ -129,7 +132,9 @@ fn dlss5_assets_report_detects_missing_then_present() {
     // 本测试是这条二进制里唯一碰资产目录的，所以在这里设环境变量是安全的。
     std::env::set_var("FGM_DATA_DIR", &root);
 
-    let d5 = util::assets_dir().expect("资产目录应能解析").join(dlss5::DIR_NAME);
+    let d5 = util::assets_dir()
+        .expect("资产目录应能解析")
+        .join(dlss5::DIR_NAME);
     std::fs::create_dir_all(&d5).expect("建 DLSS5 资产目录");
 
     let before = dlss5::assets_report();

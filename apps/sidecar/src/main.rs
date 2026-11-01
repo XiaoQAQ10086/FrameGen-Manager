@@ -1877,6 +1877,50 @@ fn frames_label(v: u8) -> &'static str {
 }
 
 /// 设置 + 只读路径：设置页要显示的东西一次拿全，省得前端发四五个 invoke
+/// 1.7.0 停更退场：清空所有游戏里的部署痕迹（只跑一次；失败下次启动重试）。
+fn retire_cleanup() -> Result<Value, String> {
+    let mut cfg = framegen_core::util::load_config();
+    if cfg.retired {
+        return Ok(json!({
+            "ok": true, "already": true, "cleaned": [], "failed": [],
+            "warnings": [], "targets": 0, "backupsRemoved": 0,
+            "announced": cfg.retire_announced,
+        }));
+    }
+    if !cfg.retire_pending {
+        cfg.retire_pending = true;
+        framegen_core::util::save_config(&cfg).map_err(|e| format!("{e:#}"))?;
+    }
+    framegen_core::log::line("[退场] 开始自动清理所有部署");
+    let report = framegen_core::retire::cleanup_all();
+    if report.ok() {
+        cfg.retired = true;
+        cfg.retire_pending = false;
+        framegen_core::util::save_config(&cfg).map_err(|e| format!("{e:#}"))?;
+    }
+    Ok(json!({
+        "ok": report.ok(),
+        "already": false,
+        "cleaned": report.cleaned,
+        "failed": report.failed,
+        "warnings": report.warnings,
+        "targets": report.targets,
+        "backupsRemoved": report.backups_removed,
+        "backupsBytes": report.backups_bytes,
+        "announced": cfg.retire_announced,
+    }))
+}
+
+/// 公告已经展示过了（下次启动不再弹）。
+fn retire_announce_seen() -> Result<Value, String> {
+    let mut cfg = framegen_core::util::load_config();
+    if !cfg.retire_announced {
+        cfg.retire_announced = true;
+        framegen_core::util::save_config(&cfg).map_err(|e| format!("{e:#}"))?;
+    }
+    Ok(json!({ "ok": true }))
+}
+
 fn get_config() -> Value {
     let cfg = framegen_core::util::load_config();
     let is_default = cfg.fg_optimized == framegen_core::update::DEFAULT_OPTIMIZED
@@ -1889,6 +1933,8 @@ fn get_config() -> Value {
         "autoScanOnStart": cfg.auto_scan_on_start,
         "srMode": cfg.fg_sr_mode,
         "assetsLegacyPrompted": cfg.assets_legacy_prompt_version,
+        "retired": cfg.retired,
+        "retireAnnounced": cfg.retire_announced,
         "legacyPrompted": cfg.legacy_prompt_version,
         "defaultPreset": framegen_core::update::DEFAULT_PRESET,
         "presets": framegen_core::update::PRESETS,
@@ -2071,6 +2117,17 @@ fn set_config(
 /// 真正换 exe 的那一步（stage_self_update + swap_in_place）还没接 —— 宁可不做，
 /// 也不做一个会把自己换坏的半成品。
 fn check_self_update() -> Result<Value, String> {
+    let cfg = framegen_core::util::load_config();
+    if cfg.retired {
+        return Ok(json!({
+            "current": framegen_core::update::SELF_VERSION,
+            "latest": null,
+            "notes": null,
+            "hasUpdate": false,
+            "unpublished": false,
+            "retired": true,
+        }));
+    }
     let client = framegen_core::update::client().map_err(|e| format!("{e:#}"))?;
     let current = framegen_core::update::SELF_VERSION.to_string();
     let latest = framegen_core::update::fetch_latest_self_version(&client);
@@ -2112,6 +2169,9 @@ fn check_self_update() -> Result<Value, String> {
 /// 启动安装程序、然后退出自己。这里只负责「下载 + 校验」，校验不过绝不返回路径
 /// （哈希取自发布时的 SHA256SUMS.txt，且清单只走官方源，不走镜像）。
 fn self_update_download(id: u64, args: &Value) -> Result<Value, String> {
+    if framegen_core::util::load_config().retired {
+        return Err("本项目已停止更新维护，请到新项目 FrameGen Manager Next 下载。".to_owned());
+    }
     let client = framegen_core::update::client().map_err(|e| format!("{e:#}"))?;
     // version 现在**不再是必填**：万一界面/旧调用方漏传，后台自己取最新版本。
     // 这样即便前端再出现「少传参数」，用户也不会看到「缺少参数 version」。
@@ -2221,10 +2281,32 @@ fn arg_usize(args: &Value, key: &str) -> Result<usize, String> {
 
 // ---------------------------------------------------------------- 命令分发
 
+const RETIRED_MSG: &str = "本项目已停止更新维护，请转移至新项目 FrameGen Manager Next（https://github.com/XiaoQAQ10086/FrameGen-Manager-Next）完成部署。";
+
+/// 停更后仍然会往游戏里写东西的命令：统一挡住，杜绝用户又部署回来。
+fn is_mutation_cmd(cmd: &str) -> bool {
+    matches!(
+        cmd,
+        "deploy_game"
+            | "clean_legacy"
+            | "framegen_cleanup_outdated"
+            | "sm_set_game"
+            | "sm_asset_deploy"
+            | "dlss5_deploy"
+            | "gpu_spoof_apply"
+    )
+}
+
 /// 命令名 -> 具体实现。表里的每个名字都和 apps/desktop/src/main.rs 里
 /// tauri::generate_handler! 的那一份对应，一个不多一个不少
 /// （外加一个 ping：Electron 用它做健康检查，Tauri 版不需要探活）。
 fn dispatch(id: u64, cmd: &str, args: &Value) -> Result<Value, String> {
+    if is_mutation_cmd(cmd) {
+        let c = framegen_core::util::load_config();
+        if c.retired || c.retire_pending {
+            return Err(RETIRED_MSG.to_owned());
+        }
+    }
     match cmd {
         // 健康检查：进程起来了、stdin/stdout 通了
         "ping" => Ok(Value::String("pong".into())),
@@ -2332,6 +2414,8 @@ fn dispatch(id: u64, cmd: &str, args: &Value) -> Result<Value, String> {
 
 
         "get_config" => Ok(get_config()),
+        "retire_cleanup" => retire_cleanup(),
+        "retire_announce_seen" => retire_announce_seen(),
         "set_config" => set_config(
             arg_u8(args, "optimized")?,
             arg_u8(args, "frames")?,

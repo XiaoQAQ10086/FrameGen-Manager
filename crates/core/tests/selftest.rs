@@ -64,7 +64,11 @@ fn sourcetest() -> usize {
     let mut fails: Vec<String> = Vec::new();
 
     println!("-- 源名字 --");
-    ck(&mut fails, framegen_core::update::source_label("") == "官方源", "空前缀认成「官方源」");
+    ck(
+        &mut fails,
+        framegen_core::update::source_label("") == "官方源",
+        "空前缀认成「官方源」",
+    );
     ck(
         &mut fails,
         framegen_core::update::source_label("https://gh-proxy.com/") == "gh-proxy.com",
@@ -81,9 +85,17 @@ fn sourcetest() -> usize {
         (fast.clone(), Some(5000)),
     ];
     let ranked = framegen_core::update::rank_by_scores(&items);
-    ck(&mut fails, ranked.first() == Some(&fast), "实测 5000 KB/s 的排最前");
+    ck(
+        &mut fails,
+        ranked.first() == Some(&fast),
+        "实测 5000 KB/s 的排最前",
+    );
     ck(&mut fails, ranked.get(1) == Some(&mid), "没测过的排中间");
-    ck(&mut fails, ranked.get(2) == Some(&dead), "实测 50 KB/s 的垫底");
+    ck(
+        &mut fails,
+        ranked.get(2) == Some(&dead),
+        "实测 50 KB/s 的垫底",
+    );
 
     let c = match framegen_core::update::client() {
         Ok(c) => c,
@@ -131,10 +143,16 @@ fn sourcetest() -> usize {
         }
         Err(e) => e.to_string(),
     };
-    ck(&mut fails, r1.is_ok(), &format!("慢源照样下完（{el:.1} 秒）：{msg1}"));
     ck(
         &mut fails,
-        std::fs::metadata(&d1).map(|m| m.len() == 4 * 1024 * 1024).unwrap_or(false),
+        r1.is_ok(),
+        &format!("慢源照样下完（{el:.1} 秒）：{msg1}"),
+    );
+    ck(
+        &mut fails,
+        std::fs::metadata(&d1)
+            .map(|m| m.len() == 4 * 1024 * 1024)
+            .unwrap_or(false),
         "慢源下到的字节数完整（4 MB）",
     );
     ck(
@@ -172,7 +190,9 @@ fn sourcetest() -> usize {
     ck(&mut fails, r2.is_ok(), "512 KB 的文件正常下完");
     ck(
         &mut fails,
-        std::fs::metadata(&d2).map(|m| m.len() == 512 * 1024).unwrap_or(false),
+        std::fs::metadata(&d2)
+            .map(|m| m.len() == 512 * 1024)
+            .unwrap_or(false),
         "小文件字节数正确",
     );
 
@@ -183,14 +203,16 @@ fn sourcetest() -> usize {
         let _ = std::fs::remove_file(d);
     }
 
-    println!("
-===== 结果: {} 项失败 =====", fails.len());
+    println!(
+        "
+===== 结果: {} 项失败 =====",
+        fails.len()
+    );
     for f in &fails {
         println!("  - {f}");
     }
     fails.len()
 }
-
 
 fn selftest() -> usize {
     println!("===== FrameGen Manager 自检 =====");
@@ -202,7 +224,13 @@ fn selftest() -> usize {
 
     println!("\n--- Steam ---");
     let roots = framegen_core::scan::steam_roots();
-    println!("根目录: {:?}", roots.iter().map(|p| p.display().to_string()).collect::<Vec<_>>());
+    println!(
+        "根目录: {:?}",
+        roots
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>()
+    );
     for r in &roots {
         for l in framegen_core::scan::steam_libraries(r) {
             println!("  库: {}", l.display());
@@ -219,7 +247,13 @@ fn selftest() -> usize {
             .and_then(framegen_core::icon::icon_of)
             .map(|ic| {
                 let total = ic.width * ic.height;
-                let transparent = ic.rgba.as_chunks::<4>().0.iter().filter(|p| p[3] == 0).count();
+                let transparent = ic
+                    .rgba
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .filter(|p| p[3] == 0)
+                    .count();
                 format!(
                     "{}x{}（透明 {:.0}%）",
                     ic.width,
@@ -252,25 +286,37 @@ fn selftest() -> usize {
     // WeGame：判定保守，只认「里面真能找到游戏程序」的目录。
     // 开发机上没装 WeGame，所以这里验的是**不变式**（扫出来的都必须是真的），不是数量。
     let wg = framegen_core::scan::scan_wegame();
-    let wg_ok = wg
-        .iter()
-        .all(|g| g.install_dir.is_dir() && framegen_core::scan::find_render_exe(&g.install_dir).is_some());
+    let wg_ok = wg.iter().all(|g| {
+        g.install_dir.is_dir() && framegen_core::scan::find_render_exe(&g.install_dir).is_some()
+    });
     println!(
         "  [{}] WeGame 扫出 {} 条，每条都指向真实存在的游戏目录{}",
         if wg_ok { "PASS" } else { "FAIL" },
         wg.len(),
-        if wg.is_empty() { "（本机没装 WeGame，属正常）" } else { "" }
+        if wg.is_empty() {
+            "（本机没装 WeGame，属正常）"
+        } else {
+            ""
+        }
     );
     for g in &wg {
         println!("      {} -> {}", g.name, g.install_dir.display());
     }
     println!(
         "  [{}] WeGame 没装就不列任何东西（本机装了 QQ，它的键也在 Tencent 下面）",
-        if framegen_core::scan::wegame_installed() || wg.is_empty() { "PASS" } else { "FAIL" }
+        if framegen_core::scan::wegame_installed() || wg.is_empty() {
+            "PASS"
+        } else {
+            "FAIL"
+        }
     );
     println!(
         "  [{}] 没把 QQNT 之类的客户端当成 WeGame 游戏",
-        if wg.iter().all(|g| !g.name.eq_ignore_ascii_case("QQNT")) { "PASS" } else { "FAIL" }
+        if wg.iter().all(|g| !g.name.eq_ignore_ascii_case("QQNT")) {
+            "PASS"
+        } else {
+            "FAIL"
+        }
     );
     println!(
         "  [{}] wegame_value_is_path_like：InstallPath=true / Name=false",
@@ -304,7 +350,12 @@ fn selftest() -> usize {
         device_desc: None,
     };
     // 自测用例表：(说明, 注册表枚举到的适配器, nvidia-smi 报的名字, 期望挑中的名字)
-    type GpuCase<'a> = (&'a str, Vec<framegen_core::gpu::GpuAdapter>, Option<&'a str>, Option<&'a str>);
+    type GpuCase<'a> = (
+        &'a str,
+        Vec<framegen_core::gpu::GpuAdapter>,
+        Option<&'a str>,
+        Option<&'a str>,
+    );
     let cases: [GpuCase<'_>; 4] = [
         (
             "能识别的 RTX 排在认不出来的 GT 1030 前面",
@@ -336,7 +387,11 @@ fn selftest() -> usize {
         let got = framegen_core::scan::pick_gpu_name(&adapters, smi.map(str::to_owned));
         println!(
             "    [{}] {label}（得到 {:?}）",
-            if got.as_deref() == want { "PASS" } else { "FAIL" },
+            if got.as_deref() == want {
+                "PASS"
+            } else {
+                "FAIL"
+            },
             got
         );
     }
@@ -345,7 +400,11 @@ fn selftest() -> usize {
     let log_file = framegen_core::log::path();
     println!(
         "  [{}] 日志文件已建立：{}",
-        if log_file.map(|p| p.is_file()).unwrap_or(false) { "PASS" } else { "FAIL" },
+        if log_file.map(|p| p.is_file()).unwrap_or(false) {
+            "PASS"
+        } else {
+            "FAIL"
+        },
         log_file
             .map(|p| p.display().to_string())
             .unwrap_or_else(|| "（没有）".to_owned())
@@ -366,11 +425,7 @@ fn selftest() -> usize {
             .and_then(|p| p.parent().map(|d| d.to_path_buf()))
             .unwrap_or_else(|| g.install_dir.clone());
         let a = framegen_core::scan::advise_proxy(&target);
-        println!(
-            "  [{}]\n       游戏目录 = {}",
-            g.name,
-            target.display()
-        );
+        println!("  [{}]\n       游戏目录 = {}", g.name, target.display());
         println!(
             "       推荐 {}  依据={}  已分析 {} 个模块  未判定={}",
             a.recommended, a.reason, a.scanned, a.undetermined
@@ -415,7 +470,11 @@ fn selftest() -> usize {
                 println!("    [FAIL] 指纹表条目格式不对：{n} size={size} sha={sha}");
             }
         }
-        ck(&mut fails, ok, "指纹表：无重名、大小非零、哈希都是 64 位十六进制");
+        ck(
+            &mut fails,
+            ok,
+            "指纹表：无重名、大小非零、哈希都是 64 位十六进制",
+        );
         // 9 个文件：6 个代理入口 + 两份运行库 + 一份 INI
         ck(
             &mut fails,
@@ -437,7 +496,7 @@ fn selftest() -> usize {
         let _ = std::fs::create_dir_all(&dir);
         let src = dir.join("dlssg_sm86.ini");
         /* 夹具照上游 0.4.0 的真实布局：MaxGeneratedFrames 在 [FrameGeneration]，
-           Optimized / Preset 在 [DLSSG]（0.4.0 才挪进去的）。 */
+        Optimized / Preset 在 [DLSSG]（0.4.0 才挪进去的）。 */
         std::fs::write(
             &src,
             "; c\n[FrameGeneration]\nMaxGeneratedFrames=3\n\n[DLSSG]\nOptimized=1\nPreset=Auto\n",
@@ -455,8 +514,15 @@ fn selftest() -> usize {
             "Auto",
         )
         .unwrap();
-        ck(&mut fails, p == src && n.is_empty(), "预设选 A + 出厂档位：直接用上游原文件，不做任何改写");
-        let (p2, n2) = framegen_core::update::prepare_deploy_ini(&src, 2, 5, "A", false, "DLSS", "Middle", "Auto").unwrap();
+        ck(
+            &mut fails,
+            p == src && n.is_empty(),
+            "预设选 A + 出厂档位：直接用上游原文件，不做任何改写",
+        );
+        let (p2, n2) = framegen_core::update::prepare_deploy_ini(
+            &src, 2, 5, "A", false, "DLSS", "Middle", "Auto",
+        )
+        .unwrap();
         let txt = std::fs::read_to_string(&p2).unwrap_or_default();
         ck(
             &mut fails,
@@ -466,7 +532,11 @@ fn selftest() -> usize {
                 && !txt.contains("Optimized=1"),
             "换档位：只改这两个键，其余内容原样",
         );
-        ck(&mut fails, n2.len() == 2, "两处改动都写进说明（预设选 Auto 时不写 Preset）");
+        ck(
+            &mut fails,
+            n2.len() == 2,
+            "两处改动都写进说明（预设选 Auto 时不写 Preset）",
+        );
         ck(
             &mut fails,
             std::fs::read_to_string(&src)
@@ -476,9 +546,19 @@ fn selftest() -> usize {
         );
         let slim = dir.join("slim.ini");
         /* 默认预设 C 必须真的落进游戏目录那份 INI。
-           这一条是防回归的：曾经"是默认值就跳过写文件"，结果部署出去的是 stock 的
-           Preset=Auto —— 默认值形同虚设，而单测/肉眼都看不出来。 */
-        let (p3, _n3) = framegen_core::update::prepare_deploy_ini(&src, framegen_core::update::DEFAULT_OPTIMIZED, framegen_core::update::DEFAULT_MAX_FRAMES, "", false, "DLSS", "Middle", "Auto").unwrap();
+        这一条是防回归的：曾经"是默认值就跳过写文件"，结果部署出去的是 stock 的
+        Preset=Auto —— 默认值形同虚设，而单测/肉眼都看不出来。 */
+        let (p3, _n3) = framegen_core::update::prepare_deploy_ini(
+            &src,
+            framegen_core::update::DEFAULT_OPTIMIZED,
+            framegen_core::update::DEFAULT_MAX_FRAMES,
+            "",
+            false,
+            "DLSS",
+            "Middle",
+            "Auto",
+        )
+        .unwrap();
         let t3 = std::fs::read_to_string(&p3).unwrap_or_default();
         ck(
             &mut fails,
@@ -486,14 +566,27 @@ fn selftest() -> usize {
             "空预设按出厂默认 A：部署用的 INI 里不能再写 Preset=C",
         );
         // 显式选 Auto（跟随上游出厂）时才原样用资产那份
-        let (p4, n4) = framegen_core::update::prepare_deploy_ini(&src, framegen_core::update::DEFAULT_OPTIMIZED, framegen_core::update::DEFAULT_MAX_FRAMES, "A", false, "DLSS", "Middle", "Auto").unwrap();
+        let (p4, n4) = framegen_core::update::prepare_deploy_ini(
+            &src,
+            framegen_core::update::DEFAULT_OPTIMIZED,
+            framegen_core::update::DEFAULT_MAX_FRAMES,
+            "A",
+            false,
+            "DLSS",
+            "Middle",
+            "Auto",
+        )
+        .unwrap();
         ck(
             &mut fails,
             p4 == src && n4.is_empty(),
             "预设显式选 A 且档位是出厂值：直接用资产原文件，不改写",
         );
         std::fs::write(&slim, "; slim\n[General]\nEnabled=1\n").unwrap();
-        let (p5, _n5) = framegen_core::update::prepare_deploy_ini(&slim, 3, 5, "", false, "DLSS", "Middle", "Auto").unwrap();
+        let (p5, _n5) = framegen_core::update::prepare_deploy_ini(
+            &slim, 3, 5, "", false, "DLSS", "Middle", "Auto",
+        )
+        .unwrap();
         let t5 = std::fs::read_to_string(&p5).unwrap_or_default();
         ck(
             &mut fails,
@@ -504,53 +597,139 @@ fn selftest() -> usize {
     }
     ck(
         &mut fails,
-        framegen_core::util::AppConfig::default().fg_optimized == framegen_core::update::DEFAULT_OPTIMIZED
-            && framegen_core::util::AppConfig::default().fg_frames == framegen_core::update::DEFAULT_MAX_FRAMES,
+        framegen_core::util::AppConfig::default().fg_optimized
+            == framegen_core::update::DEFAULT_OPTIMIZED
+            && framegen_core::util::AppConfig::default().fg_frames
+                == framegen_core::update::DEFAULT_MAX_FRAMES,
         "配置的默认档位与出厂默认一致（配置丢了也不会变成档位 0）",
     );
 
     println!("\n--- 显卡路由（哪张卡走哪条路）---");
     for (name, want) in [
-        ("NVIDIA GeForce RTX 3050", framegen_core::scan::GpuRoute::Sm86),
-        ("NVIDIA GeForce RTX 3070 Ti", framegen_core::scan::GpuRoute::Sm86),
-        ("NVIDIA GeForce RTX 2080 SUPER", framegen_core::scan::GpuRoute::Sm75),
-        ("NVIDIA GeForce RTX 2060", framegen_core::scan::GpuRoute::Sm75),
-        ("NVIDIA GeForce GTX 1660 SUPER", framegen_core::scan::GpuRoute::Gtx16),
-        ("NVIDIA GeForce GTX 1650", framegen_core::scan::GpuRoute::Gtx16),
-        ("NVIDIA GeForce GTX 1630", framegen_core::scan::GpuRoute::Gtx16),
-        ("NVIDIA GeForce RTX 4070", framegen_core::scan::GpuRoute::NotNeeded),
-        ("AMD Radeon RX 6800 XT", framegen_core::scan::GpuRoute::Unsupported),
+        (
+            "NVIDIA GeForce RTX 3050",
+            framegen_core::scan::GpuRoute::Sm86,
+        ),
+        (
+            "NVIDIA GeForce RTX 3070 Ti",
+            framegen_core::scan::GpuRoute::Sm86,
+        ),
+        (
+            "NVIDIA GeForce RTX 2080 SUPER",
+            framegen_core::scan::GpuRoute::Sm75,
+        ),
+        (
+            "NVIDIA GeForce RTX 2060",
+            framegen_core::scan::GpuRoute::Sm75,
+        ),
+        (
+            "NVIDIA GeForce GTX 1660 SUPER",
+            framegen_core::scan::GpuRoute::Gtx16,
+        ),
+        (
+            "NVIDIA GeForce GTX 1650",
+            framegen_core::scan::GpuRoute::Gtx16,
+        ),
+        (
+            "NVIDIA GeForce GTX 1630",
+            framegen_core::scan::GpuRoute::Gtx16,
+        ),
+        (
+            "NVIDIA GeForce RTX 4070",
+            framegen_core::scan::GpuRoute::NotNeeded,
+        ),
+        (
+            "AMD Radeon RX 6800 XT",
+            framegen_core::scan::GpuRoute::Unsupported,
+        ),
         // Intel 核显 / Arc：和 AMD 同一类（非 NVIDIA，驱动接口就不对）
-        ("Intel(R) UHD Graphics 630", framegen_core::scan::GpuRoute::Unsupported),
-        ("Intel(R) Arc(TM) A770 Graphics", framegen_core::scan::GpuRoute::Unsupported),
+        (
+            "Intel(R) UHD Graphics 630",
+            framegen_core::scan::GpuRoute::Unsupported,
+        ),
+        (
+            "Intel(R) Arc(TM) A770 Graphics",
+            framegen_core::scan::GpuRoute::Unsupported,
+        ),
         // Pascal 及更早 / MX / Quadro：都没有 Tensor Core，装上也白装 ——
         // 以前这些落到 Unknown 会被闸门静默放行（用户按流程做完发现没效果）。
-        ("NVIDIA GeForce GT 1030", framegen_core::scan::GpuRoute::NoTensorCore),
-        ("NVIDIA GeForce GTX 1060", framegen_core::scan::GpuRoute::NoTensorCore),
-        ("NVIDIA GeForce GTX 1080 Ti", framegen_core::scan::GpuRoute::NoTensorCore),
-        ("NVIDIA GeForce MX150", framegen_core::scan::GpuRoute::NoTensorCore),
-        ("NVIDIA Quadro P2000", framegen_core::scan::GpuRoute::NoTensorCore),
+        (
+            "NVIDIA GeForce GT 1030",
+            framegen_core::scan::GpuRoute::NoTensorCore,
+        ),
+        (
+            "NVIDIA GeForce GTX 1060",
+            framegen_core::scan::GpuRoute::NoTensorCore,
+        ),
+        (
+            "NVIDIA GeForce GTX 1080 Ti",
+            framegen_core::scan::GpuRoute::NoTensorCore,
+        ),
+        (
+            "NVIDIA GeForce MX150",
+            framegen_core::scan::GpuRoute::NoTensorCore,
+        ),
+        (
+            "NVIDIA Quadro P2000",
+            framegen_core::scan::GpuRoute::NoTensorCore,
+        ),
         // 认不出来的（比如以后的新型号）仍然是 Unknown：**不能**当成旧卡去拦，
         // 否则每出一代新卡用户都会被自己的工具挡住。
-        ("NVIDIA GeForce RTX 9090", framegen_core::scan::GpuRoute::Unknown),
+        (
+            "NVIDIA GeForce RTX 9090",
+            framegen_core::scan::GpuRoute::Unknown,
+        ),
         // 专业卡（用户实测反馈）：Quadro RTX 5000 是图灵 TU104，和 RTX 2080 同一颗核心、有 Tensor Core，
         // 名字里含 "RTX 50" 曾经被当成 40/50 系直接拦住 —— 必须走 20 系那条 SM75 路。
-        ("Quadro RTX 5000 with Max-Q Design", framegen_core::scan::GpuRoute::Sm75),
-        ("NVIDIA Quadro RTX 5000", framegen_core::scan::GpuRoute::Sm75),
-        ("NVIDIA Quadro RTX 4000", framegen_core::scan::GpuRoute::Sm75),
-        ("NVIDIA Quadro RTX 8000", framegen_core::scan::GpuRoute::Sm75),
+        (
+            "Quadro RTX 5000 with Max-Q Design",
+            framegen_core::scan::GpuRoute::Sm75,
+        ),
+        (
+            "NVIDIA Quadro RTX 5000",
+            framegen_core::scan::GpuRoute::Sm75,
+        ),
+        (
+            "NVIDIA Quadro RTX 4000",
+            framegen_core::scan::GpuRoute::Sm75,
+        ),
+        (
+            "NVIDIA Quadro RTX 8000",
+            framegen_core::scan::GpuRoute::Sm75,
+        ),
         // 带 Ada 的专业卡才是 40 系一代（原生支持，不需要本 Mod）
-        ("NVIDIA RTX 5000 Ada Generation", framegen_core::scan::GpuRoute::NotNeeded),
-        ("NVIDIA RTX 4000 Ada Generation", framegen_core::scan::GpuRoute::NotNeeded),
+        (
+            "NVIDIA RTX 5000 Ada Generation",
+            framegen_core::scan::GpuRoute::NotNeeded,
+        ),
+        (
+            "NVIDIA RTX 4000 Ada Generation",
+            framegen_core::scan::GpuRoute::NotNeeded,
+        ),
         // RTX A#### 是安培（和 30 系同路）
         ("NVIDIA RTX A4000", framegen_core::scan::GpuRoute::Sm86),
         ("NVIDIA RTX A5000", framegen_core::scan::GpuRoute::Sm86),
         // 消费级 40/50 系不能被上面的改动漏掉
-        ("NVIDIA GeForce RTX 4060", framegen_core::scan::GpuRoute::NotNeeded),
-        ("NVIDIA GeForce RTX 4090", framegen_core::scan::GpuRoute::NotNeeded),
-        ("NVIDIA GeForce RTX 4050 Laptop GPU", framegen_core::scan::GpuRoute::NotNeeded),
-        ("NVIDIA GeForce RTX 5060 Ti", framegen_core::scan::GpuRoute::NotNeeded),
-        ("NVIDIA GeForce RTX 5090", framegen_core::scan::GpuRoute::NotNeeded),
+        (
+            "NVIDIA GeForce RTX 4060",
+            framegen_core::scan::GpuRoute::NotNeeded,
+        ),
+        (
+            "NVIDIA GeForce RTX 4090",
+            framegen_core::scan::GpuRoute::NotNeeded,
+        ),
+        (
+            "NVIDIA GeForce RTX 4050 Laptop GPU",
+            framegen_core::scan::GpuRoute::NotNeeded,
+        ),
+        (
+            "NVIDIA GeForce RTX 5060 Ti",
+            framegen_core::scan::GpuRoute::NotNeeded,
+        ),
+        (
+            "NVIDIA GeForce RTX 5090",
+            framegen_core::scan::GpuRoute::NotNeeded,
+        ),
     ] {
         ck(
             &mut fails,
@@ -578,7 +757,11 @@ fn selftest() -> usize {
                 sm86,
                 g.allowed,
                 want,
-                if g.reason.is_empty() { String::new() } else { format!("｜原因：{}", g.reason) }
+                if g.reason.is_empty() {
+                    String::new()
+                } else {
+                    format!("｜原因：{}", g.reason)
+                }
             ),
         );
     }
@@ -586,7 +769,8 @@ fn selftest() -> usize {
     // 混了的话界面会给出一条根本无效的建议。
     ck(
         &mut fails,
-        framegen_core::scan::classify_gpu("NVIDIA GeForce GTX 1660 Ti") == framegen_core::scan::GpuRoute::Gtx16,
+        framegen_core::scan::classify_gpu("NVIDIA GeForce GTX 1660 Ti")
+            == framegen_core::scan::GpuRoute::Gtx16,
         "GTX 16 系单独成一路（不会被当成 RTX 20 系）",
     );
 
@@ -609,7 +793,10 @@ fn selftest() -> usize {
     ] {
         ck(
             &mut fails,
-            route.gate().map(|w| w.contains(must_contain)).unwrap_or(false),
+            route
+                .gate()
+                .map(|w| w.contains(must_contain))
+                .unwrap_or(false),
             &format!("{}：禁止部署", route.label()),
         );
     }
@@ -642,7 +829,8 @@ fn selftest() -> usize {
     );
     ck(
         &mut fails,
-        framegen_core::scan::is_known_proxy("winhttp.dll") && framegen_core::scan::is_known_proxy("d3d12.dll"),
+        framegen_core::scan::is_known_proxy("winhttp.dll")
+            && framegen_core::scan::is_known_proxy("d3d12.dll"),
         "历史上出现过的入口名都算代理入口",
     );
     ck(
@@ -802,9 +990,8 @@ fn selftest() -> usize {
     println!("\n--- 图形 API 与引擎 ---");
     {
         let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<String>>();
-        let api = |imp: &[&str], sib: &[&str]| {
-            framegen_core::scan::api_from_names(&s(imp), &s(sib))
-        };
+        let api =
+            |imp: &[&str], sib: &[&str]| framegen_core::scan::api_from_names(&s(imp), &s(sib));
         ck(
             &mut fails,
             api(&["d3d12.dll", "dxgi.dll"], &[]) == framegen_core::scan::GraphicsApi::Dx12,
@@ -825,12 +1012,14 @@ fn selftest() -> usize {
         );
         ck(
             &mut fails,
-            facts("game_vulkan.exe", &["d3d11.dll"], &[], false) == framegen_core::scan::GraphicsApi::Vulkan,
+            facts("game_vulkan.exe", &["d3d11.dll"], &[], false)
+                == framegen_core::scan::GraphicsApi::Vulkan,
             "exe 名优先于导入表",
         );
         ck(
             &mut fails,
-            facts("normal.exe", &["d3d12.dll"], &["dxgi.dll"], true) == framegen_core::scan::GraphicsApi::Vulkan,
+            facts("normal.exe", &["d3d12.dll"], &["dxgi.dll"], true)
+                == framegen_core::scan::GraphicsApi::Vulkan,
             "同目录是 DXVK/vkd3d 包装时算 Vulkan（不是 DX12）",
         );
         ck(
@@ -857,7 +1046,9 @@ fn selftest() -> usize {
             &mut fails,
             framegen_core::scan::GraphicsApi::Dx11.frame_gen_possible() == Some(false)
                 && framegen_core::scan::GraphicsApi::Dx12.frame_gen_possible() == Some(true)
-                && framegen_core::scan::GraphicsApi::Unknown.frame_gen_possible().is_none(),
+                && framegen_core::scan::GraphicsApi::Unknown
+                    .frame_gen_possible()
+                    .is_none(),
             "帧生成只在 DX12 / Vulkan 下有意义，未知时不下结论",
         );
     }
@@ -869,12 +1060,14 @@ fn selftest() -> usize {
         let verbatim = String::from_utf8(vec![92u8, 92, 63, 92]).unwrap();
         ck(
             &mut fails,
-            framegen_core::scan::path_key(Path::new("D:/Games/X/")) == framegen_core::scan::path_key(Path::new("d:\\games\\x")),
+            framegen_core::scan::path_key(Path::new("D:/Games/X/"))
+                == framegen_core::scan::path_key(Path::new("d:\\games\\x")),
             "同一个目录的不同写法归一化后相同（忽略清单/去重靠它）",
         );
         ck(
             &mut fails,
-            framegen_core::util::long_path(Path::new("C:\\short\\x.dll")).as_path() == Path::new("C:\\short\\x.dll"),
+            framegen_core::util::long_path(Path::new("C:\\short\\x.dll")).as_path()
+                == Path::new("C:\\short\\x.dll"),
             "短路径不加 verbatim 前缀（免得改变别的语义）",
         );
         let deep = format!("C:\\{}\\x.dll", "a".repeat(250));
@@ -939,10 +1132,13 @@ fn deploytest() -> usize {
     }
 
     // ---- 旧代理入口的处置规则（纯逻辑，不需要真 DLL）----
-    println!("
--- 旧代理入口怎么处置 --");
+    println!(
+        "
+-- 旧代理入口怎么处置 --"
+    );
     check!(
-        framegen_core::deploy::plan_orphan(true, false, true, true, false) == framegen_core::deploy::OrphanAction::Remove,
+        framegen_core::deploy::plan_orphan(true, false, true, true, false)
+            == framegen_core::deploy::OrphanAction::Remove,
         "原本空着、我们放进去的旧入口 -> 删掉"
     );
     check!(
@@ -951,19 +1147,23 @@ fn deploytest() -> usize {
         "原本就有文件的旧入口 -> 删掉但保留备份记录（这次修的就是这条）"
     );
     check!(
-        framegen_core::deploy::plan_orphan(true, true, true, true, true) == framegen_core::deploy::OrphanAction::Keep,
+        framegen_core::deploy::plan_orphan(true, true, true, true, true)
+            == framegen_core::deploy::OrphanAction::Keep,
         "这次还要用的入口 -> 不碰"
     );
     check!(
-        framegen_core::deploy::plan_orphan(true, false, true, false, false) == framegen_core::deploy::OrphanAction::Keep,
+        framegen_core::deploy::plan_orphan(true, false, true, false, false)
+            == framegen_core::deploy::OrphanAction::Keep,
         "内容已被用户换过 -> 不碰"
     );
     check!(
-        framegen_core::deploy::plan_orphan(false, false, true, true, false) == framegen_core::deploy::OrphanAction::Keep,
+        framegen_core::deploy::plan_orphan(false, false, true, true, false)
+            == framegen_core::deploy::OrphanAction::Keep,
         "不是代理入口 -> 不碰"
     );
     check!(
-        framegen_core::deploy::plan_orphan(true, false, false, false, true) == framegen_core::deploy::OrphanAction::Keep,
+        framegen_core::deploy::plan_orphan(true, false, false, false, true)
+            == framegen_core::deploy::OrphanAction::Keep,
         "文件已经不在了 -> 不碰"
     );
 
@@ -979,15 +1179,20 @@ fn deploytest() -> usize {
     match framegen_core::deploy::deploy(&target, "version.dll", &dep_files, &[]) {
         Ok(_) => {
             check!(
-                fs::read(target.join("version.dll")).ok().as_deref() == Some(&b"FAKE_DLL_PAYLOAD_V1"[..]),
+                fs::read(target.join("version.dll")).ok().as_deref()
+                    == Some(&b"FAKE_DLL_PAYLOAD_V1"[..]),
                 "部署后代理 DLL 内容正确"
             );
             check!(
-                fs::read(target.join("dlssg_sm86.ini")).ok().as_deref() == Some(&b"FAKE_INI_PAYLOAD_V1"[..]),
+                fs::read(target.join("dlssg_sm86.ini")).ok().as_deref()
+                    == Some(&b"FAKE_INI_PAYLOAD_V1"[..]),
                 "部署后 INI 内容正确"
             );
             check!(
-                matches!(framegen_core::deploy::state_of(&target), framegen_core::deploy::DeployState::Deployed { .. }),
+                matches!(
+                    framegen_core::deploy::state_of(&target),
+                    framegen_core::deploy::DeployState::Deployed { .. }
+                ),
                 "部署后状态 = 已部署"
             );
             check!(
@@ -997,13 +1202,17 @@ fn deploytest() -> usize {
 
             match framegen_core::deploy::restore(&target) {
                 Ok(_) => {
-                    check!(!target.join("version.dll").exists(), "还原后代理 DLL 已移除");
+                    check!(
+                        !target.join("version.dll").exists(),
+                        "还原后代理 DLL 已移除"
+                    );
                     check!(
                         fs::read(target.join("dlssg_sm86.ini")).ok().as_deref() == Some(orig_ini),
                         "还原后 INI 恢复为原内容"
                     );
                     check!(
-                        framegen_core::deploy::state_of(&target) == framegen_core::deploy::DeployState::NotDeployed,
+                        framegen_core::deploy::state_of(&target)
+                            == framegen_core::deploy::DeployState::NotDeployed,
                         "还原后状态 = 未部署"
                     );
                 }
@@ -1022,15 +1231,20 @@ fn deploytest() -> usize {
     // 重部署：上游更新之后用户会再点一次「部署」。
     // 关键：这时不能把我们上次部署进去的文件当成「游戏原文件」重新备份，
     // 否则真正的原件会被覆盖掉，「还原」就还原不回游戏原样了。
-    println!("
--- 重部署（模拟上游更新后再部署一次）--");
+    println!(
+        "
+-- 重部署（模拟上游更新后再部署一次）--"
+    );
     // 这里只部署 INI、不带 DLL：deploy 会检查目标里同名文件的签名，测试用的假字节
     // 没有本项目签名，第二次部署会被正当地拒掉。真实的已签名 DLL（15 MB）没法在自测里
     // 造出来，所以这一段专门验证「原始备份不被自己的旧版本覆盖」。
     let t4 = root.join("redeploy");
     let _ = fs::create_dir_all(&t4);
     fs::write(t4.join(framegen_core::deploy::INI_NAME), orig_ini).unwrap();
-    let ini_only = [framegen_core::deploy::DeployFile::new(framegen_core::deploy::INI_NAME, &ini_src)];
+    let ini_only = [framegen_core::deploy::DeployFile::new(
+        framegen_core::deploy::INI_NAME,
+        &ini_src,
+    )];
     fs::write(&ini_src, b"FAKE_INI_PAYLOAD_V1").unwrap();
     match framegen_core::deploy::deploy(&t4, "version.dll", &ini_only, &[]) {
         Ok(_) => {
@@ -1039,13 +1253,17 @@ fn deploytest() -> usize {
             match framegen_core::deploy::deploy(&t4, "version.dll", &ini_only, &[]) {
                 Ok(_) => {
                     check!(
-                        fs::read(t4.join(framegen_core::deploy::INI_NAME)).ok().as_deref()
+                        fs::read(t4.join(framegen_core::deploy::INI_NAME))
+                            .ok()
+                            .as_deref()
                             == Some(&b"FAKE_INI_PAYLOAD_V2"[..]),
                         "重部署后 INI 已是新内容"
                     );
                     let orig_kept = framegen_core::deploy::load_manifest(&t4)
                         .and_then(|m| {
-                            m.files.into_iter().find(|e| e.rel_path == framegen_core::deploy::INI_NAME)
+                            m.files
+                                .into_iter()
+                                .find(|e| e.rel_path == framegen_core::deploy::INI_NAME)
                         })
                         .and_then(|e| e.original_sha256)
                         .map(|h| h == framegen_core::util::sha256_hex(orig_ini))
@@ -1056,7 +1274,10 @@ fn deploytest() -> usize {
                     );
                     match framegen_core::deploy::restore(&t4) {
                         Ok(_) => check!(
-                            fs::read(t4.join(framegen_core::deploy::INI_NAME)).ok().as_deref() == Some(orig_ini),
+                            fs::read(t4.join(framegen_core::deploy::INI_NAME))
+                                .ok()
+                                .as_deref()
+                                == Some(orig_ini),
                             "重部署后仍能还原出最初的用户原始 INI"
                         ),
                         Err(e) => {
@@ -1078,17 +1299,28 @@ fn deploytest() -> usize {
     }
 
     // 换代理入口：旧入口不能留在目录里变成孤儿
-    println!("
--- 换代理入口 --");
+    println!(
+        "
+-- 换代理入口 --"
+    );
     let t5 = root.join("switch");
     let _ = fs::create_dir_all(&t5);
     let winmm_src = src.join("winmm.dll");
     fs::write(&winmm_src, b"FAKE_WINMM_V1").unwrap();
-    let only_version = [framegen_core::deploy::DeployFile::new("version.dll", &dll_src)];
-    let only_winmm = [framegen_core::deploy::DeployFile::new("winmm.dll", &winmm_src)];
+    let only_version = [framegen_core::deploy::DeployFile::new(
+        "version.dll",
+        &dll_src,
+    )];
+    let only_winmm = [framegen_core::deploy::DeployFile::new(
+        "winmm.dll",
+        &winmm_src,
+    )];
     match framegen_core::deploy::deploy(&t5, "version.dll", &only_version, &[]) {
         Ok(_) => {
-            check!(t5.join("version.dll").is_file(), "先用 version.dll 部署成功");
+            check!(
+                t5.join("version.dll").is_file(),
+                "先用 version.dll 部署成功"
+            );
             match framegen_core::deploy::deploy(&t5, "winmm.dll", &only_winmm, &[]) {
                 Ok(_) => {
                     check!(t5.join("winmm.dll").is_file(), "换入口后 winmm.dll 已部署");
@@ -1097,10 +1329,7 @@ fn deploytest() -> usize {
                         "换入口后旧的 version.dll 已被清掉（不再有两个代理并存）"
                     );
                     match framegen_core::deploy::restore(&t5) {
-                        Ok(_) => check!(
-                            !t5.join("winmm.dll").exists(),
-                            "换入口后仍能正常还原"
-                        ),
+                        Ok(_) => check!(!t5.join("winmm.dll").exists(), "换入口后仍能正常还原"),
                         Err(e) => {
                             println!("  [FAIL] 换入口后还原报错: {e}");
                             fails += 1;
@@ -1120,8 +1349,10 @@ fn deploytest() -> usize {
     }
 
     // 冲突：目录里已有第三方的 version.dll
-    println!("
--- 入口冲突 --");
+    println!(
+        "
+-- 入口冲突 --"
+    );
     let t2 = root.join("conflict");
     let _ = fs::create_dir_all(&t2);
     fs::write(t2.join("version.dll"), b"SOME_OTHER_MOD").unwrap();
@@ -1146,8 +1377,10 @@ fn deploytest() -> usize {
     check!(!t2.join("winmm.dll").exists(), "替代入口已还原");
 
     // ---- 已装过本项目：允许覆盖（这是「判断用户是否手动装过」的核心行为）----
-    println!("
--- 游戏目录已有本项目文件 --");
+    println!(
+        "
+-- 游戏目录已有本项目文件 --"
+    );
     let ours_src: Option<PathBuf> = [
         r"D:\Epic Game\HogwartsLegacy\Phoenix\Binaries\Win64\version.dll",
         r"E:\SteamLibrary\steamapps\common\PUBG\TslGame\Binaries\Win64\version.dll",
@@ -1158,7 +1391,8 @@ fn deploytest() -> usize {
     // SM 的解锁组件 —— 那种文件不能拿来当"本项目帧生成文件"的样本，直接跳过这段。
     .find(|p| {
         p.is_file()
-            && framegen_core::scan::identify_dll(p) == framegen_core::scan::FileIdentity::ThisProject
+            && framegen_core::scan::identify_dll(p)
+                == framegen_core::scan::FileIdentity::ThisProject
     });
 
     match ours_src {
@@ -1167,7 +1401,8 @@ fn deploytest() -> usize {
         }
         Some(real) => {
             check!(
-                framegen_core::scan::identify_dll(&real) == framegen_core::scan::FileIdentity::ThisProject,
+                framegen_core::scan::identify_dll(&real)
+                    == framegen_core::scan::FileIdentity::ThisProject,
                 "识别出真实的本项目文件（DLSSG Native Project 签名）"
             );
             let t5 = root.join("ours");
@@ -1204,7 +1439,10 @@ fn deploytest() -> usize {
             // 旧那份是我们自己的文件：不备份成原件，还原时也不写回。
             let winmm_switch = src.join("winmm_switch.dll");
             fs::write(&winmm_switch, b"FAKE_WINMM_SWITCH").unwrap();
-            let switch = [framegen_core::deploy::DeployFile::new("winmm.dll", &winmm_switch)];
+            let switch = [framegen_core::deploy::DeployFile::new(
+                "winmm.dll",
+                &winmm_switch,
+            )];
             match framegen_core::deploy::deploy(&t5, "winmm.dll", &switch, &[]) {
                 Ok(_) => {
                     check!(
@@ -1251,8 +1489,10 @@ fn deploytest() -> usize {
     }
 
     // ---- 目录里有「本项目的另一个代理入口」，但不是本工具装的 ----
-    println!("
--- 目录里有另一个本项目代理（手动装的）--");
+    println!(
+        "
+-- 目录里有另一个本项目代理（手动装的）--"
+    );
     let real_ours: Option<PathBuf> = [
         r"D:\Epic Game\HogwartsLegacy\Phoenix\Binaries\Win64\version.dll",
         r"E:\SteamLibrary\steamapps\common\PUBG\TslGame\Binaries\Win64\version.dll",
@@ -1261,7 +1501,8 @@ fn deploytest() -> usize {
     .map(PathBuf::from)
     .find(|p| {
         p.is_file()
-            && framegen_core::scan::identify_dll(p) == framegen_core::scan::FileIdentity::ThisProject
+            && framegen_core::scan::identify_dll(p)
+                == framegen_core::scan::FileIdentity::ThisProject
     });
     match real_ours {
         None => println!("  （本机没有真实的本项目 DLL，跳过这段）"),
@@ -1271,7 +1512,8 @@ fn deploytest() -> usize {
             // 模拟「用户手动装了 dinput8.dll」，而待部署的是 version.dll
             fs::copy(&real, t6.join("dinput8.dll")).unwrap();
             check!(
-                framegen_core::deploy::find_extra_own_proxies(&t6, "version.dll") == vec!["dinput8.dll".to_owned()],
+                framegen_core::deploy::find_extra_own_proxies(&t6, "version.dll")
+                    == vec!["dinput8.dll".to_owned()],
                 "认出了目录里另一个本项目代理（该弹窗问用户）"
             );
             check!(
@@ -1287,7 +1529,12 @@ fn deploytest() -> usize {
                 framegen_core::deploy::DeployFile::new("version.dll", &ver2),
                 framegen_core::deploy::DeployFile::new(framegen_core::deploy::INI_NAME, &ini2),
             ];
-            let r = framegen_core::deploy::deploy(&t6, "version.dll", &payload2, &["dinput8.dll".to_owned()]);
+            let r = framegen_core::deploy::deploy(
+                &t6,
+                "version.dll",
+                &payload2,
+                &["dinput8.dll".to_owned()],
+            );
             check!(r.is_ok(), "用户选「移除并继续」后部署成功");
             check!(
                 !t6.join("dinput8.dll").exists(),
@@ -1303,7 +1550,10 @@ fn deploytest() -> usize {
             check!(recorded, "移除的那份原件备份记录留下来了");
 
             // 再部署一次（用户往往还会再点一次），记录不能被丢掉
-            let ini_only2 = [framegen_core::deploy::DeployFile::new(framegen_core::deploy::INI_NAME, &ini2)];
+            let ini_only2 = [framegen_core::deploy::DeployFile::new(
+                framegen_core::deploy::INI_NAME,
+                &ini2,
+            )];
             let r2 = framegen_core::deploy::deploy(&t6, "version.dll", &ini_only2, &[]);
             check!(r2.is_ok(), "再部署一次也成功");
             let recorded2 = framegen_core::deploy::load_manifest(&t6)
@@ -1314,7 +1564,7 @@ fn deploytest() -> usize {
             match framegen_core::deploy::restore(&t6) {
                 Ok(_) => {
                     /* 手动装的那份也是本项目的文件（签名认得出）：「还原」不把它写回
-                       游戏目录，否则它就变成"游戏自带的文件"，再也清不掉。 */
+                    游戏目录，否则它就变成"游戏自带的文件"，再也清不掉。 */
                     check!(
                         !t6.join("dinput8.dll").exists(),
                         "还原后手动装的本项目代理不写回游戏目录"
@@ -1333,18 +1583,25 @@ fn deploytest() -> usize {
     }
 
     /* ---- 目录里留着 Smooth Motion 的解锁组件 ----
-       它也叫 version.dll，但没有我们的签名。认不出它就会被当成「别人的文件」，
-       于是 Smooth Motion 明明关了、帧生成却部署不了（用户反馈）。 */
-    println!("
--- 游戏目录里留着 Smooth Motion 的解锁组件 --");
+    它也叫 version.dll，但没有我们的签名。认不出它就会被当成「别人的文件」，
+    于是 Smooth Motion 明明关了、帧生成却部署不了（用户反馈）。 */
+    println!(
+        "
+-- 游戏目录里留着 Smooth Motion 的解锁组件 --"
+    );
     // 组件在哪：先是运行时的资产目录，再是本仓库里随包的那一份（自测的数据目录是空的）
     let sm_src = framegen_core::sm::asset_base()
         .ok()
         .map(|d| d.join("rtx30").join("version.dll"))
         .filter(|p| p.is_file())
         .or_else(|| {
-            let p = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../bundled-sm/rtx30/version.dll");
-            if p.is_file() { Some(p) } else { None }
+            let p = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../bundled-sm/rtx30/version.dll");
+            if p.is_file() {
+                Some(p)
+            } else {
+                None
+            }
         });
     match sm_src {
         Some(sm_src) => {
@@ -1364,7 +1621,10 @@ fn deploytest() -> usize {
             let r = framegen_core::deploy::deploy(&t7, "version.dll", &dep_files, &[]);
             match r {
                 Ok(_) => {
-                    check!(t7.join("version.dll").is_file(), "留着解锁组件时帧生成部署成功");
+                    check!(
+                        t7.join("version.dll").is_file(),
+                        "留着解锁组件时帧生成部署成功"
+                    );
                     let kept = framegen_core::deploy::load_manifest(&t7)
                         .map(|m| {
                             m.files
@@ -1384,27 +1644,33 @@ fn deploytest() -> usize {
     }
 
     /* ---- 重复部署：dlssg_sm86\ 里的运行库不能被当成「游戏原件」 ----
-       它们是 NVIDIA 签名的，按签名认不出"这是我们放的"。不按内容再比一遍就会被备份成
-       游戏原件，之后「还原」会把我们上次部署的旧运行库写回游戏目录。 */
-    println!("
--- 重复部署时运行库不当成游戏原件 --");
+    它们是 NVIDIA 签名的，按签名认不出"这是我们放的"。不按内容再比一遍就会被备份成
+    游戏原件，之后「还原」会把我们上次部署的旧运行库写回游戏目录。 */
+    println!(
+        "
+-- 重复部署时运行库不当成游戏原件 --"
+    );
     let runtime_src = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../apps/electron/bundled-assets")
         .join(framegen_core::deploy::RUNTIME_DIR);
     let lib = runtime_src.join("runtime").join("nvngx_dlssg.dll");
     if lib.is_file() {
         // 自测的数据目录是空的：先把内置资产摆到它该在的位置，判定才有东西可比
-        if let Ok(asset_dir) = framegen_core::update::asset_path(framegen_core::deploy::RUNTIME_DIR) {
+        if let Ok(asset_dir) = framegen_core::update::asset_path(framegen_core::deploy::RUNTIME_DIR)
+        {
             let dst = asset_dir.join("runtime");
             let _ = fs::create_dir_all(&dst);
             let _ = fs::copy(&lib, dst.join("nvngx_dlssg.dll"));
         }
-        let rel = format!("{}\\runtime\\nvngx_dlssg.dll", framegen_core::deploy::RUNTIME_DIR);
+        let rel = format!(
+            "{}\\runtime\\nvngx_dlssg.dll",
+            framegen_core::deploy::RUNTIME_DIR
+        );
         let t8 = root.join("rerun");
         let _ = fs::create_dir_all(&t8);
         /* 目录里已经摆着一份我们自己的运行库（别的方式放的：换了程序版本、或记录丢了），
-           而本工具对这个目录**没有部署记录** —— 正是用户遇到的那种情况。
-           这时只能靠内容认出"这也是我们自己放的"，否则会被当成游戏原件备份。 */
+        而本工具对这个目录**没有部署记录** —— 正是用户遇到的那种情况。
+        这时只能靠内容认出"这也是我们自己放的"，否则会被当成游戏原件备份。 */
         let sub = t8.join(framegen_core::deploy::RUNTIME_DIR).join("runtime");
         let _ = fs::create_dir_all(&sub);
         fs::copy(&lib, sub.join("nvngx_dlssg.dll")).unwrap();
@@ -1430,17 +1696,24 @@ fn deploytest() -> usize {
     }
 
     /* ---- 代理位被 Smooth Motion 的解锁组件顶掉之后还原 ----
-       那个组件也是本工具放的（只是换了一个功能），还原时必须一并收走；
-       留着的话游戏还在加载 Smooth Motion 的组件，而用户以为已经还原干净了。 */
-    println!("
--- 代理位被 Smooth Motion 组件顶掉后还原 --");
+    那个组件也是本工具放的（只是换了一个功能），还原时必须一并收走；
+    留着的话游戏还在加载 Smooth Motion 的组件，而用户以为已经还原干净了。 */
+    println!(
+        "
+-- 代理位被 Smooth Motion 组件顶掉后还原 --"
+    );
     let sm_dll = framegen_core::sm::asset_base()
         .ok()
         .map(|d| d.join("rtx30").join("version.dll"))
         .filter(|p| p.is_file())
         .or_else(|| {
-            let p = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../bundled-sm/rtx30/version.dll");
-            if p.is_file() { Some(p) } else { None }
+            let p = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../bundled-sm/rtx30/version.dll");
+            if p.is_file() {
+                Some(p)
+            } else {
+                None
+            }
         });
     match sm_dll {
         Some(src) => {
@@ -1466,12 +1739,14 @@ fn deploytest() -> usize {
     }
 
     /* ---- 还原时文件被占用：不能谎报「已还原」、更不能把部署记录删掉 ----
-       1.6.3 实测：游戏（或启动器 / 反作弊）还开着、或杀毒软件正在扫 version.dll 时，
-       删除失败被静默忽略，restore 报「已还原」并把记录删了 —— 目录里留下我们的文件、
-       记录却没了，界面翻成「本工具无记录」，用户只能再点一次「清理」，
-       而「清理」没有原件备份，游戏原件再也放不回来。 */
-    println!("
--- 还原时文件被占用 --");
+    1.6.3 实测：游戏（或启动器 / 反作弊）还开着、或杀毒软件正在扫 version.dll 时，
+    删除失败被静默忽略，restore 报「已还原」并把记录删了 —— 目录里留下我们的文件、
+    记录却没了，界面翻成「本工具无记录」，用户只能再点一次「清理」，
+    而「清理」没有原件备份，游戏原件再也放不回来。 */
+    println!(
+        "
+-- 还原时文件被占用 --"
+    );
     #[cfg(windows)]
     {
         use std::os::windows::fs::OpenOptionsExt;
@@ -1503,7 +1778,10 @@ fn deploytest() -> usize {
                     framegen_core::deploy::load_manifest(&t10).is_some(),
                     "部署记录被保留（还能再点一次还原收尾）"
                 );
-                check!(t10.join("version.dll").exists(), "被占用的文件没有被谎报删掉");
+                check!(
+                    t10.join("version.dll").exists(),
+                    "被占用的文件没有被谎报删掉"
+                );
                 drop(held);
                 match framegen_core::deploy::restore(&t10) {
                     Ok(_) => {
@@ -1532,8 +1810,10 @@ fn deploytest() -> usize {
     println!("  （非 Windows，跳过文件占用这段）");
 
     let _ = fs::remove_dir_all(&root);
-    println!("
-===== 结果: {fails} 项失败 =====");
+    println!(
+        "
+===== 结果: {fails} 项失败 ====="
+    );
     fails
 }
 
